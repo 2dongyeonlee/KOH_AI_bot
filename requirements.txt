@@ -1,5 +1,5 @@
-python-telegram-bot==20.7
-google-generativeai==0.4.1
+python-telegram-bot==21.3
+google-genai>=1.0.0
 PyMuPDF==1.23.8
 python-pptx==0.6.23
 APScheduler==3.10.4

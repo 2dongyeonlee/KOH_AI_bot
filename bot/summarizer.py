@@ -2,8 +2,8 @@ import os
 import io
 import fitz  # PyMuPDF
 from pptx import Presentation
-import google.generativeai as genai
-from PIL import Image
+from google import genai
+from google.genai import types
 
 SYSTEM_PROMPT = """너는 SK하이닉스 커뮤니케이션 총괄 조직의
 6R 전략 담당 권오혁 담당의 전담 비서 '궁오혁봇'이야.
@@ -21,19 +21,31 @@ SYSTEM_PROMPT = """너는 SK하이닉스 커뮤니케이션 총괄 조직의
 
 SUMMARY_PROMPT = "다음 내용을 핵심만 3줄로 요약해줘.\n각 줄은 번호를 붙여줘. 한국어로.\n\n{content}"
 
+EXT_TO_MIME = {
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "gif": "image/gif",
+    "webp": "image/webp",
+    "bmp": "image/bmp",
+}
 
-def _get_model():
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    return genai.GenerativeModel(
-        model_name="gemini-2.0-flash",
-        system_instruction=SYSTEM_PROMPT,
-    )
+
+def _client() -> genai.Client:
+    return genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+
+def _config() -> types.GenerateContentConfig:
+    return types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
 
 
 def summarize_text(text: str) -> str:
     try:
-        model = _get_model()
-        response = model.generate_content(SUMMARY_PROMPT.format(content=text))
+        response = _client().models.generate_content(
+            model="gemini-2.0-flash",
+            contents=SUMMARY_PROMPT.format(content=text),
+            config=_config(),
+        )
         return response.text
     except Exception:
         return "요약 중 오류가 발생했어요. 잠시 후 다시 시도해주세요."
@@ -50,16 +62,16 @@ def summarize_pdf(file_bytes: bytes) -> str:
         return "문서를 읽을 수 없어요. 텍스트가 포함된 PDF인지 확인해주세요."
 
 
-def summarize_image(file_bytes: bytes) -> str:
+def summarize_image(file_bytes: bytes, ext: str = "jpg") -> str:
     try:
-        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-        model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash",
-            system_instruction=SYSTEM_PROMPT,
-        )
-        image = Image.open(io.BytesIO(file_bytes))
+        mime = EXT_TO_MIME.get(ext, "image/jpeg")
+        image_part = types.Part.from_bytes(data=file_bytes, mime_type=mime)
         prompt = "이 이미지의 내용을 핵심만 3줄로 요약해줘.\n각 줄은 번호를 붙여줘. 한국어로."
-        response = model.generate_content([prompt, image])
+        response = _client().models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[image_part, prompt],
+            config=_config(),
+        )
         return response.text
     except Exception:
         return "요약 중 오류가 발생했어요. 잠시 후 다시 시도해주세요."

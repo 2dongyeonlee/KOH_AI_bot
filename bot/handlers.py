@@ -1,7 +1,8 @@
 import os
 from collections import deque
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -25,8 +26,9 @@ SYSTEM_PROMPT = """너는 SK하이닉스 커뮤니케이션 총괄 조직의
 - 불필요한 부연 설명 없이 바로 본론으로"""
 
 SUMMARY_KEYWORDS = {"요약", "요약해줘", "정리해줘"}
+IMAGE_EXTS = {"jpg", "jpeg", "png", "gif", "webp", "bmp"}
 
-# 대화 히스토리: user_id → deque(maxlen=10)
+# 대화 히스토리: user_id → deque of types.Content (maxlen=10)
 _chat_history: dict[int, deque] = {}
 
 
@@ -38,25 +40,25 @@ def _get_history(user_id: int) -> deque:
 
 def _gemini_chat(user_id: int, text: str) -> str:
     try:
-        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-        model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash",
-            system_instruction=SYSTEM_PROMPT,
+        client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        history = list(_get_history(user_id))
+        chat = client.chats.create(
+            model="gemini-2.0-flash",
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+            history=history,
         )
-        history = _get_history(user_id)
-        contents = list(history) + [{"role": "user", "parts": [text]}]
-        response = model.generate_content(contents)
+        response = chat.send_message(text)
         reply = response.text
 
-        history.append({"role": "user", "parts": [text]})
-        history.append({"role": "model", "parts": [reply]})
+        h = _get_history(user_id)
+        h.append(types.Content(role="user", parts=[types.Part(text=text)]))
+        h.append(types.Content(role="model", parts=[types.Part(text=reply)]))
         return reply
     except Exception:
         return "요약 중 오류가 발생했어요. 잠시 후 다시 시도해주세요."
 
 
 async def _download_bytes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[bytes, str] | None:
-    """파일 다운로드 후 (bytes, mime_or_ext) 반환."""
     msg = update.message
 
     if msg.document:
@@ -112,8 +114,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         if ext == "pdf":
             reply = summarize_pdf(file_bytes)
-        elif ext in ("jpg", "jpeg", "png", "gif", "webp", "bmp"):
-            reply = summarize_image(file_bytes)
+        elif ext in IMAGE_EXTS:
+            reply = summarize_image(file_bytes, ext)
         elif ext in ("pptx", "ppt"):
             reply = summarize_pptx(file_bytes)
         else:
@@ -137,8 +139,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 file_bytes, ext = result
                 if ext == "pdf":
                     reply = summarize_pdf(file_bytes)
-                elif ext in ("jpg", "jpeg", "png", "gif", "webp", "bmp"):
-                    reply = summarize_image(file_bytes)
+                elif ext in IMAGE_EXTS:
+                    reply = summarize_image(file_bytes, ext)
                 elif ext in ("pptx", "ppt"):
                     reply = summarize_pptx(file_bytes)
                 else:
@@ -149,9 +151,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await msg.reply_text(summarize_text(replied.text))
             return
 
-    # 인라인 요약 (텍스트 + 요약 키워드)
+    # 인라인 요약 키워드만 단독 입력 → 요약 대상 없음
     if stripped in SUMMARY_KEYWORDS:
-        return  # 요약 대상 없음
+        return
 
     # 일정 등록
     if "일정:" in text or "일정 :" in text:
