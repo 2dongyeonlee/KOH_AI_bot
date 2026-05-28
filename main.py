@@ -10,13 +10,15 @@ from bot.scheduler import start_scheduler
 load_dotenv()
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID", "0"))
+GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID") or "0")
 
 
 def main() -> None:
     app = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("관리자등록", handle_register_admin))
+    app.add_handler(
+        MessageHandler(filters.Regex(r"^/관리자등록$"), handle_register_admin)
+    )
 
     # 텍스트, 문서, 사진 모두 단일 핸들러로 처리
     app.add_handler(
