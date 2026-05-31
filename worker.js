@@ -158,7 +158,7 @@ async function difyChat(env, { query, user, conversationId, files = [] }) {
   const body = {
     inputs: {},
     query,
-    response_mode: "blocking",
+    response_mode: "streaming",
     user,
   };
   if (conversationId) body.conversation_id = conversationId;
@@ -177,7 +177,42 @@ async function difyChat(env, { query, user, conversationId, files = [] }) {
     const err = await res.text();
     throw new Error(`Dify chat error ${res.status}: ${err}`);
   }
-  return res.json();
+
+  // SSE 스트림 파싱: message 이벤트 answer 누적, message_end에서 conversation_id 추출
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let answer = "";
+  let newConversationId = "";
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop(); // 마지막 불완전한 줄은 다음 청크로 이월
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const data = line.slice(6).trim();
+      if (!data || data === "[DONE]") continue;
+
+      try {
+        const parsed = JSON.parse(data);
+        if (parsed.event === "message" && parsed.answer) {
+          answer += parsed.answer;
+        }
+        if (parsed.event === "message_end") {
+          newConversationId = parsed.conversation_id || "";
+        }
+      } catch (_) {
+        // 파싱 불가 라인 무시
+      }
+    }
+  }
+
+  return { answer, conversation_id: newConversationId };
 }
 
 async function difyUploadFile(env, blob, fileName, mimeType, userId) {
