@@ -91,7 +91,7 @@ async function handleAdminMessage(userId, chatId, text, env) {
     await sendMessage(env, chatId, result.answer || "응답을 받지 못했어요.");
   } catch (e) {
     console.error("difyChat error:", e);
-    await sendMessage(env, chatId, "오류가 발생했어요. 잠시 후 다시 시도해주세요.");
+    await sendMessage(env, chatId, `❌ 오류 발생\n${e.message}`);
   }
 }
 
@@ -147,11 +147,7 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
     await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했어요.");
   } catch (e) {
     console.error("handleFile error:", e);
-    await sendMessage(
-      env,
-      chatId,
-      "파일 처리 중 오류가 발생했어요. 잠시 후 다시 시도해주세요."
-    );
+    await sendMessage(env, chatId, `❌ 파일 처리 오류\n${e.message}`);
   }
 }
 
