@@ -32,43 +32,22 @@ async function handleUpdate(update, env) {
   const text = message.text || message.caption || "";
   const hasFile = !!(message.document || message.photo);
 
-  if (text.trim() === "/관리자등록") {
-    await handleAdminRegister(userId, chatId, env);
-    return;
-  }
+  // ADMIN 판별: env.ADMIN_TELEGRAM_ID와 일치 여부
+  const isAdmin = userId === String(env.ADMIN_TELEGRAM_ID);
 
-  const adminId = await getAdminId(env);
-  const isAdmin = adminId !== null && userId === adminId;
-
+  // 파일 업로드 → 누구든 자동 요약
   if (hasFile) {
     await handleFile(message, userId, chatId, isAdmin, env);
     return;
   }
 
+  // ADMIN 텍스트 → Dify 대화
   if (isAdmin && text.trim()) {
     await handleAdminMessage(userId, chatId, text.trim(), env);
     return;
   }
 
-  // 팀원 텍스트 → 무시
-}
-
-// ─────────────────────────────────────────────
-// /관리자등록
-// ─────────────────────────────────────────────
-async function handleAdminRegister(userId, chatId, env) {
-  const existing = await env.USERS.get("admin_id");
-  if (existing) {
-    await sendMessage(env, chatId, "이미 관리자가 등록되어 있습니다.");
-    return;
-  }
-  await env.USERS.put("admin_id", userId);
-  await sendMessage(env, chatId, "✅ 관리자로 등록됐습니다.");
-}
-
-async function getAdminId(env) {
-  const kv = await env.USERS.get("admin_id");
-  return kv || env.ADMIN_ID || null;
+  // 그 외 텍스트 → 무시
 }
 
 // ─────────────────────────────────────────────
@@ -76,13 +55,13 @@ async function getAdminId(env) {
 // ─────────────────────────────────────────────
 async function handleAdminMessage(userId, chatId, text, env) {
   try {
-    let conversationId = (await env.CONVERSATIONS.get(`conv_${userId}`)) || "";
+    const conversationId = (await env.CONVERSATIONS.get(`conv_${userId}`)) || "";
     let result;
 
     try {
       result = await difyChat(env, { query: text, user: userId, conversationId });
     } catch (e) {
-      // conversation_id 만료 시 초기화 후 재시도
+      // conversation_id 만료 → KV 삭제 후 재시도
       if (e.message.includes("not_found") || e.message.includes("Conversation Not Exists")) {
         await env.CONVERSATIONS.delete(`conv_${userId}`);
         result = await difyChat(env, { query: text, user: userId, conversationId: "" });
@@ -102,7 +81,7 @@ async function handleAdminMessage(userId, chatId, text, env) {
 }
 
 // ─────────────────────────────────────────────
-// 파일 요약
+// 파일 요약 (누구든 가능)
 // ─────────────────────────────────────────────
 async function handleFile(message, userId, chatId, isAdmin, env) {
   try {
@@ -125,7 +104,8 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
     const uploaded = await difyUploadFile(env, fileBlob, fileName, mimeType, userId);
     if (!uploaded.id) throw new Error("Dify 파일 업로드 실패: " + JSON.stringify(uploaded));
 
-    let conversationId = isAdmin
+    // ADMIN이면 대화 맥락 유지, 팀원은 독립 세션
+    const conversationId = isAdmin
       ? (await env.CONVERSATIONS.get(`conv_${userId}`)) || ""
       : "";
 
@@ -145,6 +125,7 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
     try {
       result = await difyChat(env, { ...filePayload, conversationId });
     } catch (e) {
+      // conversation_id 만료 → KV 삭제 후 재시도
       if (e.message.includes("not_found") || e.message.includes("Conversation Not Exists")) {
         await env.CONVERSATIONS.delete(`conv_${userId}`);
         result = await difyChat(env, { ...filePayload, conversationId: "" });
