@@ -200,7 +200,10 @@ async function difyChat(env, { query, user, conversationId, files = [] }) {
 
       try {
         const parsed = JSON.parse(data);
-        if (parsed.event === "message" && parsed.answer) {
+        if (
+          (parsed.event === "message" || parsed.event === "agent_message") &&
+          parsed.answer
+        ) {
           answer += parsed.answer;
         }
         if (parsed.event === "message_end") {
