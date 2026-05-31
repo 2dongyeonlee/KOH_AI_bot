@@ -4,6 +4,10 @@ const SUMMARY_PROMPT =
 const TONE_RULE =
   "[응답 규칙: 존댓말 격식체 사용. ^^ 이모티콘 사용 금지. 불필요한 감탄사 사용 금지.]\n\n";
 const ADMIN_NAME = "권오혁";
+const ALLOWED_NAMES = new Set([
+  "권오혁", "염성진", "황무연", "함동균",
+  "손경배", "한혜승", "박호현", "양서진", "원정호",
+]);
 
 const PRIVATE_WELCOME =
   "안녕하세요. 저는 권오혁 담당님의 AI 비서 권오혁(A)입니다.\n" +
@@ -214,10 +218,14 @@ async function handleUpdate(update, env) {
     return;
   }
 
-  // 이름 입력 대기 중
+  // 등록 플로우 대기 중
   const user = await getUser(userId, env);
   if (user?.step === "waiting_name" && !hasFile && text.trim()) {
     await handleRegisterStep2(userId, chatId, text.trim(), chatId, env);
+    return;
+  }
+  if (user?.step === "waiting_team" && !hasFile && text.trim()) {
+    await handleRegisterStep3(userId, chatId, text.trim(), env);
     return;
   }
 
@@ -235,7 +243,7 @@ async function handleUpdate(update, env) {
 // ─────────────────────────────────────────────
 async function handlePrivateMessage(message, userId, chatId, text, hasFile, user, env) {
   // 첫 메시지 시 안내 (user가 없거나 step 상태인 경우 = 처음)
-  const isFirstContact = !user || user.step === "waiting_name";
+  const isFirstContact = !user || user.step === "waiting_name" || user.step === "waiting_team";
 
   if (hasFile) {
     const isRegistered = !!(user?.name);
@@ -311,19 +319,37 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
 // ─────────────────────────────────────────────
 async function handleRegisterStep1(userId, chatId, env) {
   await saveUser(userId, { id: userId, step: "waiting_name" }, env);
-  await sendMessage(
-    env,
-    chatId,
-    `회원님의 텔레그램 ID: ${userId} 입니다.\n성함을 입력해 주세요. (예: 권오혁)`
-  );
+  await sendMessage(env, chatId, "성함을 입력해 주세요.");
 }
 
 // ─────────────────────────────────────────────
-// 등록 Step 2: 이름 입력 완료
+// 등록 Step 2: 이름 입력
 // ─────────────────────────────────────────────
 async function handleRegisterStep2(userId, chatId, name, currentChatId, env) {
-  await saveUser(userId, { id: userId, name, chat_id: currentChatId }, env);
-  await sendMessage(env, chatId, `등록 완료되었습니다. ${name}님으로 등록되었습니다.`);
+  if (ALLOWED_NAMES.has(name)) {
+    await saveUser(userId, { id: userId, name, chat_id: currentChatId }, env);
+    await sendMessage(env, chatId, `등록 완료되었습니다. ${name}님.`);
+  } else {
+    await saveUser(userId, { id: userId, name, chat_id: currentChatId, step: "waiting_team" }, env);
+    await sendMessage(
+      env,
+      chatId,
+      "소속 조직과 담당 업무를 알려주세요.\n(예: 6R전략실 담당 / 권오혁)"
+    );
+  }
+}
+
+// ─────────────────────────────────────────────
+// 등록 Step 3: 조직/담당 입력 완료
+// ─────────────────────────────────────────────
+async function handleRegisterStep3(userId, chatId, input, env) {
+  const user = await getUser(userId, env);
+  const parts = input.split("/").map((s) => s.trim());
+  const team = parts[0] || input.trim();
+  const role = parts[1] || "";
+  await saveUser(userId, { id: userId, name: user.name, team, role, chat_id: user.chat_id }, env);
+  const suffix = role ? ` (${team} / ${role})` : ` (${team})`;
+  await sendMessage(env, chatId, `등록 완료되었습니다. ${user.name}님${suffix}.`);
 }
 
 // ─────────────────────────────────────────────
