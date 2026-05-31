@@ -1,6 +1,7 @@
 const TELEGRAM_API = `https://api.telegram.org/bot`;
 const SUMMARY_PROMPT =
   "다음 파일의 내용을 핵심만 3줄로 요약해줘. 각 줄은 번호를 붙여줘. 한국어로.";
+const DIFY_API_KEY = "app-gerzU1HvAhT9lyStmMe6cuZS";
 
 // ─────────────────────────────────────────────
 // 진입점
@@ -155,7 +156,7 @@ async function difyStream(env, chatId, { query, user, conversationId = "", files
   const res = await fetch(`${env.DIFY_API_URL}/chat-messages`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${env.DIFY_API_KEY.trim()}`,
+      Authorization: `Bearer ${DIFY_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
@@ -224,7 +225,7 @@ async function difyUploadFile(env, blob, fileName, mimeType, userId) {
 
   const res = await fetch(`${env.DIFY_API_URL}/files/upload`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${env.DIFY_API_KEY.trim()}` },
+    headers: { Authorization: `Bearer ${DIFY_API_KEY}` },
     body: form,
   });
 
