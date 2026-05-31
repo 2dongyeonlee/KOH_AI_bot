@@ -141,13 +141,13 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
 }
 
 // ─────────────────────────────────────────────
-// Dify API (blocking)
+// Dify API (streaming — Agent 앱 전용)
 // ─────────────────────────────────────────────
 async function difyChat(env, { query, user, conversationId = "", files = [] }) {
   const body = {
     inputs: {},
     query,
-    response_mode: "blocking",
+    response_mode: "streaming",
     user,
   };
   if (conversationId) body.conversation_id = conversationId;
@@ -167,7 +167,39 @@ async function difyChat(env, { query, user, conversationId = "", files = [] }) {
     throw new Error(`Dify API ${res.status}: ${err}`);
   }
 
-  return res.json(); // { answer, conversation_id, ... }
+  // SSE 파싱: agent_message → answer 누적, message_end → conversation_id 추출
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let answer = "";
+  let newConversationId = "";
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop();
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const raw = line.slice(6).trim();
+      if (!raw || raw === "[DONE]") continue;
+
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed.event === "agent_message" && parsed.answer) {
+          answer += parsed.answer;
+        }
+        if (parsed.event === "message_end") {
+          newConversationId = parsed.conversation_id || "";
+        }
+      } catch (_) {}
+    }
+  }
+
+  return { answer, conversation_id: newConversationId };
 }
 
 async function difyUploadFile(env, blob, fileName, mimeType, userId) {
