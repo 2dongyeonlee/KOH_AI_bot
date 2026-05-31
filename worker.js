@@ -1,6 +1,4 @@
-const TELEGRAM_API = `https://api.telegram.org/bot`;
 const DIFY_API_URL = "https://api.dify.ai/v1";
-const DIFY_API_KEY = "app-gerzU1HvAhT9lyStmMe6cuZS";
 const SUMMARY_PROMPT =
   "다음 파일의 내용을 핵심만 3줄로 요약해줘. 각 줄은 번호를 붙여줘. 한국어로.";
 
@@ -79,7 +77,7 @@ async function getAdminId(env) {
 async function handleAdminMessage(userId, chatId, text, env) {
   try {
     const conversationId = (await env.CONVERSATIONS.get(`conv_${userId}`)) || "";
-    const result = await difyChat({ query: text, user: userId, conversationId });
+    const result = await difyChat(env, { query: text, user: userId, conversationId });
 
     if (result.conversation_id) {
       await env.CONVERSATIONS.put(`conv_${userId}`, result.conversation_id);
@@ -119,7 +117,7 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
       ? (await env.CONVERSATIONS.get(`conv_${userId}`)) || ""
       : "";
 
-    const result = await difyChat({
+    const result = await difyChat(env, {
       query: SUMMARY_PROMPT,
       user: userId,
       conversationId,
@@ -145,7 +143,7 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
 // ─────────────────────────────────────────────
 // Dify API (blocking)
 // ─────────────────────────────────────────────
-async function difyChat({ query, user, conversationId = "", files = [] }) {
+async function difyChat(env, { query, user, conversationId = "", files = [] }) {
   const body = {
     inputs: {},
     query,
@@ -158,7 +156,7 @@ async function difyChat({ query, user, conversationId = "", files = [] }) {
   const res = await fetch(`${DIFY_API_URL}/chat-messages`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${DIFY_API_KEY}`,
+      Authorization: `Bearer ${env.DIFY_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
@@ -179,7 +177,7 @@ async function difyUploadFile(env, blob, fileName, mimeType, userId) {
 
   const res = await fetch(`${DIFY_API_URL}/files/upload`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${DIFY_API_KEY}` },
+    headers: { Authorization: `Bearer ${env.DIFY_API_KEY}` },
     body: form,
   });
 
@@ -202,14 +200,14 @@ function difyFileType(mimeType) {
 // ─────────────────────────────────────────────
 async function tgGetFile(env, fileId) {
   const res = await fetch(
-    `${TELEGRAM_API}${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`
+    `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`
   );
   const data = await res.json();
   return data.result;
 }
 
 async function sendMessage(env, chatId, text) {
-  await fetch(`${TELEGRAM_API}${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, text }),
