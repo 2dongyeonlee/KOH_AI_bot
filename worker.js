@@ -155,7 +155,7 @@ async function difyStream(env, chatId, { query, user, conversationId = "", files
   const res = await fetch(`${env.DIFY_API_URL}/chat-messages`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${env.DIFY_API_KEY}`,
+      Authorization: `Bearer ${env.DIFY_API_KEY.trim()}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
@@ -224,7 +224,7 @@ async function difyUploadFile(env, blob, fileName, mimeType, userId) {
 
   const res = await fetch(`${env.DIFY_API_URL}/files/upload`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${env.DIFY_API_KEY}` },
+    headers: { Authorization: `Bearer ${env.DIFY_API_KEY.trim()}` },
     body: form,
   });
 
