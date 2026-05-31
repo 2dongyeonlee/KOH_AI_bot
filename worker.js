@@ -76,8 +76,20 @@ async function getAdminId(env) {
 // ─────────────────────────────────────────────
 async function handleAdminMessage(userId, chatId, text, env) {
   try {
-    const conversationId = (await env.CONVERSATIONS.get(`conv_${userId}`)) || "";
-    const result = await difyChat(env, { query: text, user: userId, conversationId });
+    let conversationId = (await env.CONVERSATIONS.get(`conv_${userId}`)) || "";
+    let result;
+
+    try {
+      result = await difyChat(env, { query: text, user: userId, conversationId });
+    } catch (e) {
+      // conversation_id 만료 시 초기화 후 재시도
+      if (e.message.includes("not_found") || e.message.includes("Conversation Not Exists")) {
+        await env.CONVERSATIONS.delete(`conv_${userId}`);
+        result = await difyChat(env, { query: text, user: userId, conversationId: "" });
+      } else {
+        throw e;
+      }
+    }
 
     if (result.conversation_id) {
       await env.CONVERSATIONS.put(`conv_${userId}`, result.conversation_id);
@@ -113,14 +125,13 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
     const uploaded = await difyUploadFile(env, fileBlob, fileName, mimeType, userId);
     if (!uploaded.id) throw new Error("Dify 파일 업로드 실패: " + JSON.stringify(uploaded));
 
-    const conversationId = isAdmin
+    let conversationId = isAdmin
       ? (await env.CONVERSATIONS.get(`conv_${userId}`)) || ""
       : "";
 
-    const result = await difyChat(env, {
+    const filePayload = {
       query: SUMMARY_PROMPT,
       user: userId,
-      conversationId,
       files: [
         {
           type: difyFileType(mimeType),
@@ -128,7 +139,19 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
           upload_file_id: uploaded.id,
         },
       ],
-    });
+    };
+
+    let result;
+    try {
+      result = await difyChat(env, { ...filePayload, conversationId });
+    } catch (e) {
+      if (e.message.includes("not_found") || e.message.includes("Conversation Not Exists")) {
+        await env.CONVERSATIONS.delete(`conv_${userId}`);
+        result = await difyChat(env, { ...filePayload, conversationId: "" });
+      } else {
+        throw e;
+      }
+    }
 
     if (isAdmin && result.conversation_id) {
       await env.CONVERSATIONS.put(`conv_${userId}`, result.conversation_id);
