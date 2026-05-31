@@ -6,6 +6,11 @@ compatibility_date = "2024-11-01"
 DIFY_API_URL = "https://api.dify.ai/v1"
 
 [[kv_namespaces]]
-binding = "BOT_KV"
-id = "YOUR_KV_NAMESPACE_ID"
-preview_id = "YOUR_KV_NAMESPACE_ID"
+binding = "USERS"
+id = "65a2237c4bf94cb1a24346daa9628536"
+preview_id = "65a2237c4bf94cb1a24346daa9628536"
+
+[[kv_namespaces]]
+binding = "CONVERSATIONS"
+id = "41fe286a688e4254ba25f83997d5a007"
+preview_id = "41fe286a688e4254ba25f83997d5a007"

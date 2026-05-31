@@ -60,17 +60,17 @@ async function handleUpdate(update, env) {
 // /관리자등록
 // ─────────────────────────────────────────────
 async function handleAdminRegister(userId, chatId, env) {
-  const existing = await env.BOT_KV.get("admin_id");
+  const existing = await env.USERS.get("admin_id");
   if (existing) {
     await sendMessage(env, chatId, "이미 관리자가 등록되어 있습니다.");
     return;
   }
-  await env.BOT_KV.put("admin_id", userId);
+  await env.USERS.put("admin_id", userId);
   await sendMessage(env, chatId, "✅ 관리자로 등록됐습니다.");
 }
 
 async function getAdminId(env) {
-  const kv = await env.BOT_KV.get("admin_id");
+  const kv = await env.USERS.get("admin_id");
   return kv || env.ADMIN_ID || null;
 }
 
@@ -79,14 +79,14 @@ async function getAdminId(env) {
 // ─────────────────────────────────────────────
 async function handleAdminMessage(userId, chatId, text, env) {
   try {
-    const conversationId = (await env.BOT_KV.get(`conv_${userId}`)) || "";
+    const conversationId = (await env.CONVERSATIONS.get(`conv_${userId}`)) || "";
     const result = await difyChat(env, {
       query: text,
       user: userId,
       conversationId,
     });
     if (result.conversation_id) {
-      await env.BOT_KV.put(`conv_${userId}`, result.conversation_id);
+      await env.CONVERSATIONS.put(`conv_${userId}`, result.conversation_id);
     }
     await sendMessage(env, chatId, result.answer || "응답을 받지 못했어요.");
   } catch (e) {
@@ -124,7 +124,7 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
 
     // 4) ADMIN이면 대화 맥락 유지, 팀원은 독립 세션
     const conversationId = isAdmin
-      ? (await env.BOT_KV.get(`conv_${userId}`)) || ""
+      ? (await env.CONVERSATIONS.get(`conv_${userId}`)) || ""
       : "";
 
     const result = await difyChat(env, {
@@ -141,7 +141,7 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
     });
 
     if (isAdmin && result.conversation_id) {
-      await env.BOT_KV.put(`conv_${userId}`, result.conversation_id);
+      await env.CONVERSATIONS.put(`conv_${userId}`, result.conversation_id);
     }
 
     await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했어요.");
