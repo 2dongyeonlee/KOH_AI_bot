@@ -3,6 +3,7 @@ const SUMMARY_PROMPT =
   "다음 파일의 내용을 핵심만 3줄로 요약해줘. 각 줄은 번호를 붙여줘. 한국어로.";
 const TONE_RULE =
   "[응답 규칙: 존댓말 격식체 사용. ^^ 이모티콘 사용 금지. 불필요한 감탄사 사용 금지.]\n\n";
+const ADMIN_NAME = "권오혁";
 
 // ─────────────────────────────────────────────
 // 진입점
@@ -23,6 +24,31 @@ export default {
 };
 
 // ─────────────────────────────────────────────
+// KV 유저 헬퍼
+// ─────────────────────────────────────────────
+async function getUser(userId, env) {
+  const raw = await env.USERS.get(`user_${userId}`);
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function saveUser(userId, data, env) {
+  await env.USERS.put(`user_${userId}`, JSON.stringify(data));
+}
+
+async function checkIsAdmin(userId, env) {
+  // env 환경변수 우선
+  if (env.ADMIN_TELEGRAM_ID && userId === String(env.ADMIN_TELEGRAM_ID)) return true;
+  // KV에서 이름이 "권오혁"인 경우
+  const user = await getUser(userId, env);
+  return user?.name === ADMIN_NAME;
+}
+
+async function checkIsRegistered(userId, env) {
+  const user = await getUser(userId, env);
+  return !!(user?.name); // step 없이 name이 있으면 등록 완료
+}
+
+// ─────────────────────────────────────────────
 // 메시지 라우팅
 // ─────────────────────────────────────────────
 async function handleUpdate(update, env) {
@@ -34,17 +60,27 @@ async function handleUpdate(update, env) {
   const text = message.text || message.caption || "";
   const hasFile = !!(message.document || message.photo);
 
-  // /관리자등록
+  // /관리자등록 → 이름 입력 대기 시작
   if (text.trim() === "/관리자등록") {
-    await handleAdminRegister(userId, chatId, env);
+    await handleRegisterStep1(userId, chatId, env);
+    return;
+  }
+
+  // 이름 입력 대기 중인 경우 → step 2 처리
+  const user = await getUser(userId, env);
+  if (user?.step === "waiting_name" && !hasFile && text.trim()) {
+    await handleRegisterStep2(userId, chatId, text.trim(), env);
     return;
   }
 
   const isAdmin = await checkIsAdmin(userId, env);
+  const isRegistered = await checkIsRegistered(userId, env);
 
-  // 파일 업로드 → 누구든 자동 요약
+  // 파일 업로드: 등록된 사람만 요약 (미등록자 무시)
   if (hasFile) {
-    await handleFile(message, userId, chatId, isAdmin, env);
+    if (isAdmin || isRegistered) {
+      await handleFile(message, userId, chatId, isAdmin, env);
+    }
     return;
   }
 
@@ -54,21 +90,27 @@ async function handleUpdate(update, env) {
     return;
   }
 
-  // 그 외 텍스트 → 무시
+  // 그 외 → 무시
 }
 
 // ─────────────────────────────────────────────
-// /관리자등록
+// 등록 Step 1: /관리자등록 입력
 // ─────────────────────────────────────────────
-async function handleAdminRegister(userId, chatId, env) {
-  await env.USERS.put("admin_id", userId);
-  await sendMessage(env, chatId, `등록 완료! 회원님의 텔레그램 ID: ${userId}`);
+async function handleRegisterStep1(userId, chatId, env) {
+  await saveUser(userId, { id: userId, step: "waiting_name" }, env);
+  await sendMessage(
+    env,
+    chatId,
+    `회원님의 텔레그램 ID: ${userId} 입니다.\n성함을 입력해 주세요. (예: 권오혁)`
+  );
 }
 
-async function checkIsAdmin(userId, env) {
-  if (env.ADMIN_TELEGRAM_ID && userId === String(env.ADMIN_TELEGRAM_ID)) return true;
-  const kvAdmin = await env.USERS.get("admin_id");
-  return kvAdmin !== null && userId === kvAdmin;
+// ─────────────────────────────────────────────
+// 등록 Step 2: 이름 입력 완료
+// ─────────────────────────────────────────────
+async function handleRegisterStep2(userId, chatId, name, env) {
+  await saveUser(userId, { id: userId, name }, env);
+  await sendMessage(env, chatId, `등록 완료되었습니다. ${name}님으로 등록되었습니다.`);
 }
 
 // ─────────────────────────────────────────────
@@ -102,7 +144,7 @@ async function handleAdminMessage(userId, chatId, text, env) {
 }
 
 // ─────────────────────────────────────────────
-// 파일 요약 (누구든 가능)
+// 파일 요약
 // ─────────────────────────────────────────────
 async function handleFile(message, userId, chatId, isAdmin, env) {
   try {
@@ -167,12 +209,7 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
 // Dify API (streaming — Agent 앱 전용)
 // ─────────────────────────────────────────────
 async function difyChat(env, { query, user, conversationId = "", files = [] }) {
-  const body = {
-    inputs: {},
-    query,
-    response_mode: "streaming",
-    user,
-  };
+  const body = { inputs: {}, query, response_mode: "streaming", user };
   if (conversationId) body.conversation_id = conversationId;
   if (files.length > 0) body.files = files;
 
@@ -208,15 +245,10 @@ async function difyChat(env, { query, user, conversationId = "", files = [] }) {
       if (!line.startsWith("data: ")) continue;
       const raw = line.slice(6).trim();
       if (!raw || raw === "[DONE]") continue;
-
       try {
         const parsed = JSON.parse(raw);
-        if (parsed.event === "agent_message" && parsed.answer) {
-          answer += parsed.answer;
-        }
-        if (parsed.event === "message_end") {
-          newConversationId = parsed.conversation_id || "";
-        }
+        if (parsed.event === "agent_message" && parsed.answer) answer += parsed.answer;
+        if (parsed.event === "message_end") newConversationId = parsed.conversation_id || "";
       } catch (_) {}
     }
   }
