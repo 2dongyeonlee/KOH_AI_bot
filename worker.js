@@ -1,7 +1,8 @@
 const TELEGRAM_API = `https://api.telegram.org/bot`;
+const DIFY_API_URL = "https://api.dify.ai/v1";
+const DIFY_API_KEY = "app-gerzU1HvAhT9lyStmMe6cuZS";
 const SUMMARY_PROMPT =
   "다음 파일의 내용을 핵심만 3줄로 요약해줘. 각 줄은 번호를 붙여줘. 한국어로.";
-const DIFY_API_KEY = "app-gerzU1HvAhT9lyStmMe6cuZS";
 
 // ─────────────────────────────────────────────
 // 진입점
@@ -50,6 +51,8 @@ async function handleUpdate(update, env) {
     await handleAdminMessage(userId, chatId, text.trim(), env);
     return;
   }
+
+  // 팀원 텍스트 → 무시
 }
 
 // ─────────────────────────────────────────────
@@ -76,14 +79,12 @@ async function getAdminId(env) {
 async function handleAdminMessage(userId, chatId, text, env) {
   try {
     const conversationId = (await env.CONVERSATIONS.get(`conv_${userId}`)) || "";
-    const newConversationId = await difyStream(env, chatId, {
-      query: text,
-      user: userId,
-      conversationId,
-    });
-    if (newConversationId) {
-      await env.CONVERSATIONS.put(`conv_${userId}`, newConversationId);
+    const result = await difyChat({ query: text, user: userId, conversationId });
+
+    if (result.conversation_id) {
+      await env.CONVERSATIONS.put(`conv_${userId}`, result.conversation_id);
     }
+    await sendMessage(env, chatId, result.answer || "응답을 받지 못했어요.");
   } catch (e) {
     console.error("handleAdminMessage error:", e);
     await sendMessage(env, chatId, `❌ 오류 발생\n${e.message}`);
@@ -95,7 +96,6 @@ async function handleAdminMessage(userId, chatId, text, env) {
 // ─────────────────────────────────────────────
 async function handleFile(message, userId, chatId, isAdmin, env) {
   try {
-    // 1) Telegram 파일 메타 추출
     let fileId, fileName, mimeType;
     if (message.document) {
       fileId = message.document.file_id;
@@ -108,21 +108,18 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
       mimeType = "image/jpeg";
     }
 
-    // 2) Telegram → 파일 바이너리 다운로드
     const fileInfo = await tgGetFile(env, fileId);
     const fileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
     const fileBlob = await fetch(fileUrl).then((r) => r.blob());
 
-    // 3) Dify 파일 업로드
     const uploaded = await difyUploadFile(env, fileBlob, fileName, mimeType, userId);
     if (!uploaded.id) throw new Error("Dify 파일 업로드 실패: " + JSON.stringify(uploaded));
 
-    // 4) ADMIN이면 대화 맥락 유지, 팀원은 독립 세션
     const conversationId = isAdmin
       ? (await env.CONVERSATIONS.get(`conv_${userId}`)) || ""
       : "";
 
-    const newConversationId = await difyStream(env, chatId, {
+    const result = await difyChat({
       query: SUMMARY_PROMPT,
       user: userId,
       conversationId,
@@ -135,9 +132,10 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
       ],
     });
 
-    if (isAdmin && newConversationId) {
-      await env.CONVERSATIONS.put(`conv_${userId}`, newConversationId);
+    if (isAdmin && result.conversation_id) {
+      await env.CONVERSATIONS.put(`conv_${userId}`, result.conversation_id);
     }
+    await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했어요.");
   } catch (e) {
     console.error("handleFile error:", e);
     await sendMessage(env, chatId, `❌ 파일 처리 오류\n${e.message}`);
@@ -145,15 +143,19 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
 }
 
 // ─────────────────────────────────────────────
-// Dify streaming API → SSE 파싱 → Telegram 전송
+// Dify API (blocking)
 // ─────────────────────────────────────────────
-async function difyStream(env, chatId, { query, user, conversationId = "", files = [] }) {
-  // 1. Dify API 호출 (streaming)
-  const body = { inputs: {}, query, response_mode: "streaming", user };
+async function difyChat({ query, user, conversationId = "", files = [] }) {
+  const body = {
+    inputs: {},
+    query,
+    response_mode: "blocking",
+    user,
+  };
   if (conversationId) body.conversation_id = conversationId;
   if (files.length > 0) body.files = files;
 
-  const res = await fetch(`${env.DIFY_API_URL}/chat-messages`, {
+  const res = await fetch(`${DIFY_API_URL}/chat-messages`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${DIFY_API_KEY}`,
@@ -167,55 +169,7 @@ async function difyStream(env, chatId, { query, user, conversationId = "", files
     throw new Error(`Dify API ${res.status}: ${err}`);
   }
 
-  // 2. response.body를 ReadableStream으로 읽기
-  const reader = res.body.getReader();
-  // 3. TextDecoder로 디코딩
-  const decoder = new TextDecoder();
-  let answer = "";
-  let newConversationId = "";
-  let buffer = "";
-  let sent = false;
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop(); // 불완전한 마지막 줄 다음 청크로 이월
-
-    for (const line of lines) {
-      // 4. "data: "로 시작하는 줄만 파싱
-      if (!line.startsWith("data: ")) continue;
-      const raw = line.slice(6).trim();
-      if (!raw || raw === "[DONE]") continue;
-
-      try {
-        const parsed = JSON.parse(raw);
-
-        // 5. agent_message 이벤트 → answer 누적
-        if (parsed.event === "agent_message" && parsed.answer) {
-          answer += parsed.answer;
-        }
-
-        // 6. message_end 이벤트 → 누적된 텍스트 텔레그램 전송
-        if (parsed.event === "message_end") {
-          newConversationId = parsed.conversation_id || "";
-          await sendMessage(env, chatId, answer || "응답을 받지 못했어요.");
-          sent = true;
-        }
-      } catch (_) {
-        // 파싱 불가 라인 무시
-      }
-    }
-  }
-
-  // message_end 없이 스트림이 끝난 경우 fallback 전송
-  if (!sent && answer) {
-    await sendMessage(env, chatId, answer);
-  }
-
-  return newConversationId;
+  return res.json(); // { answer, conversation_id, ... }
 }
 
 async function difyUploadFile(env, blob, fileName, mimeType, userId) {
@@ -223,7 +177,7 @@ async function difyUploadFile(env, blob, fileName, mimeType, userId) {
   form.append("file", new File([blob], fileName, { type: mimeType }));
   form.append("user", userId);
 
-  const res = await fetch(`${env.DIFY_API_URL}/files/upload`, {
+  const res = await fetch(`${DIFY_API_URL}/files/upload`, {
     method: "POST",
     headers: { Authorization: `Bearer ${DIFY_API_KEY}` },
     body: form,
