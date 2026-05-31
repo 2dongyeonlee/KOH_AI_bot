@@ -5,6 +5,9 @@ compatibility_date = "2024-11-01"
 [vars]
 DIFY_API_URL = "https://api.dify.ai/v1"
 
+[triggers]
+crons = ["0 23 * * *"]
+
 [[kv_namespaces]]
 binding = "USERS"
 id = "65a2237c4bf94cb1a24346daa9628536"
@@ -14,3 +17,13 @@ preview_id = "65a2237c4bf94cb1a24346daa9628536"
 binding = "CONVERSATIONS"
 id = "41fe286a688e4254ba25f83997d5a007"
 preview_id = "41fe286a688e4254ba25f83997d5a007"
+
+[[kv_namespaces]]
+binding = "ROOMS"
+id = "6edc67aa943043179eddd67e8d71f886"
+preview_id = "6edc67aa943043179eddd67e8d71f886"
+
+[[kv_namespaces]]
+binding = "SCHEDULES"
+id = "3e6133b2fefd4c1088e14baed49fcd1e"
+preview_id = "3e6133b2fefd4c1088e14baed49fcd1e"
