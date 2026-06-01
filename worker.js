@@ -221,10 +221,6 @@ async function handleUpdate(update, env) {
   }
 
   const user = await getUser(userId, env);
-  if (user?.step === "waiting_name_auto" && !hasFile && text.trim()) {
-    await handleAutoRegister(userId, chatId, text.trim(), env);
-    return;
-  }
   if (user?.step === "waiting_name" && !hasFile && text.trim()) {
     await handleRegisterStep2(userId, chatId, text.trim(), chatId, env);
     return;
@@ -243,26 +239,29 @@ async function handleUpdate(update, env) {
 }
 
 async function handlePrivateMessage(message, userId, chatId, text, hasFile, user, env) {
-  const isRegistered = !!(user?.name);
-
   if (hasFile) {
-    if (isRegistered) {
-      const isAdmin = await checkIsAdmin(userId, env);
-      await handleFile(message, userId, chatId, isAdmin, env);
-    } else {
-      await sendMessage(env, chatId, "성함을 먼저 알려주시면 등록 후 도움을 드릴 수 있습니다.");
-    }
+    const isAdmin = await checkIsAdmin(userId, env);
+    await handleFile(message, userId, chatId, isAdmin, env);
     return;
   }
 
   if (!text.trim()) return;
 
-  if (!isRegistered) {
-    await saveUser(userId, { id: userId, step: "waiting_name_auto" }, env);
-    await sendMessage(env, chatId, PRIVATE_GREETING);
+  // 이름 입력 대기 중 → 등록 처리 (Dify 호출 없음)
+  if (user?.step === "waiting_name_auto") {
+    await handleAutoRegister(userId, chatId, text.trim(), env);
     return;
   }
 
+  // 첫 접촉 → 등록 안내 먼저, 이후 Dify 답변
+  if (!user) {
+    await saveUser(userId, { id: userId, step: "waiting_name_auto" }, env);
+    await sendMessage(env, chatId, PRIVATE_GREETING);
+    await handleUserMessage(userId, chatId, text.trim(), true, env);
+    return;
+  }
+
+  // 권오혁님 → 특정인 전달 명령
   if (user.name === ADMIN_NAME) {
     const fwd = extractForwardCommand(text);
     if (fwd) {
@@ -271,7 +270,8 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     }
   }
 
-  if (isForwardRequest(text)) {
+  // 전달 요청 → 권오혁님에게 포워딩
+  if (user.name && isForwardRequest(text)) {
     const admin = await findAdminUser(env);
     if (admin?.chat_id) {
       await sendMessage(env, admin.chat_id, `${user.name}님이 전달: ${text}`);
@@ -280,6 +280,7 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     }
   }
 
+  // 등록 여부 상관없이 모든 메시지 Dify 답변
   await handleUserMessage(userId, chatId, text.trim(), true, env);
 }
 
@@ -309,8 +310,17 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     await saveSchedule(env, schedule);
   }
 
-  const sendReply = user?.name === ADMIN_NAME;
-  await handleUserMessage(userId, chatId, text.trim(), sendReply, env);
+  // 키워드 포함 시만 Dify 호출
+  if (hasGroupKeyword(text)) {
+    const sendReply = user?.name === ADMIN_NAME;
+    await handleUserMessage(userId, chatId, text.trim(), sendReply, env);
+  }
+}
+
+function hasGroupKeyword(text) {
+  return ["일정", "언제", "어디", "보고드립니다", "권오혁(A)", "권오혁A", "비서", "?"].some(
+    (kw) => text.includes(kw)
+  );
 }
 
 async function handleAutoRegister(userId, chatId, name, env) {
