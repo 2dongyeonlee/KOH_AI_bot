@@ -169,6 +169,21 @@ function extractSchedule(text, todayISO) {
   return { date: dateStr, time: timeStr, title };
 }
 
+function isSelfInfoQuery(text) {
+  return /내\s*(아이디|[iI][dD])|나\s*(누구야|뭐로\s*등록됐|어떻게\s*등록됐)/.test(text);
+}
+
+async function handleSelfInfo(user, userId, chatId, env) {
+  if (!user?.name) {
+    await sendMessage(env, chatId, `아직 등록되지 않으셨습니다.\n텔레그램 ID: ${userId}`);
+    return;
+  }
+  let msg = `${user.name}님으로 등록되어 있습니다.\n텔레그램 ID: ${userId}`;
+  if (user.team) msg += `\n소속: ${user.team}`;
+  if (user.role) msg += `\n담당: ${user.role}`;
+  await sendMessage(env, chatId, msg);
+}
+
 function isForwardRequest(text) {
   return /전달|전해|알려|보내/.test(text);
 }
@@ -253,6 +268,12 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
+  // 본인 등록 정보 조회 → KV 직접 답변
+  if (isSelfInfoQuery(text)) {
+    await handleSelfInfo(user, userId, chatId, env);
+    return;
+  }
+
   // 첫 접촉 → 등록 안내 먼저, 이후 Dify 답변
   if (!user) {
     await saveUser(userId, { id: userId, step: "waiting_name_auto" }, env);
@@ -301,6 +322,12 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
 
   if (!isRegistered) {
     await sendMessage(env, chatId, "/등록 명령어로 먼저 등록해 주세요.");
+    return;
+  }
+
+  // 본인 등록 정보 조회 → KV 직접 답변
+  if (isSelfInfoQuery(text)) {
+    await handleSelfInfo(user, userId, chatId, env);
     return;
   }
 
