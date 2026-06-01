@@ -170,7 +170,49 @@ function extractSchedule(text, todayISO) {
 }
 
 function isSelfInfoQuery(text) {
-  return /내\s*(아이디|[iI][dD])|나\s*(누구야|뭐로\s*등록됐|어떻게\s*등록됐)/.test(text);
+  return (
+    /내\s*(아이디|[iI][dD])/.test(text) ||
+    /나\s*(누구야|뭐로\s*등록됐|어떻게\s*등록됐)/.test(text) ||
+    /(아이디|[iI][dD])\s*(는|가)?\s*(뭐야|뭐인가요|뭐에요|알려줘|\?)/.test(text)
+  );
+}
+
+function isNewsQuery(text) {
+  return /뉴스/.test(text) || /최신\s*(기사|소식)/.test(text);
+}
+
+async function handleNewsQuery(chatId, env) {
+  try {
+    const res = await fetch("https://news.google.com/rss?hl=ko&gl=KR&ceid=KR:ko", {
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
+    if (!res.ok) throw new Error(`RSS ${res.status}`);
+    const xml = await res.text();
+
+    const headlines = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)]
+      .slice(0, 5)
+      .map((m) => {
+        const raw =
+          m[1].match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/)?.[1] ||
+          m[1].match(/<title>(.*?)<\/title>/)?.[1] ||
+          "";
+        return raw.replace(/<[^>]+>/g, "").replace(/\s+-\s+[^-]+$/, "").trim();
+      })
+      .filter(Boolean);
+
+    if (headlines.length === 0) {
+      await sendMessage(env, chatId, "뉴스를 불러오지 못했습니다.");
+      return;
+    }
+
+    const kst = new Date(Date.now() + 9 * 3600000);
+    const dateStr = kst.toISOString().slice(0, 10);
+    const msg = `📰 ${dateStr} 주요 뉴스\n\n${headlines.map((h, i) => `${i + 1}. ${h}`).join("\n")}`;
+    await sendMessage(env, chatId, msg);
+  } catch (e) {
+    console.error("handleNewsQuery error:", e);
+    await sendMessage(env, chatId, "뉴스를 불러오지 못했습니다.");
+  }
 }
 
 async function handleSelfInfo(user, userId, chatId, env) {
@@ -274,6 +316,12 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
+  // 뉴스 조회 → RSS 직접 답변
+  if (isNewsQuery(text)) {
+    await handleNewsQuery(chatId, env);
+    return;
+  }
+
   // 첫 접촉 → 등록 안내 먼저, 이후 Dify 답변
   if (!user) {
     await saveUser(userId, { id: userId, step: "waiting_name_auto" }, env);
@@ -328,6 +376,12 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
   // 본인 등록 정보 조회 → KV 직접 답변
   if (isSelfInfoQuery(text)) {
     await handleSelfInfo(user, userId, chatId, env);
+    return;
+  }
+
+  // 뉴스 조회 → RSS 직접 답변
+  if (isNewsQuery(text)) {
+    await handleNewsQuery(chatId, env);
     return;
   }
 
