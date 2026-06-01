@@ -70,6 +70,17 @@ async function findAdminUser(env) {
   return null;
 }
 
+async function findUserByName(name, env) {
+  const list = await env.USERS.list({ prefix: "user_" });
+  for (const key of list.keys) {
+    const raw = await env.USERS.get(key.name);
+    if (!raw) continue;
+    const u = JSON.parse(raw);
+    if (u.name === name) return u;
+  }
+  return null;
+}
+
 async function checkIsAdmin(userId, env) {
   if (env.ADMIN_TELEGRAM_ID && userId === String(env.ADMIN_TELEGRAM_ID)) return true;
   const user = await getUser(userId, env);
@@ -176,9 +187,27 @@ function extractSchedule(text, todayISO) {
   return { date: dateStr, time: timeStr, title };
 }
 
-// 전달 요청 패턴 감지
+// 전달 요청 패턴 감지 (일반 사용자 → 권오혁님)
 function isForwardRequest(text) {
   return /전달|전해|알려|보내/.test(text);
+}
+
+// 권오혁님 → 특정인 전달 명령 파싱
+// 예: "염성진한테 내일 회의 준비해달라고 전달해줘"
+function extractForwardCommand(text) {
+  const m = text.match(/^(.+?)한테\s+([\s\S]+?)\s*(전달해줘|보내줘|말해줘)\s*$/);
+  if (!m) return null;
+  return { targetName: m[1].trim(), content: m[2].trim() };
+}
+
+async function handleAdminForward(targetName, content, adminChatId, env) {
+  const target = await findUserByName(targetName, env);
+  if (!target?.chat_id) {
+    await sendMessage(env, adminChatId, `${targetName}님은 아직 등록되지 않으셨습니다.`);
+    return;
+  }
+  await sendMessage(env, target.chat_id, `권오혁 담당님 전달사항입니다.\n\n${content}`);
+  await sendMessage(env, adminChatId, `${targetName}님께 전달 완료했습니다.`);
 }
 
 // ─────────────────────────────────────────────
@@ -262,6 +291,15 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
   // 첫 접촉 안내
   if (isFirstContact) {
     await sendMessage(env, chatId, PRIVATE_WELCOME);
+  }
+
+  // 권오혁님 → 특정인 전달 명령 ("OOO한테 X 전달해줘/보내줘/말해줘")
+  if (user?.name === ADMIN_NAME) {
+    const fwd = extractForwardCommand(text);
+    if (fwd) {
+      await handleAdminForward(fwd.targetName, fwd.content, chatId, env);
+      return;
+    }
   }
 
   // 전달 요청 감지 → 권오혁님에게 포워딩
