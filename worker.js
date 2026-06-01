@@ -9,19 +9,15 @@ const ALLOWED_NAMES = new Set([
   "손경배", "한혜승", "박호현", "양서진", "원정호",
 ]);
 
-const PRIVATE_WELCOME =
-  "안녕하세요. 저는 권오혁 담당님의 AI 비서 권오혁(A)입니다.\n" +
-  "권오혁 담당님께 전달할 내용이 있으시면 말씀해 주세요.\n" +
-  "/등록 으로 성함을 등록하시면 더 원활하게 소통할 수 있습니다.";
+const PRIVATE_GREETING =
+  "안녕하세요! 저는 권오혁 담당님의 AI 비서입니다.\n" +
+  "성함을 알려주시면 누구신지 등록하겠습니다.";
 
 const GROUP_WELCOME =
   "안녕하세요. 저는 권오혁 담당님의 AI 비서 권오혁(A)입니다.\n" +
   "원활한 소통을 위해 구성원 여러분의 성함을 등록해 주세요.\n" +
   "/등록 을 입력하시면 등록됩니다.";
 
-// ─────────────────────────────────────────────
-// 진입점
-// ─────────────────────────────────────────────
 export default {
   async fetch(request, env) {
     if (request.method !== "POST") {
@@ -41,9 +37,6 @@ export default {
   },
 };
 
-// ─────────────────────────────────────────────
-// KV 유저 헬퍼
-// ─────────────────────────────────────────────
 async function getUser(userId, env) {
   const raw = await env.USERS.get(`user_${userId}`);
   return raw ? JSON.parse(raw) : null;
@@ -54,12 +47,10 @@ async function saveUser(userId, data, env) {
 }
 
 async function findAdminUser(env) {
-  // ADMIN_TELEGRAM_ID 환경변수로 조회
   if (env.ADMIN_TELEGRAM_ID) {
     const raw = await env.USERS.get(`user_${env.ADMIN_TELEGRAM_ID}`);
     if (raw) return JSON.parse(raw);
   }
-  // KV 리스트에서 name이 ADMIN_NAME인 유저 탐색
   const list = await env.USERS.list({ prefix: "user_" });
   for (const key of list.keys) {
     const raw = await env.USERS.get(key.name);
@@ -92,9 +83,6 @@ async function checkIsRegistered(userId, env) {
   return !!(user?.name);
 }
 
-// ─────────────────────────────────────────────
-// KV 룸 헬퍼
-// ─────────────────────────────────────────────
 async function saveRoom(chatId, chatTitle, env) {
   await env.ROOMS.put(`room_${chatId}`, JSON.stringify({ id: chatId, title: chatTitle || "" }));
 }
@@ -109,17 +97,14 @@ async function getAllRooms(env) {
   return rooms;
 }
 
-// ─────────────────────────────────────────────
-// KV 일정 헬퍼
-// ─────────────────────────────────────────────
 function getTodayKST() {
   const now = new Date();
   const kst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
-  return kst.toISOString().slice(0, 10); // YYYY-MM-DD
+  return kst.toISOString().slice(0, 10);
 }
 
 async function saveSchedule(env, schedule) {
-  const dateKey = schedule.date.replace(/-/g, ""); // YYYYMMDD
+  const dateKey = schedule.date.replace(/-/g, "");
   const raw = await env.SCHEDULES.get(`schedules_${dateKey}`);
   const list = raw ? JSON.parse(raw) : [];
   list.push(schedule);
@@ -132,9 +117,6 @@ async function getTodaySchedules(env) {
   return raw ? JSON.parse(raw) : [];
 }
 
-// ─────────────────────────────────────────────
-// 일정 감지 (regex 기반)
-// ─────────────────────────────────────────────
 function extractSchedule(text, todayISO) {
   const hasDate = /오늘|내일|모레|(\d{1,2})월\s*\d{1,2}일/.test(text);
   const hasTime = /오전|오후|(\d{1,2})시|(\d{2}):(\d{2})/.test(text);
@@ -187,13 +169,10 @@ function extractSchedule(text, todayISO) {
   return { date: dateStr, time: timeStr, title };
 }
 
-// 전달 요청 패턴 감지 (일반 사용자 → 권오혁님)
 function isForwardRequest(text) {
   return /전달|전해|알려|보내/.test(text);
 }
 
-// 권오혁님 → 특정인 전달 명령 파싱
-// 예: "염성진한테 내일 회의 준비해달라고 전달해줘"
 function extractForwardCommand(text) {
   const m = text.match(/^(.+?)한테\s+([\s\S]+?)\s*(전달해줘|보내줘|말해줘)\s*$/);
   if (!m) return null;
@@ -210,11 +189,7 @@ async function handleAdminForward(targetName, content, adminChatId, env) {
   await sendMessage(env, adminChatId, `${targetName}님께 전달 완료했습니다.`);
 }
 
-// ─────────────────────────────────────────────
-// 메인 라우팅
-// ─────────────────────────────────────────────
 async function handleUpdate(update, env) {
-  // 봇이 그룹에 추가됨 (my_chat_member)
   if (update.my_chat_member) {
     const mc = update.my_chat_member;
     const newStatus = mc.new_chat_member?.status;
@@ -230,25 +205,26 @@ async function handleUpdate(update, env) {
 
   const userId = String(message.from.id);
   const chatId = message.chat.id;
-  const chatType = message.chat.type; // "private" | "group" | "supergroup"
+  const chatType = message.chat.type;
   const text = message.text || message.caption || "";
   const hasFile = !!(message.document || message.photo);
 
-  // 봇이 그룹에 추가됨 (new_chat_members)
   if (message.new_chat_members?.some((m) => m.is_bot)) {
     await saveRoom(chatId, message.chat.title, env);
     await sendMessage(env, chatId, GROUP_WELCOME);
     return;
   }
 
-  // /등록 명령어 (1:1 + 그룹 공통)
   if (text.split("@")[0].trim() === "/등록") {
     await handleRegisterStep1(userId, chatId, env);
     return;
   }
 
-  // 등록 플로우 대기 중
   const user = await getUser(userId, env);
+  if (user?.step === "waiting_name_auto" && !hasFile && text.trim()) {
+    await handleAutoRegister(userId, chatId, text.trim(), env);
+    return;
+  }
   if (user?.step === "waiting_name" && !hasFile && text.trim()) {
     await handleRegisterStep2(userId, chatId, text.trim(), chatId, env);
     return;
@@ -259,7 +235,6 @@ async function handleUpdate(update, env) {
   }
 
   const isPrivate = chatType === "private";
-
   if (isPrivate) {
     await handlePrivateMessage(message, userId, chatId, text, hasFile, user, env);
   } else {
@@ -267,34 +242,28 @@ async function handleUpdate(update, env) {
   }
 }
 
-// ─────────────────────────────────────────────
-// 1:1 개인 채팅 처리
-// ─────────────────────────────────────────────
 async function handlePrivateMessage(message, userId, chatId, text, hasFile, user, env) {
-  // 첫 메시지 시 안내 (user가 없거나 step 상태인 경우 = 처음)
-  const isFirstContact = !user || user.step === "waiting_name" || user.step === "waiting_team";
+  const isRegistered = !!(user?.name);
 
   if (hasFile) {
-    const isRegistered = !!(user?.name);
     if (isRegistered) {
       const isAdmin = await checkIsAdmin(userId, env);
       await handleFile(message, userId, chatId, isAdmin, env);
     } else {
-      if (isFirstContact) await sendMessage(env, chatId, PRIVATE_WELCOME);
-      await sendMessage(env, chatId, "/등록 으로 성함을 등록하시면 더 원활하게 소통할 수 있습니다.");
+      await sendMessage(env, chatId, "성함을 먼저 알려주시면 등록 후 도움을 드릴 수 있습니다.");
     }
     return;
   }
 
   if (!text.trim()) return;
 
-  // 첫 접촉 안내
-  if (isFirstContact) {
-    await sendMessage(env, chatId, PRIVATE_WELCOME);
+  if (!isRegistered) {
+    await saveUser(userId, { id: userId, step: "waiting_name_auto" }, env);
+    await sendMessage(env, chatId, PRIVATE_GREETING);
+    return;
   }
 
-  // 권오혁님 → 특정인 전달 명령 ("OOO한테 X 전달해줘/보내줘/말해줘")
-  if (user?.name === ADMIN_NAME) {
+  if (user.name === ADMIN_NAME) {
     const fwd = extractForwardCommand(text);
     if (fwd) {
       await handleAdminForward(fwd.targetName, fwd.content, chatId, env);
@@ -302,24 +271,18 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     }
   }
 
-  // 전달 요청 감지 → 권오혁님에게 포워딩
   if (isForwardRequest(text)) {
     const admin = await findAdminUser(env);
     if (admin?.chat_id) {
-      const senderName = user?.name || `ID:${userId}`;
-      await sendMessage(env, admin.chat_id, `${senderName}님이 전달: ${text}`);
+      await sendMessage(env, admin.chat_id, `${user.name}님이 전달: ${text}`);
       await sendMessage(env, chatId, "권오혁 담당님께 전달하였습니다.");
       return;
     }
   }
 
-  // 1:1은 누구든 Dify 답변 전송
   await handleUserMessage(userId, chatId, text.trim(), true, env);
 }
 
-// ─────────────────────────────────────────────
-// 그룹방 처리
-// ─────────────────────────────────────────────
 async function handleGroupMessage(message, userId, chatId, text, hasFile, user, env) {
   const isRegistered = !!(user?.name);
 
@@ -340,29 +303,26 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     return;
   }
 
-  // 일정 감지
   const schedule = extractSchedule(text, getTodayKST());
   if (schedule) {
     schedule.chat_id = chatId;
     await saveSchedule(env, schedule);
   }
 
-  // 모든 메시지 Dify 전송; name이 '권오혁'인 경우만 답변 반환
   const sendReply = user?.name === ADMIN_NAME;
   await handleUserMessage(userId, chatId, text.trim(), sendReply, env);
 }
 
-// ─────────────────────────────────────────────
-// 등록 Step 1: /등록 입력
-// ─────────────────────────────────────────────
+async function handleAutoRegister(userId, chatId, name, env) {
+  await saveUser(userId, { id: userId, name, chat_id: chatId }, env);
+  await sendMessage(env, chatId, `${name}님으로 등록되었습니다.`);
+}
+
 async function handleRegisterStep1(userId, chatId, env) {
   await saveUser(userId, { id: userId, step: "waiting_name" }, env);
   await sendMessage(env, chatId, "성함을 입력해 주세요.");
 }
 
-// ─────────────────────────────────────────────
-// 등록 Step 2: 이름 입력
-// ─────────────────────────────────────────────
 async function handleRegisterStep2(userId, chatId, name, currentChatId, env) {
   if (ALLOWED_NAMES.has(name)) {
     await saveUser(userId, { id: userId, name, chat_id: currentChatId }, env);
@@ -377,9 +337,6 @@ async function handleRegisterStep2(userId, chatId, name, currentChatId, env) {
   }
 }
 
-// ─────────────────────────────────────────────
-// 등록 Step 3: 조직/담당 입력 완료
-// ─────────────────────────────────────────────
 async function handleRegisterStep3(userId, chatId, input, env) {
   const user = await getUser(userId, env);
   const parts = input.split("/").map((s) => s.trim());
@@ -390,9 +347,6 @@ async function handleRegisterStep3(userId, chatId, input, env) {
   await sendMessage(env, chatId, `등록 완료되었습니다. ${user.name}님${suffix}.`);
 }
 
-// ─────────────────────────────────────────────
-// 사용자 메시지 → Dify 전송
-// ─────────────────────────────────────────────
 async function handleUserMessage(userId, chatId, text, sendReply, env) {
   try {
     const conversationId = (await env.CONVERSATIONS.get(`conv_${userId}`)) || "";
@@ -425,9 +379,6 @@ async function handleUserMessage(userId, chatId, text, sendReply, env) {
   }
 }
 
-// ─────────────────────────────────────────────
-// 파일 요약
-// ─────────────────────────────────────────────
 async function handleFile(message, userId, chatId, isAdmin, env) {
   try {
     let fileId, fileName, mimeType;
@@ -487,13 +438,10 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
   }
 }
 
-// ─────────────────────────────────────────────
-// 일일 브리핑 (cron: UTC 23:00 = KST 08:00)
-// ─────────────────────────────────────────────
 async function sendDailyBriefing(env) {
-  const today = getTodayKST(); // YYYY-MM-DD
+  const today = getTodayKST();
   const schedules = await getTodaySchedules(env);
-  if (schedules.length === 0) return; // 일정 없으면 발송 안 함
+  if (schedules.length === 0) return;
 
   const sorted = schedules.sort((a, b) => (a.time || "").localeCompare(b.time || ""));
   const lines = sorted.map((s) => `${s.time} ${s.title}`).join("\n");
@@ -503,9 +451,6 @@ async function sendDailyBriefing(env) {
   await Promise.all(rooms.map((r) => sendMessage(env, r.id, msg)));
 }
 
-// ─────────────────────────────────────────────
-// Dify API (streaming — Agent 앱 전용)
-// ─────────────────────────────────────────────
 async function difyChat(env, { query, user, conversationId = "", files = [] }) {
   const body = { inputs: {}, query, response_mode: "streaming", user };
   if (conversationId) body.conversation_id = conversationId;
@@ -579,9 +524,6 @@ function difyFileType(mimeType) {
   return "document";
 }
 
-// ─────────────────────────────────────────────
-// Telegram API
-// ─────────────────────────────────────────────
 async function tgGetFile(env, fileId) {
   const res = await fetch(
     `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`
