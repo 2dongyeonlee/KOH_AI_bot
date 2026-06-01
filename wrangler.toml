@@ -1,4 +1,4 @@
-name = "KOH_AI_bot"
+name = "koh-ai-bot"
 main = "worker.js"
 compatibility_date = "2024-11-01"
 
