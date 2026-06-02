@@ -189,7 +189,6 @@ async function handleNewsQuery(chatId, env) {
     });
     if (!res.ok) throw new Error(`RSS ${res.status}`);
     const xml = await res.text();
-
     const headlines = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)]
       .slice(0, 5)
       .map((m) => {
@@ -200,12 +199,10 @@ async function handleNewsQuery(chatId, env) {
         return raw.replace(/<[^>]+>/g, "").replace(/\s+-\s+[^-]+$/, "").trim();
       })
       .filter(Boolean);
-
     if (headlines.length === 0) {
       await sendMessage(env, chatId, "뉴스를 불러오지 못했습니다.");
       return;
     }
-
     const kst = new Date(Date.now() + 9 * 3600000);
     const dateStr = kst.toISOString().slice(0, 10);
     const msg = `📰 ${dateStr} 주요 뉴스\n\n${headlines.map((h, i) => `${i + 1}. ${h}`).join("\n")}`;
@@ -305,25 +302,21 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
 
   if (!text.trim()) return;
 
-  // 이름 입력 대기 중 → 등록 처리 (Dify 호출 없음)
   if (user?.step === "waiting_name_auto") {
     await handleAutoRegister(userId, chatId, text.trim(), env);
     return;
   }
 
-  // 본인 등록 정보 조회 → KV 직접 답변
   if (isSelfInfoQuery(text)) {
     await handleSelfInfo(user, userId, chatId, env);
     return;
   }
 
-  // 뉴스 조회 → RSS 직접 답변
   if (isNewsQuery(text)) {
     await handleNewsQuery(chatId, env);
     return;
   }
 
-  // 첫 접촉 → 등록 안내 먼저, 이후 Dify 답변
   if (!user) {
     await saveUser(userId, { id: userId, step: "waiting_name_auto" }, env);
     await sendMessage(env, chatId, PRIVATE_GREETING);
@@ -331,7 +324,6 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
-  // 권오혁님 → 특정인 전달 명령
   if (user.name === ADMIN_NAME) {
     const fwd = extractForwardCommand(text);
     if (fwd) {
@@ -340,7 +332,6 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     }
   }
 
-  // 전달 요청 → 권오혁님에게 포워딩 (릴레이 요청은 스킵)
   if (!isRelay && user.name && isForwardRequest(text)) {
     const admin = await findAdminUser(env);
     if (admin?.chat_id) {
@@ -350,7 +341,6 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     }
   }
 
-  // 등록 여부 상관없이 모든 메시지 Dify 답변
   await handleUserMessage(userId, chatId, text.trim(), true, env);
 }
 
@@ -374,13 +364,11 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     return;
   }
 
-  // 본인 등록 정보 조회 → KV 직접 답변
   if (isSelfInfoQuery(text)) {
     await handleSelfInfo(user, userId, chatId, env);
     return;
   }
 
-  // 뉴스 조회 → RSS 직접 답변
   if (isNewsQuery(text)) {
     await handleNewsQuery(chatId, env);
     return;
@@ -392,7 +380,6 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     await saveSchedule(env, schedule);
   }
 
-  // 키워드 포함 시만 Dify 호출
   if (hasGroupKeyword(text)) {
     const sendReply = user?.name === ADMIN_NAME;
     await handleUserMessage(userId, chatId, text.trim(), sendReply, env);
@@ -444,7 +431,6 @@ async function handleUserMessage(userId, chatId, text, sendReply, env) {
     const conversationId = (await env.CONVERSATIONS.get(`conv_${userId}`)) || "";
     const query = TONE_RULE + text;
     let result;
-
     try {
       result = await difyChat(env, { query, user: userId, conversationId });
     } catch (e) {
@@ -455,11 +441,9 @@ async function handleUserMessage(userId, chatId, text, sendReply, env) {
         throw e;
       }
     }
-
     if (result.conversation_id) {
       await env.CONVERSATIONS.put(`conv_${userId}`, result.conversation_id);
     }
-
     if (sendReply) {
       await sendMessage(env, chatId, result.answer || "응답을 받지 못했어요.");
     }
@@ -484,30 +468,17 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
       fileName = "photo.jpg";
       mimeType = "image/jpeg";
     }
-
     const fileInfo = await tgGetFile(env, fileId);
     const fileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
     const fileBlob = await fetch(fileUrl).then((r) => r.blob());
-
     const uploaded = await difyUploadFile(env, fileBlob, fileName, mimeType, userId);
     if (!uploaded.id) throw new Error("Dify 파일 업로드 실패: " + JSON.stringify(uploaded));
-
-    const conversationId = isAdmin
-      ? (await env.CONVERSATIONS.get(`conv_${userId}`)) || ""
-      : "";
-
+    const conversationId = isAdmin ? (await env.CONVERSATIONS.get(`conv_${userId}`)) || "" : "";
     const filePayload = {
       query: TONE_RULE + SUMMARY_PROMPT,
       user: userId,
-      files: [
-        {
-          type: difyFileType(mimeType),
-          transfer_method: "local_file",
-          upload_file_id: uploaded.id,
-        },
-      ],
+      files: [{ type: difyFileType(mimeType), transfer_method: "local_file", upload_file_id: uploaded.id }],
     };
-
     let result;
     try {
       result = await difyChat(env, { ...filePayload, conversationId });
@@ -519,7 +490,6 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
         throw e;
       }
     }
-
     if (isAdmin && result.conversation_id) {
       await env.CONVERSATIONS.put(`conv_${userId}`, result.conversation_id);
     }
@@ -534,11 +504,9 @@ async function sendDailyBriefing(env) {
   const today = getTodayKST();
   const schedules = await getTodaySchedules(env);
   if (schedules.length === 0) return;
-
   const sorted = schedules.sort((a, b) => (a.time || "").localeCompare(b.time || ""));
   const lines = sorted.map((s) => `${s.time} ${s.title}`).join("\n");
   const msg = `📅 오늘의 주요 일정\n\n${lines}`;
-
   const rooms = await getAllRooms(env);
   await Promise.all(rooms.map((r) => sendMessage(env, r.id, msg)));
 }
@@ -547,7 +515,6 @@ async function difyChat(env, { query, user, conversationId = "", files = [] }) {
   const body = { inputs: {}, query, response_mode: "streaming", user };
   if (conversationId) body.conversation_id = conversationId;
   if (files.length > 0) body.files = files;
-
   const res = await fetch(`${DIFY_API_URL}/chat-messages`, {
     method: "POST",
     headers: {
@@ -556,26 +523,21 @@ async function difyChat(env, { query, user, conversationId = "", files = [] }) {
     },
     body: JSON.stringify(body),
   });
-
   if (!res.ok) {
     const err = await res.text();
     throw new Error(`Dify API ${res.status}: ${err}`);
   }
-
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let answer = "";
   let newConversationId = "";
   let buffer = "";
-
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split("\n");
     buffer = lines.pop();
-
     for (const line of lines) {
       if (!line.startsWith("data: ")) continue;
       const raw = line.slice(6).trim();
@@ -587,7 +549,6 @@ async function difyChat(env, { query, user, conversationId = "", files = [] }) {
       } catch (_) {}
     }
   }
-
   return { answer, conversation_id: newConversationId };
 }
 
@@ -595,13 +556,11 @@ async function difyUploadFile(env, blob, fileName, mimeType, userId) {
   const form = new FormData();
   form.append("file", new File([blob], fileName, { type: mimeType }));
   form.append("user", userId);
-
   const res = await fetch(`${DIFY_API_URL}/files/upload`, {
     method: "POST",
     headers: { Authorization: `Bearer ${env.DIFY_API_KEY.trim()}` },
     body: form,
   });
-
   if (!res.ok) {
     const err = await res.text();
     throw new Error(`Dify upload error ${res.status}: ${err}`);
