@@ -23,9 +23,10 @@ export default {
     if (request.method !== "POST") {
       return new Response("OK");
     }
+    const isRelay = request.headers.get("X-Bot-Relay") === "true";
     try {
       const update = await request.json();
-      await handleUpdate(update, env);
+      await handleUpdate(update, env, isRelay);
     } catch (e) {
       console.error("handleUpdate error:", e);
     }
@@ -246,7 +247,7 @@ async function handleAdminForward(targetName, content, adminChatId, env) {
   await sendMessage(env, adminChatId, `${targetName}님께 전달 완료했습니다.`);
 }
 
-async function handleUpdate(update, env) {
+async function handleUpdate(update, env, isRelay = false) {
   if (update.my_chat_member) {
     const mc = update.my_chat_member;
     const newStatus = mc.new_chat_member?.status;
@@ -289,13 +290,13 @@ async function handleUpdate(update, env) {
 
   const isPrivate = chatType === "private";
   if (isPrivate) {
-    await handlePrivateMessage(message, userId, chatId, text, hasFile, user, env);
+    await handlePrivateMessage(message, userId, chatId, text, hasFile, user, env, isRelay);
   } else {
     await handleGroupMessage(message, userId, chatId, text, hasFile, user, env);
   }
 }
 
-async function handlePrivateMessage(message, userId, chatId, text, hasFile, user, env) {
+async function handlePrivateMessage(message, userId, chatId, text, hasFile, user, env, isRelay = false) {
   if (hasFile) {
     const isAdmin = await checkIsAdmin(userId, env);
     await handleFile(message, userId, chatId, isAdmin, env);
@@ -339,8 +340,8 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     }
   }
 
-  // 전달 요청 → 권오혁님에게 포워딩
-  if (user.name && isForwardRequest(text)) {
+  // 전달 요청 → 권오혁님에게 포워딩 (릴레이 요청은 스킵)
+  if (!isRelay && user.name && isForwardRequest(text)) {
     const admin = await findAdminUser(env);
     if (admin?.chat_id) {
       await sendMessage(env, admin.chat_id, `${user.name}님이 전달: ${text}`);
