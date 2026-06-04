@@ -613,7 +613,7 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
   // 권오혁봇이 이 방에 있음을 D1에 등록
   await dbRegisterKohInRoom(env, chatId);
 
-  // 멤버십 기록
+  // 멤버십 기록 (메시지 본문 저장은 이동연봇이 항상 담당)
   await dbUpsertMember(env, chatId, userId, "koh");
 
   // 미등록자 텔레그램 이름 자동 저장
@@ -624,16 +624,6 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     user = { id: userId, name: tgName, chat_id: chatId };
     await saveUser(userId, user, env);
   }
-
-  // 권오혁봇이 방에 있으므로 대화 본문 저장 담당 (saved_by='koh')
-  await dbInsert(env, {
-    roomId:     chatId,
-    roomTitle:  message.chat.title,
-    senderId:   userId,
-    senderName: user?.name || message.from?.first_name || "",
-    content:    text,
-    savedBy:    "koh",
-  });
 
   // 본인 등록 정보 조회 → KV 직접 답변
   if (isSelfInfoQuery(text)) {
