@@ -100,7 +100,7 @@ async function getAllRooms(env) {
 
 // ── D1 (Cloudflare SQLite) ────────────────────────────────────
 // 방 대화 저장 (권오혁봇이 방에 있으면 담당)
-async function dbInsert(env, { roomId, roomTitle, senderId, senderName, content }) {
+async function dbInsert(env, { roomId, roomTitle, senderId, senderName, content, savedBy }) {
   if (!env.DB || !content?.trim()) return;
   try {
     await env.DB.prepare(
@@ -113,7 +113,7 @@ async function dbInsert(env, { roomId, roomTitle, senderId, senderName, content 
         String(senderId),
         senderName || "",
         content.slice(0, 4000),
-        "koh"
+        savedBy || "koh"
       )
       .run();
   } catch (e) {
@@ -627,11 +627,12 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
 
   // 권오혁봇이 방에 있으므로 대화 본문 저장 담당 (saved_by='koh')
   await dbInsert(env, {
-    roomId: chatId,
-    roomTitle: message.chat.title,
-    senderId: userId,
+    roomId:     chatId,
+    roomTitle:  message.chat.title,
+    senderId:   userId,
     senderName: user?.name || message.from?.first_name || "",
-    content: text,
+    content:    text,
+    savedBy:    "koh",
   });
 
   // 본인 등록 정보 조회 → KV 직접 답변
