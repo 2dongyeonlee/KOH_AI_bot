@@ -738,8 +738,16 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
 
     const fileInfo = await tgGetFile(env, fileId);
     const fileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
-    const fileBlob = await fetch(fileUrl).then((r) => r.blob());
 
+    // 이미지는 Gemini로, 문서는 Dify로 처리
+    if (mimeType.startsWith("image/") && env.GEMINI_API_KEY) {
+      const buffer = await fetch(fileUrl).then((r) => r.arrayBuffer());
+      const answer = await analyzeImageWithClaude(env, buffer, mimeType);
+      await sendMessage(env, chatId, answer);
+      return;
+    }
+
+    const fileBlob = await fetch(fileUrl).then((r) => r.blob());
     const uploaded = await difyUploadFile(env, fileBlob, fileName, mimeType, userId);
     if (!uploaded.id) throw new Error("Dify 파일 업로드 실패: " + JSON.stringify(uploaded));
 
@@ -750,13 +758,7 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
     const filePayload = {
       query: TONE_RULE + SUMMARY_PROMPT,
       user: userId,
-      files: [
-        {
-          type: difyFileType(mimeType),
-          transfer_method: "local_file",
-          upload_file_id: uploaded.id,
-        },
-      ],
+      files: [{ type: difyFileType(mimeType), transfer_method: "local_file", upload_file_id: uploaded.id }],
     };
 
     let result;
@@ -779,6 +781,38 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
     console.error("handleFile error:", e);
     await sendMessage(env, chatId, `❌ 파일 처리 오류\n${e.message}`);
   }
+}
+
+async function analyzeImageWithClaude(env, buffer, mimeType) {
+  const validMimes = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+  const imgMime = validMimes.includes(mimeType) ? mimeType : "image/jpeg";
+
+  const uint8 = new Uint8Array(buffer);
+  const chunks = [];
+  for (let i = 0; i < uint8.length; i += 8192) {
+    chunks.push(String.fromCharCode(...uint8.subarray(i, i + 8192)));
+  }
+  const base64 = btoa(chunks.join(""));
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${env.GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { inline_data: { mime_type: imgMime, data: base64 } },
+            { text: TONE_RULE + "이 이미지를 설명하고 핵심 내용을 한국어로 요약해줘." },
+          ],
+        }],
+      }),
+    }
+  );
+
+  if (!res.ok) throw new Error(`Gemini API ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || "분석 결과를 받지 못했습니다.";
 }
 
 async function sendDailyBriefing(env) {
