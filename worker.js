@@ -98,40 +98,81 @@ async function getAllRooms(env) {
   return rooms;
 }
 
-// ── Supabase ─────────────────────────────────────────────────
-// 멤버십 기록 (메시지 본문 저장은 이동연봇 담당 → 중복 방지)
-async function sbUpsertMember(env, roomId, userId) {
-  if (!env.SUPABASE_URL || !env.SUPABASE_KEY) return;
+// ── D1 (Cloudflare SQLite) ────────────────────────────────────
+// 방 대화 저장 (권오혁봇이 방에 있으면 담당)
+async function dbInsert(env, { roomId, roomTitle, senderId, senderName, content }) {
+  if (!env.DB || !content?.trim()) return;
   try {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/room_members`, {
-      method: "POST",
-      headers: {
-        apikey: env.SUPABASE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_KEY}`,
-        "Content-Type": "application/json",
-        Prefer: "resolution=merge-duplicates,return=minimal",
-      },
-      body: JSON.stringify({ room_id: String(roomId), user_id: String(userId) }),
-    });
+    await env.DB.prepare(
+      `INSERT INTO messages (room_id, room_title, sender_id, sender_name, content, saved_by)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        String(roomId),
+        roomTitle || "",
+        String(senderId),
+        senderName || "",
+        content.slice(0, 4000),
+        "koh"
+      )
+      .run();
   } catch (e) {
-    console.error("sbUpsertMember:", e);
+    console.error("dbInsert:", e);
   }
 }
 
-// 전체 방 검색 (두 봇 모두 전체 방 접근 — 내부 도구)
-async function sbSearchAll(env, { roomTitle, keyword, days = 7 }) {
-  if (!env.SUPABASE_URL || !env.SUPABASE_KEY) return [];
-  const since = new Date(Date.now() - days * 86400000).toISOString();
-  let url = `${env.SUPABASE_URL}/rest/v1/messages?created_at=gte.${since}&order=created_at.desc&limit=120`;
-  if (roomTitle) url += `&room_title=ilike.*${encodeURIComponent(roomTitle)}*`;
-  if (keyword) url += `&content=ilike.*${encodeURIComponent(keyword)}*`;
+// 멤버십 기록
+async function dbUpsertMember(env, roomId, userId, botName) {
+  if (!env.DB) return;
   try {
-    const res = await fetch(url, {
-      headers: { apikey: env.SUPABASE_KEY, Authorization: `Bearer ${env.SUPABASE_KEY}` },
-    });
-    return res.ok ? await res.json() : [];
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO room_members (room_id, user_id, bot_name) VALUES (?, ?, ?)`
+    )
+      .bind(String(roomId), String(userId), botName || "koh")
+      .run();
   } catch (e) {
-    console.error("sbSearchAll:", e);
+    console.error("dbUpsertMember:", e);
+  }
+}
+
+// 권오혁봇 존재 등록 (방에 처음 들어올 때)
+async function dbRegisterKohInRoom(env, roomId) {
+  if (!env.DB) return;
+  try {
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO room_members (room_id, user_id, bot_name) VALUES (?, ?, ?)`
+    )
+      .bind(String(roomId), "koh_bot", "koh")
+      .run();
+  } catch (e) {
+    console.error("dbRegisterKohInRoom:", e);
+  }
+}
+
+// 방 대화 검색 (두 봇이 같은 DB 공유하므로 전체 검색 가능)
+async function dbSearch(env, { roomTitle, keyword, days = 7 }) {
+  if (!env.DB) return [];
+  try {
+    const since = new Date(Date.now() - days * 86400000)
+      .toISOString()
+      .replace("T", " ")
+      .slice(0, 19);
+    let query = `SELECT * FROM messages WHERE created_at >= ? ORDER BY created_at DESC LIMIT 100`;
+    const params = [since];
+    if (roomTitle && !keyword) {
+      query = `SELECT * FROM messages WHERE created_at >= ? AND room_title LIKE ? ORDER BY created_at DESC LIMIT 100`;
+      params.push(`%${roomTitle}%`);
+    } else if (keyword && !roomTitle) {
+      query = `SELECT * FROM messages WHERE created_at >= ? AND content LIKE ? ORDER BY created_at DESC LIMIT 100`;
+      params.push(`%${keyword}%`);
+    } else if (roomTitle && keyword) {
+      query = `SELECT * FROM messages WHERE created_at >= ? AND room_title LIKE ? AND content LIKE ? ORDER BY created_at DESC LIMIT 100`;
+      params.push(`%${roomTitle}%`, `%${keyword}%`);
+    }
+    const result = await env.DB.prepare(query).bind(...params).all();
+    return result.results || [];
+  } catch (e) {
+    console.error("dbSearch:", e);
     return [];
   }
 }
@@ -234,6 +275,20 @@ function isNewsQuery(text) {
   return /뉴스/.test(text) || /최신\s*(기사|소식)/.test(text);
 }
 
+function isIntroQuery(text) {
+  return (
+    /(뭐\s*할\s*수\s*있|기능|도움말|소개)/.test(text) ||
+    /너\s*(는|가)?\s*(뭐야|누구야|할\s*수)/.test(text)
+  );
+}
+
+function isUserListQuery(text) {
+  return (
+    /(누가|누구|팀원).{0,10}(등록|저장|있어|됐어)/.test(text) ||
+    /등록된\s*(사람|팀원|목록)/.test(text)
+  );
+}
+
 function isRoomSearchQuery(text) {
   return (
     /(방|프로젝트|회의|단톡).{0,12}(에서|얘기|논의|대화|내용|정리|요약|찾)/.test(text) ||
@@ -302,6 +357,48 @@ async function handleSelfInfo(user, userId, chatId, env) {
   if (user.team) msg += `\n소속: ${user.team}`;
   if (user.role) msg += `\n담당: ${user.role}`;
   await sendMessage(env, chatId, msg);
+}
+
+async function handleIntro(chatId, env) {
+  await sendMessage(
+    env,
+    chatId,
+    `권오혁 담당의 AI 비서입니다.
+
+일정
+- 오늘/이번주 일정 알려줘
+
+파일·이미지
+- PDF, PPT, 사진 올리면 요약·분석
+
+팀방 검색
+- A방 지난주 논의 정리해줘
+- HBM 관련 대화 찾아줘
+
+내 정보
+- 내 아이디 뭐야
+- 누가 등록됐어`
+  );
+}
+
+async function handleUserList(chatId, env) {
+  const list = await env.USERS.list({ prefix: "user_" });
+  const users = [];
+  for (const key of list.keys) {
+    const raw = await env.USERS.get(key.name);
+    if (!raw) continue;
+    const u = JSON.parse(raw);
+    if (u.name && !u.step) {
+      users.push(`${u.name} (ID: ${u.id})${u.team ? " / " + u.team : ""}`);
+    }
+  }
+  await sendMessage(
+    env,
+    chatId,
+    users.length
+      ? `등록된 팀원 ${users.length}명:\n\n${users.join("\n")}`
+      : "아직 등록된 분이 없습니다."
+  );
 }
 
 function isForwardRequest(text) {
@@ -382,9 +479,29 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
 
   if (!text.trim()) return;
 
-  // 이름 입력 대기 중 → 등록 처리 (Dify 호출 없음)
+  // 이름 입력 대기 중 → 등록 처리 (Dify 호출 없음) [기존 호환]
   if (user?.step === "waiting_name_auto") {
     await handleAutoRegister(userId, chatId, text.trim(), env);
+    return;
+  }
+
+  // 첫 접촉: 텔레그램 이름·ID 자동 저장 (릴레이는 임시 사용자로 처리)
+  if (!user) {
+    if (isRelay) {
+      user = { id: userId, name: message.from?.first_name || "사용자", chat_id: chatId };
+    } else {
+      const tgName =
+        [message.from?.first_name, message.from?.last_name].filter(Boolean).join(" ").trim() ||
+        `user_${userId}`;
+      await saveUser(userId, { id: userId, name: tgName, chat_id: chatId }, env);
+      await sendMessage(env, chatId, PRIVATE_GREETING);
+      return;
+    }
+  }
+
+  // 기능 소개
+  if (isIntroQuery(text)) {
+    await handleIntro(chatId, env);
     return;
   }
 
@@ -394,17 +511,26 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
+  // 등록자 목록 (관리자만)
+  if (isUserListQuery(text)) {
+    const isAdmin = await checkIsAdmin(userId, env);
+    if (isAdmin) {
+      await handleUserList(chatId, env);
+      return;
+    }
+  }
+
   // 뉴스 조회 → RSS 직접 답변
   if (isNewsQuery(text)) {
     await handleNewsQuery(chatId, env);
     return;
   }
 
-  // 종합분석 — 뉴스 + 팀방 교차분석 (Supabase 설정 시에만)
-  if (env.SUPABASE_URL && isCombinedAnalysis(text)) {
+  // 종합분석 — 뉴스 + 팀방 교차분석 (공유 D1)
+  if (env.DB && isCombinedAnalysis(text)) {
     const q = parseSearch(text);
     const [rows, newsText] = await Promise.all([
-      sbSearchAll(env, q),
+      dbSearch(env, q),
       fetchNewsRaw(env, q.keyword || "AI 산업"),
     ]);
     const roomCorpus = rows.length
@@ -427,10 +553,10 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
-  // 팀방 검색·요약 (Supabase 설정 시에만)
-  if (env.SUPABASE_URL && isRoomSearchQuery(text)) {
+  // 팀방 검색·요약 (공유 D1에서 전체 검색)
+  if (isRoomSearchQuery(text)) {
     const q = parseSearch(text);
-    const rows = await sbSearchAll(env, q);
+    const rows = await dbSearch(env, q);
     if (rows.length === 0) {
       await sendMessage(env, chatId, "해당 조건의 대화 기록이 없습니다.");
       return;
@@ -443,17 +569,6 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     const query = TONE_RULE + "다음 팀 대화 기록의 핵심 논의를 항목별로 요약해줘.\n\n" + corpus;
     const result = await difyChat(env, { query, user: userId, conversationId: "" });
     await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했습니다.");
-    return;
-  }
-
-  // 첫 접촉 → 텔레그램 이름·ID 자동 저장 후 Dify 답변
-  if (!user) {
-    const tgName =
-      [message.from?.first_name, message.from?.last_name].filter(Boolean).join(" ").trim() ||
-      `user_${userId}`;
-    await saveUser(userId, { id: userId, name: tgName, chat_id: chatId }, env);
-    await sendMessage(env, chatId, PRIVATE_GREETING);
-    await handleUserMessage(userId, chatId, text.trim(), true, env);
     return;
   }
 
@@ -495,10 +610,13 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
 
   if (!text.trim()) return;
 
-  // 멤버십 기록 (메시지 본문 저장은 이동연봇 담당)
-  await sbUpsertMember(env, chatId, userId);
+  // 권오혁봇이 이 방에 있음을 D1에 등록
+  await dbRegisterKohInRoom(env, chatId);
 
-  // 미등록자도 텔레그램 이름으로 자동 등록 (ID 확보)
+  // 멤버십 기록
+  await dbUpsertMember(env, chatId, userId, "koh");
+
+  // 미등록자 텔레그램 이름 자동 저장
   if (!user) {
     const tgName =
       [message.from?.first_name, message.from?.last_name].filter(Boolean).join(" ").trim() ||
@@ -506,6 +624,15 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     user = { id: userId, name: tgName, chat_id: chatId };
     await saveUser(userId, user, env);
   }
+
+  // 권오혁봇이 방에 있으므로 대화 본문 저장 담당 (saved_by='koh')
+  await dbInsert(env, {
+    roomId: chatId,
+    roomTitle: message.chat.title,
+    senderId: userId,
+    senderName: user?.name || message.from?.first_name || "",
+    content: text,
+  });
 
   // 본인 등록 정보 조회 → KV 직접 답변
   if (isSelfInfoQuery(text)) {
@@ -758,9 +885,15 @@ async function tgGetFile(env, fileId) {
 }
 
 async function sendMessage(env, chatId, text) {
+  const clean = String(text)
+    .replace(/\*\*(.+?)\*\*/gs, "$1")
+    .replace(/\*(.+?)\*/gs, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/__(.+?)__/gs, "$1")
+    .replace(/`{1,3}([^`]*)`{1,3}/g, "$1");
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text }),
+    body: JSON.stringify({ chat_id: chatId, text: clean }),
   });
 }

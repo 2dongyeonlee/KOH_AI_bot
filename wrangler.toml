@@ -8,6 +8,12 @@ DIFY_API_URL = "https://api.dify.ai/v1"
 [triggers]
 crons = ["0 23 * * *"]
 
+# ⚠️ dylee-ai-bot과 동일한 D1 database_id를 넣어야 합니다 (배포 전 필수 교체)
+[[d1_databases]]
+binding = "DB"
+database_name = "6r-ai-db"
+database_id = "REPLACE_WITH_DYLEE_D1_DATABASE_ID"
+
 [[kv_namespaces]]
 binding = "USERS"
 id = "65a2237c4bf94cb1a24346daa9628536"
