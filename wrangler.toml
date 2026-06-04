@@ -12,7 +12,7 @@ crons = ["0 23 * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "6r-ai-db"
-database_id = "REPLACE_WITH_DYLEE_D1_DATABASE_ID"
+database_id = "d55c7eaa-ef2e-40e5-8283-a50008dc5fb2"
 
 [[kv_namespaces]]
 binding = "USERS"
