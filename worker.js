@@ -20,6 +20,24 @@ const GROUP_WELCOME =
 
 export default {
   async fetch(request, env) {
+    const url = new URL(request.url);
+
+    // 이동연봇에서 전달받는 relay 처리
+    if (url.pathname === "/relay" && request.method === "POST") {
+      try {
+        const body = await request.json();
+        const { from, content } = body;
+        const kohUser = await findUserByName("권오혁", env);
+        if (kohUser?.chat_id) {
+          await sendMessage(env, kohUser.chat_id, `[이동연 TL 전달]\n${from}: ${content}`);
+        }
+        return new Response("ok", { status: 200 });
+      } catch (e) {
+        console.error("relay error:", e);
+        return new Response("error", { status: 500 });
+      }
+    }
+
     if (request.method !== "POST") {
       return new Response("OK");
     }
@@ -174,6 +192,21 @@ async function dbSearch(env, { roomTitle, keyword, days = 7 }) {
   } catch (e) {
     console.error("dbSearch:", e);
     return [];
+  }
+}
+
+// conversations 테이블에 대화 저장
+async function dbSaveConversation(env, { userId, userName, question, answer, context = "" }) {
+  if (!env.DB || !question?.trim() || !answer?.trim()) return;
+  try {
+    await env.DB.prepare(
+      `INSERT INTO conversations (user_id, user_name, question, answer, context)
+       VALUES (?, ?, ?, ?, ?)`
+    )
+      .bind(String(userId), userName || "", question.slice(0, 2000), answer.slice(0, 4000), context)
+      .run();
+  } catch (e) {
+    console.error("dbSaveConversation:", e);
   }
 }
 
@@ -592,68 +625,7 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
   }
 
   // 등록 여부 상관없이 모든 메시지 Dify 답변
-  await handleUserMessage(userId, chatId, text.trim(), true, env);
-}
-
-async function handleGroupMessage(message, userId, chatId, text, hasFile, user, env) {
-  const isRegistered = !!(user?.name);
-
-  if (hasFile) {
-    if (isRegistered) {
-      const isAdmin = await checkIsAdmin(userId, env);
-      await handleFile(message, userId, chatId, isAdmin, env);
-    } else {
-      await sendMessage(env, chatId, "/등록 명령어로 먼저 등록해 주세요.");
-    }
-    return;
-  }
-
-  if (!text.trim()) return;
-
-  // 권오혁봇이 이 방에 있음을 D1에 등록
-  await dbRegisterKohInRoom(env, chatId);
-
-  // 멤버십 기록 (메시지 본문 저장은 이동연봇이 항상 담당)
-  await dbUpsertMember(env, chatId, userId, "koh");
-
-  // 미등록자 텔레그램 이름 자동 저장
-  if (!user) {
-    const tgName =
-      [message.from?.first_name, message.from?.last_name].filter(Boolean).join(" ").trim() ||
-      `user_${userId}`;
-    user = { id: userId, name: tgName, chat_id: chatId };
-    await saveUser(userId, user, env);
-  }
-
-  // 본인 등록 정보 조회 → KV 직접 답변
-  if (isSelfInfoQuery(text)) {
-    await handleSelfInfo(user, userId, chatId, env);
-    return;
-  }
-
-  // 뉴스 조회 → RSS 직접 답변
-  if (isNewsQuery(text)) {
-    await handleNewsQuery(chatId, env);
-    return;
-  }
-
-  const schedule = extractSchedule(text, getTodayKST());
-  if (schedule) {
-    schedule.chat_id = chatId;
-    await saveSchedule(env, schedule);
-  }
-
-  // 키워드 포함 시만 Dify 호출
-  if (hasGroupKeyword(text)) {
-    const sendReply = user?.name === ADMIN_NAME;
-    await handleUserMessage(userId, chatId, text.trim(), sendReply, env);
-  }
-}
-
-function hasGroupKeyword(text) {
-  return ["일정", "언제", "어디", "보고드립니다", "권오혁(A)", "권오혁A", "비서", "?"].some(
-    (kw) => text.includes(kw)
-  );
+  await handleUserMessage(userId, chatId, text.trim(), true, env, user?.name || "");
 }
 
 async function handleAutoRegister(userId, chatId, name, env) {
@@ -690,26 +662,35 @@ async function handleRegisterStep3(userId, chatId, input, env) {
   await sendMessage(env, chatId, `등록 완료되었습니다. ${user.name}님${suffix}.`);
 }
 
-async function handleUserMessage(userId, chatId, text, sendReply, env) {
+async function handleUserMessage(userId, chatId, text, sendReply, env, userName = "") {
   try {
-    const conversationId = (await env.CONVERSATIONS.get(`conv_${userId}`)) || "";
+    const convKey = `conv_${userId}`;
+    const conversationId = (await env.CONVERSATIONS.get(convKey)) || "";
     const query = TONE_RULE + text;
     let result;
 
     try {
-      result = await difyChat(env, { query, user: userId, conversationId });
+      result = await difyChat(env, { query, user: String(userId), conversationId });
     } catch (e) {
       if (e.message.includes("not_found") || e.message.includes("Conversation Not Exists")) {
-        await env.CONVERSATIONS.delete(`conv_${userId}`);
-        result = await difyChat(env, { query, user: userId, conversationId: "" });
+        await env.CONVERSATIONS.delete(convKey);
+        result = await difyChat(env, { query, user: String(userId), conversationId: "" });
       } else {
         throw e;
       }
     }
 
     if (result.conversation_id) {
-      await env.CONVERSATIONS.put(`conv_${userId}`, result.conversation_id);
+      await env.CONVERSATIONS.put(convKey, result.conversation_id, { expirationTtl: 86400 });
     }
+
+    // D1에 대화 이력 저장
+    await dbSaveConversation(env, {
+      userId,
+      userName,
+      question: text,
+      answer: result.answer || "",
+    });
 
     if (sendReply) {
       await sendMessage(env, chatId, result.answer || "응답을 받지 못했어요.");
@@ -719,6 +700,77 @@ async function handleUserMessage(userId, chatId, text, sendReply, env) {
     if (sendReply) {
       await sendMessage(env, chatId, `❌ 오류 발생\n${e.message}`);
     }
+  }
+}
+
+async function handleGroupMessage(message, userId, chatId, text, hasFile, user, env) {
+  if (hasFile) {
+    await handleFile(message, userId, chatId, false, env);
+    return;
+  }
+
+  if (!text.trim()) return;
+
+  // 멤버십 + 방 등록
+  await dbRegisterKohInRoom(env, chatId);
+  await dbUpsertMember(env, chatId, userId, "koh");
+
+  // 미등록자 이름 자동 저장
+  if (!user) {
+    const tgName =
+      [message.from?.first_name, message.from?.last_name].filter(Boolean).join(" ").trim() ||
+      `user_${userId}`;
+    await saveUser(userId, { id: userId, name: tgName, chat_id: chatId }, env);
+    user = await getUser(userId, env);
+  }
+
+  // 일정 감지 (브리핑 cron용)
+  const schedule = extractSchedule(text, getTodayKST());
+  if (schedule) {
+    schedule.chat_id = chatId;
+    await saveSchedule(env, schedule);
+  }
+
+  // 멘션 또는 봇 메시지 reply인 경우만 응답
+  const botUsername = "@KOH_AI_bot";
+  const isMentioned = text.includes(botUsername);
+  const isReply = message.reply_to_message?.from?.is_bot === true;
+  const cleanText = text.replace(botUsername, "").trim();
+
+  if (!isMentioned && !isReply) return;
+
+  if (!cleanText) {
+    await sendMessage(env, chatId, `네, ${user?.name || ""}님. 무엇을 도와드릴까요?`);
+    return;
+  }
+
+  // 팀방 검색
+  if (isRoomSearchQuery(cleanText)) {
+    const q = parseSearch(cleanText);
+    const rows = await dbSearch(env, q);
+    if (rows.length === 0) {
+      await sendMessage(env, chatId, "해당 조건의 대화 기록이 없습니다.");
+      return;
+    }
+    const corpus = rows
+      .reverse()
+      .map((r) => `[${r.room_title}] ${r.sender_name}: ${r.content}`)
+      .join("\n")
+      .slice(0, 6000);
+    const query = TONE_RULE + "다음 팀 대화 기록의 핵심 논의를 항목별로 요약해줘.\n\n" + corpus;
+    const result = await difyChat(env, { query, user: userId, conversationId: "" });
+    await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했습니다.");
+    return;
+  }
+
+  // 일반 질문 → Dify (그룹방 맥락 포함, 대화 흐름 없이 단발 응답)
+  const contextMsg =
+    TONE_RULE +
+    `[단체방: ${message.chat.title}] [발신자: ${user?.name || message.from?.first_name}] ` +
+    cleanText;
+  const result = await difyChat(env, { query: contextMsg, user: userId, conversationId: "" });
+  if (result.answer) {
+    await sendMessage(env, chatId, result.answer);
   }
 }
 
