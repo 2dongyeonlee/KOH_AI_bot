@@ -296,6 +296,40 @@ function extractSchedule(text, todayISO) {
   return { date: dateStr, time: timeStr, title };
 }
 
+function cleanName(raw) {
+  if (!raw) return "";
+  return raw
+    .trim()
+    .replace(/\s*(입니다|이에요|이야|예요|이라고|라고|으로|로)$/g, "")
+    .replace(/\s*(팀원|담당|TL|팀장|사원|주임|대리|과장|차장|부장|임원|상무|전무|사장)$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isUserUpdateQuery(text) {
+  return (
+    /(이름|성함|명칭).{0,30}(바꿔|변경|수정|고쳐|바꾸|수정하고)/.test(text) ||
+    /(바꿔|변경|수정|고쳐).{0,20}(이름|성함|명칭)/.test(text) ||
+    /이름\s+([가-힣]{2,5})/.test(text) ||
+    /([가-힣]{2,5})(으?로|로)\s*(이름|명칭)?\s*(바꿔|변경|수정|고쳐|저장)/.test(text)
+  );
+}
+
+function extractNewName(text) {
+  const patterns = [
+    /이름\s*([가-힣]{2,5})\s*(으?로|이라고|라고)?\s*(바꿔|변경|수정|고쳐|저장)/,
+    /이름\s+([가-힣]{2,5})/,
+    /([가-힣]{2,5})(으?로|로)\s*(이름|명칭)?\s*(바꿔|변경|수정|고쳐|저장)/,
+    /([가-힣]{2,5})(으?로|로)\s*(바꿔|변경|수정|고쳐줘)/,
+    /내\s*이름\s*([가-힣]{2,5})/,
+  ];
+  for (const p of patterns) {
+    const m = text.match(p);
+    if (m) return cleanName(m[1]);
+  }
+  return null;
+}
+
 function isSelfInfoQuery(text) {
   return (
     /내\s*(아이디|[iI][dD])/.test(text) ||
@@ -422,7 +456,8 @@ async function handleUserList(chatId, env) {
     if (!raw) continue;
     const u = JSON.parse(raw);
     if (u.name && !u.step) {
-      users.push(`${u.name} (ID: ${u.id})${u.team ? " / " + u.team : ""}`);
+      const name = cleanName(u.name) || u.name;
+      users.push(`${name} (${u.id})`);
     }
   }
   await sendMessage(
@@ -541,6 +576,26 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
   // 본인 등록 정보 조회 → KV 직접 답변
   if (isSelfInfoQuery(text)) {
     await handleSelfInfo(user, userId, chatId, env);
+    return;
+  }
+
+  // 이름 수정
+  if (isUserUpdateQuery(text)) {
+    const newName = extractNewName(text);
+    if (!newName || newName.length < 2) {
+      await sendMessage(
+        env,
+        chatId,
+        "이름을 명확히 알려주세요.\n" +
+        "예) 이름 권오혁으로 바꿔줘\n" +
+        "예) 권오혁으로 수정해줘"
+      );
+      return;
+    }
+    const oldName = user?.name || "미등록";
+    const cleaned = cleanName(newName);
+    await saveUser(userId, { ...user, name: cleaned }, env);
+    await sendMessage(env, chatId, `${oldName} → ${cleaned} 으로 변경했습니다.`);
     return;
   }
 
