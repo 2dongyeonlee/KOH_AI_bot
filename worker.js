@@ -303,6 +303,50 @@ async function dbSaveConversation(env, { userId, userName, question, answer, con
   }
 }
 
+async function dbSaveFile(env, { roomId, roomTitle, senderId, senderName, fileName, mimeType, summary, savedBy }) {
+  if (!env.DB) return;
+  try {
+    await env.DB.prepare(
+      `INSERT INTO files (room_id, room_title, sender_id, sender_name, file_name, mime_type, summary, saved_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        String(roomId),
+        roomTitle || "",
+        String(senderId),
+        senderName || "",
+        fileName || "",
+        mimeType || "",
+        (summary || "").slice(0, 4000),
+        savedBy || "koh"
+      )
+      .run();
+  } catch (e) {
+    console.error("dbSaveFile:", e);
+  }
+}
+
+async function dbSearchFiles(env, { roomTitle, keyword, days = 7 }) {
+  if (!env.DB) return [];
+  try {
+    const since = new Date(Date.now() - days * 86400000)
+      .toISOString().replace("T", " ").slice(0, 19);
+    let where = "created_at >= ?";
+    const params = [since];
+    if (roomTitle) { where += " AND room_title LIKE ?"; params.push(`%${roomTitle}%`); }
+    if (keyword) {
+      where += " AND (file_name LIKE ? OR summary LIKE ?)";
+      params.push(`%${keyword}%`, `%${keyword}%`);
+    }
+    const query = `SELECT * FROM files WHERE ${where} ORDER BY created_at DESC LIMIT 50`;
+    const result = await env.DB.prepare(query).bind(...params).all();
+    return result.results || [];
+  } catch (e) {
+    console.error("dbSearchFiles:", e);
+    return [];
+  }
+}
+
 async function fetchNewsRaw(env, keyword) {
   try {
     const q = encodeURIComponent(keyword || "AI 산업");
@@ -487,6 +531,37 @@ function isRoomSearchQuery(text) {
   );
 }
 
+function isDigestQuery(text) {
+  return (
+    /(오늘|어제|이번주|최근).{0,10}(공유|올라온|전달된|업로드|자료|파일)/.test(text) ||
+    /(자료|파일|공유).{0,10}(정리|요약|모아)/.test(text) ||
+    /공유된\s*(자료|파일|내용)/.test(text)
+  );
+}
+
+async function buildDigest(env, { days = 1, keyword = null } = {}) {
+  const [messages, files] = await Promise.all([
+    dbSearch(env, { days, keyword }),
+    dbSearchFiles(env, { days, keyword }),
+  ]);
+  let corpus = "";
+  if (files.length > 0) {
+    corpus += "=== 공유된 파일 ===\n";
+    corpus += files
+      .map((f) => `[${f.room_title}] ${f.sender_name}: ${f.file_name}\n요약: ${f.summary}`)
+      .join("\n\n");
+    corpus += "\n\n";
+  }
+  if (messages.length > 0) {
+    corpus += "=== 관련 대화 ===\n";
+    corpus += messages
+      .map((r) => `[${r.room_title}] ${r.sender_name}: ${r.content}`)
+      .join("\n")
+      .slice(0, 4000);
+  }
+  return corpus.trim() || null;
+}
+
 function isCombinedAnalysis(text) {
   return (
     /(종합|교차|총정리).{0,6}(분석|정리|요약|브리핑)/.test(text) ||
@@ -642,7 +717,7 @@ async function handleUpdate(update, env, isRelay = false) {
   }
 
   if (text.split("@")[0].trim() === "/등록") {
-    await handleRegisterStep1(userId, chatId, env);
+    await handleRegisterInstant(userId, chatId, message, env);
     return;
   }
 
@@ -783,6 +858,23 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
+  // 자료 digest 조회
+  if (isDigestQuery(text)) {
+    const days = parseDays(text);
+    const corpus = await buildDigest(env, { days });
+    if (!corpus) {
+      await sendMessage(env, chatId, `최근 ${days}일간 공유된 자료가 없습니다.`);
+      return;
+    }
+    const query =
+      TONE_RULE +
+      `다음은 최근 ${days}일간 팀에서 공유된 자료와 대화입니다. 핵심 내용을 항목별로 정리해줘.\n\n` +
+      corpus;
+    const result = await difyChat(env, { query, user: userId, conversationId: "" });
+    await sendMessage(env, chatId, result.answer || "정리 중 오류가 발생했습니다.");
+    return;
+  }
+
   // 팀방 검색·요약 (공유 D1에서 전체 검색)
   if (isRoomSearchQuery(text)) {
     const q = parseSearch(text);
@@ -860,6 +952,16 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
 
   // 등록 여부 상관없이 모든 메시지 Dify 답변
   await handleUserMessage(userId, chatId, text.trim(), true, env, user?.name || "");
+}
+
+async function handleRegisterInstant(userId, chatId, message, env) {
+  const tgName =
+    [message.from?.first_name, message.from?.last_name].filter(Boolean).join(" ").trim() ||
+    `user_${userId}`;
+  const name = cleanName(tgName) || tgName;
+  const existing = await getUser(userId, env);
+  await saveUser(userId, { ...(existing || {}), id: userId, name, chat_id: chatId }, env);
+  await sendMessage(env, chatId, `${name}님으로 등록되었습니다.`);
 }
 
 async function handleAutoRegister(userId, chatId, name, env) {
@@ -1081,6 +1183,11 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
       mimeType = "image/jpeg";
     }
 
+    const roomId = message.chat.id;
+    const roomTitle = message.chat.title || String(chatId);
+    const senderUser = await getUser(userId, env);
+    const senderName = senderUser?.name || message.from?.first_name || "";
+
     const fileInfo = await tgGetFile(env, fileId);
     const fileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
 
@@ -1088,6 +1195,7 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
     if (mimeType.startsWith("image/") && env.GEMINI_API_KEY) {
       const buffer = await fetch(fileUrl).then((r) => r.arrayBuffer());
       const answer = await analyzeImageWithClaude(env, buffer, mimeType);
+      await dbSaveFile(env, { roomId, roomTitle, senderId: userId, senderName, fileName, mimeType, summary: answer, savedBy: "koh" });
       await sendMessage(env, chatId, answer);
       return;
     }
@@ -1121,10 +1229,13 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
     if (isAdmin && result.conversation_id) {
       await env.CONVERSATIONS.put(`conv_${userId}`, result.conversation_id);
     }
-    await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했어요.");
+
+    const summary = result.answer || "";
+    await dbSaveFile(env, { roomId, roomTitle, senderId: userId, senderName, fileName, mimeType, summary, savedBy: "koh" });
+    await sendMessage(env, chatId, summary || "요약 중 오류가 발생했어요.");
   } catch (e) {
     console.error("handleFile error:", e);
-    await sendMessage(env, chatId, `❌ 파일 처리 오류\n${e.message}`);
+    await sendMessage(env, chatId, `파일 처리 오류\n${e.message}`);
   }
 }
 
@@ -1161,13 +1272,36 @@ async function analyzeImageWithClaude(env, buffer, mimeType) {
 }
 
 async function sendDailyBriefing(env) {
-  const today = getTodayKST();
   const schedules = await getTodaySchedules(env);
-  if (schedules.length === 0) return;
+  let msg = "";
 
-  const sorted = schedules.sort((a, b) => (a.time || "").localeCompare(b.time || ""));
-  const lines = sorted.map((s) => `${s.time} ${s.title}`).join("\n");
-  const msg = `📅 오늘의 주요 일정\n\n${lines}`;
+  // 어제 공유된 자료 digest
+  const digest = await buildDigest(env, { days: 1 });
+  if (digest) {
+    try {
+      const adminUser = await findAdminUser(env);
+      const query =
+        TONE_RULE +
+        "다음은 어제 팀에서 공유된 자료와 대화입니다. 핵심 내용을 3줄로 요약해줘.\n\n" +
+        digest;
+      const result = await difyChat(env, {
+        query,
+        user: String(adminUser?.id || "admin"),
+        conversationId: "",
+      });
+      if (result.answer) msg += `📦 어제 공유된 자료 요약\n\n${result.answer}\n\n`;
+    } catch (e) {
+      console.error("digest in briefing:", e);
+    }
+  }
+
+  if (schedules.length > 0) {
+    const sorted = schedules.sort((a, b) => (a.time || "").localeCompare(b.time || ""));
+    const lines = sorted.map((s) => `${s.time} ${s.title}`).join("\n");
+    msg += `📅 오늘의 주요 일정\n\n${lines}`;
+  }
+
+  if (!msg) return;
 
   const rooms = await getAllRooms(env);
   await Promise.all(rooms.map((r) => sendMessage(env, r.id, msg)));
