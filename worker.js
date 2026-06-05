@@ -167,6 +167,31 @@ async function dbRegisterKohInRoom(env, roomId) {
   }
 }
 
+async function dbRegisterRoom(env, roomId, roomTitle, botName) {
+  if (!env.DB) return;
+  try {
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO rooms (room_id, room_title, bot_name) VALUES (?, ?, ?)`
+    )
+      .bind(String(roomId), roomTitle || "", botName || "koh")
+      .run();
+  } catch (e) {
+    console.error("dbRegisterRoom:", e);
+  }
+}
+
+async function dbGetAllRooms(env) {
+  if (!env.DB) return [];
+  try {
+    const result = await env.DB.prepare(
+      `SELECT DISTINCT room_id, room_title FROM rooms ORDER BY joined_at DESC`
+    ).all();
+    return result.results || [];
+  } catch (e) {
+    return [];
+  }
+}
+
 // 방 대화 검색 (두 봇이 같은 DB 공유하므로 전체 검색 가능)
 async function dbSearch(env, { roomTitle, keyword, days = 7 }) {
   if (!env.DB) return [];
@@ -175,18 +200,11 @@ async function dbSearch(env, { roomTitle, keyword, days = 7 }) {
       .toISOString()
       .replace("T", " ")
       .slice(0, 19);
-    let query = `SELECT * FROM messages WHERE created_at >= ? ORDER BY created_at DESC LIMIT 100`;
+    let where = "created_at >= ?";
     const params = [since];
-    if (roomTitle && !keyword) {
-      query = `SELECT * FROM messages WHERE created_at >= ? AND room_title LIKE ? ORDER BY created_at DESC LIMIT 100`;
-      params.push(`%${roomTitle}%`);
-    } else if (keyword && !roomTitle) {
-      query = `SELECT * FROM messages WHERE created_at >= ? AND content LIKE ? ORDER BY created_at DESC LIMIT 100`;
-      params.push(`%${keyword}%`);
-    } else if (roomTitle && keyword) {
-      query = `SELECT * FROM messages WHERE created_at >= ? AND room_title LIKE ? AND content LIKE ? ORDER BY created_at DESC LIMIT 100`;
-      params.push(`%${roomTitle}%`, `%${keyword}%`);
-    }
+    if (roomTitle) { where += " AND room_title LIKE ?"; params.push(`%${roomTitle}%`); }
+    if (keyword)   { where += " AND content LIKE ?";    params.push(`%${keyword}%`); }
+    const query = `SELECT * FROM messages WHERE ${where} ORDER BY created_at DESC LIMIT 150`;
     const result = await env.DB.prepare(query).bind(...params).all();
     return result.results || [];
   } catch (e) {
@@ -431,6 +449,14 @@ function isUserListQuery(text) {
   );
 }
 
+function isRoomListQuery(text) {
+  return (
+    /(내가|봇이|어떤)\s*(들어간|포함된|있는)\s*방/.test(text) ||
+    /방\s*(목록|리스트|어디어디)/.test(text) ||
+    /어떤\s*방에\s*(있어|들어가)/.test(text)
+  );
+}
+
 function isActionQuery(text) {
   return /(해줘|알려줘|보여줘|정리해줘|요약해줘|찾아줘|알려주세요|해주세요|주세요|줘)$/.test(text.trim())
     || /[?？]/.test(text);
@@ -593,6 +619,7 @@ async function handleUpdate(update, env, isRelay = false) {
     const newStatus = mc.new_chat_member?.status;
     if ((newStatus === "member" || newStatus === "administrator") && mc.chat.type !== "private") {
       await saveRoom(mc.chat.id, mc.chat.title, env);
+      await dbRegisterRoom(env, mc.chat.id, mc.chat.title, "koh");
       await sendMessage(env, mc.chat.id, GROUP_WELCOME);
     }
     return;
@@ -609,6 +636,7 @@ async function handleUpdate(update, env, isRelay = false) {
 
   if (message.new_chat_members?.some((m) => m.is_bot)) {
     await saveRoom(chatId, message.chat.title, env);
+    await dbRegisterRoom(env, chatId, message.chat.title, "koh");
     await sendMessage(env, chatId, GROUP_WELCOME);
     return;
   }
@@ -704,6 +732,22 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
       await handleUserList(chatId, env);
       return;
     }
+  }
+
+  // 봇이 들어간 방 목록
+  if (isRoomListQuery(text)) {
+    const rooms = await dbGetAllRooms(env);
+    if (rooms.length === 0) {
+      await sendMessage(
+        env,
+        chatId,
+        "현재 등록된 단체방이 없습니다.\n봇을 단체방에 추가하면 자동으로 등록됩니다."
+      );
+      return;
+    }
+    const lines = rooms.map((r) => r.room_title || r.room_id).join("\n");
+    await sendMessage(env, chatId, `봇이 참여 중인 방 ${rooms.length}개:\n\n${lines}`);
+    return;
   }
 
   // 뉴스 조회 → RSS 직접 답변
@@ -901,7 +945,8 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
 
   if (!text.trim()) return;
 
-  // 멤버십 + 방 등록
+  // 방 + 멤버십 D1 등록 (항상)
+  await dbRegisterRoom(env, chatId, message.chat.title, "koh");
   await dbRegisterKohInRoom(env, chatId);
   await dbUpsertMember(env, chatId, userId, "koh");
 
@@ -914,6 +959,17 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     await saveUser(userId, { id: userId, name: tgName, chat_id: chatId }, env);
     user = await getUser(userId, env);
   }
+
+  // D1에 대화 저장 (항상)
+  await dbInsert(env, {
+    roomId:     chatId,
+    roomTitle:  message.chat.title || String(chatId),
+    senderId:   userId,
+    senderName: user?.name || message.from?.first_name || "",
+    content:    text,
+    savedBy:    "koh",
+  });
+  console.log(`[KOH DB저장] room=${message.chat.title} user=${user?.name} text=${text.slice(0, 30)}`);
 
   // 일정 감지 (브리핑 cron용)
   const schedule = extractSchedule(text, getTodayKST());
