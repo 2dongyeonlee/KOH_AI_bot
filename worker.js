@@ -195,6 +195,81 @@ async function dbSearch(env, { roomTitle, keyword, days = 7 }) {
   }
 }
 
+async function summarizeUrl(env, url, userId, chatId) {
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; bot)" },
+      redirect: "follow",
+    });
+    if (!res.ok) {
+      await sendMessage(env, chatId, "해당 링크에 접근할 수 없습니다.");
+      return;
+    }
+    const html = await res.text();
+    const text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[\s\S]*?<\/style>/gi, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s{2,}/g, " ")
+      .trim()
+      .slice(0, 5000);
+    if (text.length < 100) {
+      await sendMessage(env, chatId, "본문을 추출할 수 없는 링크입니다.");
+      return;
+    }
+    const query = TONE_RULE + "아래 기사/문서 내용을 핵심 3줄로 요약해줘. 출처·광고·메뉴 내용은 제외.\n\n" + text;
+    const result = await difyChat(env, { query, user: String(userId), conversationId: "" });
+    await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했습니다.");
+  } catch (e) {
+    console.error("summarizeUrl:", e);
+    await sendMessage(env, chatId, "링크 접근 중 오류가 발생했습니다.");
+  }
+}
+
+async function summarizeAllRooms(env, userId, { summaryType, days, keyword }) {
+  if (!env.DB) return null;
+  try {
+    const since = new Date(Date.now() - days * 86400000)
+      .toISOString().replace("T", " ").slice(0, 19);
+    let sql = `SELECT * FROM messages WHERE created_at >= ? ORDER BY created_at ASC LIMIT 200`;
+    const params = [since];
+    if (keyword) {
+      sql = `SELECT * FROM messages WHERE created_at >= ? AND content LIKE ? ORDER BY created_at ASC LIMIT 200`;
+      params.push(`%${keyword}%`);
+    }
+    const result = await env.DB.prepare(sql).bind(...params).all();
+    const rows = result.results || [];
+    if (rows.length === 0) return null;
+    let corpus = "";
+    if (summaryType === "person") {
+      const byPerson = {};
+      rows.forEach((r) => {
+        const k = r.sender_name || "미등록";
+        if (!byPerson[k]) byPerson[k] = [];
+        byPerson[k].push(r.content);
+      });
+      corpus = Object.entries(byPerson)
+        .map(([name, msgs]) => `[${name}]\n${msgs.join("\n")}`)
+        .join("\n\n")
+        .slice(0, 8000);
+    } else if (summaryType === "timeline") {
+      corpus = rows
+        .map((r) => `[${r.created_at.slice(0, 16)}] [${r.room_title}] ${r.sender_name}: ${r.content}`)
+        .join("\n")
+        .slice(0, 8000);
+    } else {
+      corpus = rows
+        .map((r) => `[${r.room_title}] ${r.sender_name}: ${r.content}`)
+        .join("\n")
+        .slice(0, 8000);
+    }
+    return corpus;
+  } catch (e) {
+    console.error("summarizeAllRooms:", e);
+    return null;
+  }
+}
+
 // conversations 테이블에 대화 저장
 async function dbSaveConversation(env, { userId, userName, question, answer, context = "" }) {
   if (!env.DB || !question?.trim() || !answer?.trim()) return;
@@ -354,6 +429,29 @@ function isUserListQuery(text) {
     /(누가|누구|팀원).{0,10}(등록|저장|있어|됐어)/.test(text) ||
     /등록된\s*(사람|팀원|목록)/.test(text)
   );
+}
+
+function isActionQuery(text) {
+  return /(해줘|알려줘|보여줘|정리해줘|요약해줘|찾아줘|알려주세요|해주세요|주세요|줘)$/.test(text.trim())
+    || /[?？]/.test(text);
+}
+
+function isUrlText(text) {
+  return /https?:\/\/[^\s]+/.test(text);
+}
+
+function parseSummaryType(text) {
+  if (/(담당자|사람|누가|발신자).*요약/.test(text)) return "person";
+  if (/(시간|시계열|순서|날짜).*요약/.test(text)) return "timeline";
+  return "topic";
+}
+
+function parseDays(text) {
+  if (/오늘/.test(text)) return 1;
+  if (/이번주|이번 주|7일/.test(text)) return 7;
+  if (/이번달|이번 달|한달|30일/.test(text)) return 30;
+  const d = text.match(/(\d+)\s*일/);
+  return d ? parseInt(d[1]) : 7;
 }
 
 function isRoomSearchQuery(text) {
@@ -660,6 +758,43 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
+  // 전체 방 통합 요약 (DM에서도 가능)
+  const isAllRoomSummary =
+    /(전체|모든|이번주|이번달|오늘|최근).{0,10}(요약|정리|내용|대화|자료)/.test(text) ||
+    /(주제별|시계열|담당자별|시간순).*요약/.test(text);
+
+  if (isAllRoomSummary) {
+    const summaryType = parseSummaryType(text);
+    const days = parseDays(text);
+    const corpus = await summarizeAllRooms(env, userId, { summaryType, days, keyword: null });
+    if (!corpus) {
+      await sendMessage(
+        env,
+        chatId,
+        `최근 ${days}일 내 저장된 대화가 없습니다.\n단체방에 봇이 추가되어 있어야 대화가 저장됩니다.`
+      );
+      return;
+    }
+    const typeLabel =
+      summaryType === "person" ? "담당자별" : summaryType === "timeline" ? "시계열 순" : "주제별";
+    const query =
+      TONE_RULE +
+      `다음은 최근 ${days}일간 팀 대화 기록입니다. ${typeLabel}로 핵심 내용을 요약해줘.\n\n` +
+      corpus;
+    const result = await difyChat(env, { query, user: userId, conversationId: "" });
+    await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했습니다.");
+    return;
+  }
+
+  // URL 요약 (DM에서)
+  if (isUrlText(text)) {
+    const urlMatch = text.match(/https?:\/\/[^\s]+/);
+    if (urlMatch) {
+      await summarizeUrl(env, urlMatch[0], userId, chatId);
+      return;
+    }
+  }
+
   // 권오혁님 → 특정인 전달 명령
   if (user.name === ADMIN_NAME) {
     const fwd = extractForwardCommand(text);
@@ -772,9 +907,10 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
 
   // 미등록자 이름 자동 저장
   if (!user) {
-    const tgName =
+    const rawName =
       [message.from?.first_name, message.from?.last_name].filter(Boolean).join(" ").trim() ||
       `user_${userId}`;
+    const tgName = cleanName(rawName) || rawName;
     await saveUser(userId, { id: userId, name: tgName, chat_id: chatId }, env);
     user = await getUser(userId, env);
   }
@@ -786,20 +922,68 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     await saveSchedule(env, schedule);
   }
 
-  // 멘션 또는 봇 메시지 reply인 경우만 응답
+  // 이름 밝히는 경우 자동 등록 ("구정모입니다", "저는 이동연이에요")
+  const nameIntro = text.match(
+    /(?:저는|나는|제?\s*이름은)?\s*([가-힣]{2,4})\s*(?:입니다|이에요|이야|예요|이라고|라고\s*해)/
+  );
+  if (nameIntro) {
+    const introName = cleanName(nameIntro[1]);
+    if (introName && introName.length >= 2) {
+      const existing = await getUser(userId, env);
+      await saveUser(userId, { ...(existing || {}), id: userId, name: introName, chat_id: chatId }, env);
+      await sendMessage(env, chatId, `${introName}님, 반갑습니다. 무엇을 도와드릴까요?`);
+      return;
+    }
+  }
+
+  // 응답 조건: @멘션 OR 봇 reply OR 질문형 문장
   const botUsername = "@KOH_AI_bot";
   const isMentioned = text.includes(botUsername);
   const isReply = message.reply_to_message?.from?.is_bot === true;
   const cleanText = text.replace(botUsername, "").trim();
+  const isQuestion = isActionQuery(cleanText);
 
-  if (!isMentioned && !isReply) return;
+  if (!isMentioned && !isReply && !isQuestion) return;
 
   if (!cleanText) {
     await sendMessage(env, chatId, `네, ${user?.name || ""}님. 무엇을 도와드릴까요?`);
     return;
   }
 
-  // 팀방 검색
+  // URL 요약
+  if (isUrlText(cleanText)) {
+    const urlMatch = cleanText.match(/https?:\/\/[^\s]+/);
+    if (urlMatch) {
+      await summarizeUrl(env, urlMatch[0], userId, chatId);
+      return;
+    }
+  }
+
+  // 전체 방 통합 요약
+  const isAllRoomSummary =
+    /(전체|모든|이번주|이번달|오늘|최근).{0,10}(요약|정리|내용|대화|자료)/.test(cleanText) ||
+    /(주제별|시계열|담당자별|시간순).*요약/.test(cleanText);
+
+  if (isAllRoomSummary) {
+    const summaryType = parseSummaryType(cleanText);
+    const days = parseDays(cleanText);
+    const corpus = await summarizeAllRooms(env, userId, { summaryType, days, keyword: null });
+    if (!corpus) {
+      await sendMessage(env, chatId, `최근 ${days}일 내 저장된 대화가 없습니다.`);
+      return;
+    }
+    const typeLabel =
+      summaryType === "person" ? "담당자별" : summaryType === "timeline" ? "시계열 순" : "주제별";
+    const query =
+      TONE_RULE +
+      `다음은 최근 ${days}일간 팀 대화 기록입니다. ${typeLabel}로 핵심 내용을 요약해줘.\n\n` +
+      corpus;
+    const result = await difyChat(env, { query, user: userId, conversationId: "" });
+    await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했습니다.");
+    return;
+  }
+
+  // 특정 방/키워드 검색
   if (isRoomSearchQuery(cleanText)) {
     const q = parseSearch(cleanText);
     const rows = await dbSearch(env, q);
@@ -818,15 +1002,13 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     return;
   }
 
-  // 일반 질문 → Dify (그룹방 맥락 포함, 대화 흐름 없이 단발 응답)
+  // 일반 응답
   const contextMsg =
     TONE_RULE +
-    `[단체방: ${message.chat.title}] [발신자: ${user?.name || message.from?.first_name}] ` +
+    `[단체방: ${message.chat.title}] [발신자: ${user?.name || message.from?.first_name}]\n` +
     cleanText;
   const result = await difyChat(env, { query: contextMsg, user: userId, conversationId: "" });
-  if (result.answer) {
-    await sendMessage(env, chatId, result.answer);
-  }
+  if (result.answer) await sendMessage(env, chatId, result.answer);
 }
 
 async function handleFile(message, userId, chatId, isAdmin, env) {
