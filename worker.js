@@ -8,10 +8,14 @@ const TONE_RULE =
   "[응답 규칙: 존댓말 격식체 사용. ^^ 이모티콘 사용 금지. 불필요한 감탄사 사용 금지.]\n\n";
 const ADMIN_NAME = "권오혁";
 const BOT_OWNER_NAME = "권오혁";
-const BOT_PERSONA = "권오혁의 개인 업무 비서 AI OS";
+const BOT_OWNER_ROLE = "6R전략담당";
+const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
+const OWNER_ALIASES = ["권오혁", "오혁", "권 담당", "권오혁 담당", "권오혁 담당님", "권 담당님"];
+const OWNER_AUTO_CONFIRM_SCORE = 90;
+const OWNER_REVIEW_SCORE = 60;
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -90,6 +94,42 @@ function isLongSharedContent(text) {
   return !/(요약|정리|찾아|알려|분석|뭐야|어떻게|왜|해줘|해 줘)/.test(t);
 }
 
+function looksLikeBareKoreanName(text) {
+  return /^[가-힣]{2,4}$/.test(String(text || "").trim());
+}
+
+async function maybeUpdateUserDisplayNameFromBareName(env, message) {
+  if (!env.DB || !message?.from?.id || !looksLikeBareKoreanName(message.text || "")) return;
+  await env.DB.prepare(`
+    UPDATE users
+    SET name = ?, source = 'bare_name_message', last_seen_at = CURRENT_TIMESTAMP
+    WHERE telegram_id = ?
+  `).bind(String(message.text).trim(), String(message.from.id)).run();
+}
+
+function isRegisterCommand(text) {
+  return /^\/등록\b/.test(String(text || "").trim());
+}
+
+async function handleRegisterCommand(env, chatId, from) {
+  await upsertUser(env, from, chatId, "manual_register");
+  await sendMessage(env, chatId, `${getSenderName(from)}님으로 자동 등록되어 있습니다.\n텔레그램 ID: ${from.id}`);
+}
+
+function parseOwnerConfirmCommand(text) {
+  const m = String(text || "").trim().match(/^\/owner_confirm\s+(\d+)/);
+  return m ? m[1] : null;
+}
+
+function parseOwnerRejectCommand(text) {
+  const m = String(text || "").trim().match(/^\/owner_reject\s+(\d+)/);
+  return m ? m[1] : null;
+}
+
+function isOwnerStatusQuery(text) {
+  return /(주인|owner).{0,10}(상태|등록|확인|누구|뭐야|알려)|누구\s*봇|누구의\s*비서|담당자.{0,10}(누구|뭐야|알려)/i.test(text || "");
+}
+
 async function handleLongSharedContent(env, chatId, message) {
   await maybeLearnFromMessage(env, message);
   await sendMessage(
@@ -97,6 +137,302 @@ async function handleLongSharedContent(env, chatId, message) {
     chatId,
     "공유해주신 내용을 주요 업무 참고자료로 저장해두겠습니다.\n나중에 관련 안건을 물어보시면 출처와 함께 다시 정리해드릴 수 있습니다."
   );
+}
+
+function normalizeKoreanText(text) {
+  return String(text || "")
+    .replace(/\s+/g, "")
+    .replace(/[()\/\-_. ,:;~!@#$%^&*+=?]/g, "")
+    .toLowerCase();
+}
+
+function includesOwnerAlias(text) {
+  const normalized = normalizeKoreanText(text);
+  return OWNER_ALIASES.some((alias) => normalized.includes(normalizeKoreanText(alias)));
+}
+
+async function getStoredOwnerTelegramId(env) {
+  if (!env.DB) return "";
+  try {
+    const row = await env.DB.prepare(`
+      SELECT profile_value
+      FROM memory_profile
+      WHERE profile_key = 'bot_owner_telegram_id'
+      LIMIT 1
+    `).first();
+    return row?.profile_value ? String(row.profile_value) : "";
+  } catch (e) {
+    console.error("getStoredOwnerTelegramId:", e);
+    return "";
+  }
+}
+
+async function getOwnerTelegramId(env) {
+  const fromEnv = String(env.BOT_OWNER_TELEGRAM_ID || "").trim();
+  if (fromEnv) return fromEnv;
+  return await getStoredOwnerTelegramId(env);
+}
+
+async function isBotOwner(env, from) {
+  if (!from?.id) return false;
+  const ownerId = await getOwnerTelegramId(env);
+  return !!ownerId && String(from.id) === String(ownerId);
+}
+
+async function ensureOwnerProfile(env) {
+  if (!env.DB) return;
+  try {
+    await env.DB.prepare(`
+      INSERT INTO memory_profile (profile_key, profile_value, evidence, confidence)
+      VALUES ('bot_owner_name', ?, ?, 5)
+      ON CONFLICT(profile_key) DO UPDATE SET
+        profile_value = excluded.profile_value,
+        evidence = excluded.evidence,
+        confidence = 5,
+        updated_at = CURRENT_TIMESTAMP
+    `).bind(BOT_OWNER_NAME, "코드 상수 BOT_OWNER_NAME").run();
+    await env.DB.prepare(`
+      INSERT INTO memory_profile (profile_key, profile_value, evidence, confidence)
+      VALUES ('bot_owner_role', ?, ?, 5)
+      ON CONFLICT(profile_key) DO UPDATE SET
+        profile_value = excluded.profile_value,
+        evidence = excluded.evidence,
+        confidence = 5,
+        updated_at = CURRENT_TIMESTAMP
+    `).bind(BOT_OWNER_ROLE, "코드 상수 BOT_OWNER_ROLE").run();
+  } catch (e) {
+    console.error("ensureOwnerProfile:", e);
+  }
+}
+
+function getOwnerCandidateScore(message) {
+  const from = message?.from || {};
+  const text = message?.text || message?.caption || "";
+  const firstName = from.first_name || "";
+  const lastName = from.last_name || "";
+  const username = from.username || "";
+  const fullName = [firstName, lastName].filter(Boolean).join("");
+  const displayName = [firstName, lastName].filter(Boolean).join(" ").trim();
+  let score = 0;
+  const evidence = [];
+
+  if (normalizeKoreanText(fullName) === normalizeKoreanText(BOT_OWNER_NAME)) {
+    score += 60;
+    evidence.push("telegram_name_exact_owner");
+  } else if (includesOwnerAlias(fullName) || includesOwnerAlias(displayName)) {
+    score += 45;
+    evidence.push("telegram_name_contains_owner_alias");
+  }
+  if (includesOwnerAlias(username)) {
+    score += 20;
+    evidence.push("username_contains_owner_alias");
+  }
+  if (includesOwnerAlias(text)) {
+    score += 25;
+    evidence.push("message_contains_owner_alias");
+  }
+  if (/(6R전략담당|6R전략|담당\s*\/\s*권오혁|권오혁\s*담당)/.test(text)) {
+    score += 35;
+    evidence.push("message_contains_owner_role");
+  }
+  if (message?.chat?.type === "private") {
+    score += 20;
+    evidence.push("private_dm_to_bot");
+  }
+  return {
+    score,
+    evidence,
+    displayName: displayName || username || String(from.id || ""),
+    username,
+  };
+}
+
+async function upsertOwnerCandidate(env, message) {
+  if (!env.DB || !message?.from?.id) return null;
+  if (await getOwnerTelegramId(env)) return null;
+  const { score, evidence, displayName, username } = getOwnerCandidateScore(message);
+  if (score <= 0) return null;
+  const telegramId = String(message.from.id);
+  const prev = await env.DB.prepare(`
+    SELECT score, evidence_json, status
+    FROM owner_candidates
+    WHERE telegram_id = ?
+  `).bind(telegramId).first();
+  let prevEvidence = [];
+  try {
+    prevEvidence = prev?.evidence_json ? JSON.parse(prev.evidence_json) : [];
+  } catch (_) {
+    prevEvidence = [];
+  }
+  const mergedEvidence = Array.from(new Set([...prevEvidence, ...evidence]));
+  const newScore = Math.min(100, Math.max(score, Number(prev?.score || 0) + Math.min(score, 30)));
+  const status =
+    newScore >= OWNER_AUTO_CONFIRM_SCORE ? "confirmed" :
+    newScore >= OWNER_REVIEW_SCORE ? "needs_review" : "candidate";
+
+  await env.DB.prepare(`
+    INSERT INTO owner_candidates
+      (telegram_id, name, username, score, evidence_json, status, updated_at)
+    VALUES
+      (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(telegram_id) DO UPDATE SET
+      name = excluded.name,
+      username = excluded.username,
+      score = excluded.score,
+      evidence_json = excluded.evidence_json,
+      status = excluded.status,
+      updated_at = CURRENT_TIMESTAMP
+  `).bind(
+    telegramId,
+    displayName,
+    username || "",
+    newScore,
+    JSON.stringify(mergedEvidence),
+    status
+  ).run();
+  return { telegramId, name: displayName, username, score: newScore, evidence: mergedEvidence, status };
+}
+
+async function confirmOwner(env, candidate, reason = "auto_confirm") {
+  if (!env.DB || !candidate?.telegramId) return;
+  if (await getOwnerTelegramId(env)) return;
+  await env.DB.prepare(`
+    INSERT INTO memory_profile (profile_key, profile_value, evidence, confidence)
+    VALUES ('bot_owner_telegram_id', ?, ?, 5)
+    ON CONFLICT(profile_key) DO UPDATE SET
+      profile_value = excluded.profile_value,
+      evidence = excluded.evidence,
+      confidence = 5,
+      updated_at = CURRENT_TIMESTAMP
+  `).bind(
+    String(candidate.telegramId),
+    `${reason}: ${candidate.name || ""} / evidence=${JSON.stringify(candidate.evidence || [])}`
+  ).run();
+  await env.DB.prepare(`
+    UPDATE owner_candidates
+    SET status = 'confirmed', updated_at = CURRENT_TIMESTAMP
+    WHERE telegram_id = ?
+  `).bind(String(candidate.telegramId)).run();
+  await ensureOwnerProfile(env);
+}
+
+async function notifyOwnerCandidateForReview(env, candidate) {
+  if (!env.DB || !env.ADMIN_TELEGRAM_ID || !candidate || candidate.status !== "needs_review") return;
+  const key = `owner_review_notified_${candidate.telegramId}`;
+  const already = await env.DB.prepare(`
+    SELECT profile_value
+    FROM memory_profile
+    WHERE profile_key = ?
+  `).bind(key).first();
+  if (already) return;
+  const msg =
+    `주인 후보 확인이 필요합니다.\n\n` +
+    `봇: ${BOT_OWNER_NAME}봇\n` +
+    `후보: ${candidate.name || "이름 없음"}\n` +
+    `Telegram ID: ${candidate.telegramId}\n` +
+    `점수: ${candidate.score}\n` +
+    `근거: ${(candidate.evidence || []).join(", ")}\n\n` +
+    `맞으면 다음 명령을 보내세요.\n` +
+    `/owner_confirm ${candidate.telegramId}\n\n` +
+    `아니면 다음 명령을 보내세요.\n` +
+    `/owner_reject ${candidate.telegramId}`;
+  await sendMessage(env, env.ADMIN_TELEGRAM_ID, msg);
+  await env.DB.prepare(`
+    INSERT INTO memory_profile (profile_key, profile_value, evidence, confidence)
+    VALUES (?, '1', ?, 5)
+  `).bind(key, "owner candidate review notification sent").run();
+}
+
+async function maybeDetectBotOwner(env, message) {
+  try {
+    if (await getOwnerTelegramId(env)) return;
+    const candidate = await upsertOwnerCandidate(env, message);
+    if (!candidate) return;
+    if (candidate.status === "confirmed") {
+      await confirmOwner(env, candidate, "auto_high_confidence");
+      return;
+    }
+    if (candidate.status === "needs_review") {
+      await notifyOwnerCandidateForReview(env, candidate);
+    }
+  } catch (e) {
+    console.error("maybeDetectBotOwner:", e);
+  }
+}
+
+async function handleOwnerConfirmReject(env, chatId, from, text) {
+  if (!env.DB) return false;
+  const isAdmin = String(from?.id || "") === String(env.ADMIN_TELEGRAM_ID || "");
+  if (!isAdmin) return false;
+
+  const confirmId = parseOwnerConfirmCommand(text);
+  if (confirmId) {
+    const candidate = await env.DB.prepare(`
+      SELECT telegram_id, name, username, score, evidence_json
+      FROM owner_candidates
+      WHERE telegram_id = ?
+    `).bind(confirmId).first();
+    if (!candidate) {
+      await sendMessage(env, chatId, "해당 owner 후보를 찾지 못했습니다.");
+      return true;
+    }
+    let evidence = [];
+    try {
+      evidence = candidate.evidence_json ? JSON.parse(candidate.evidence_json) : [];
+    } catch (_) {}
+    await confirmOwner(env, {
+      telegramId: candidate.telegram_id,
+      name: candidate.name,
+      username: candidate.username,
+      score: candidate.score,
+      evidence,
+    }, "manual_admin_confirm");
+    await sendMessage(env, chatId, `${BOT_OWNER_NAME}봇 주인을 확정했습니다.\nTelegram ID: ${confirmId}`);
+    return true;
+  }
+
+  const rejectId = parseOwnerRejectCommand(text);
+  if (rejectId) {
+    await env.DB.prepare(`
+      UPDATE owner_candidates
+      SET status = 'rejected', updated_at = CURRENT_TIMESTAMP
+      WHERE telegram_id = ?
+    `).bind(rejectId).run();
+    await sendMessage(env, chatId, `owner 후보를 제외했습니다.\nTelegram ID: ${rejectId}`);
+    return true;
+  }
+  return false;
+}
+
+async function handleOwnerStatus(env, chatId) {
+  const ownerId = await getOwnerTelegramId(env);
+  if (ownerId) {
+    await sendMessage(
+      env,
+      chatId,
+      `이 봇은 ${BOT_OWNER_NAME}님의 개인 업무 비서입니다.\n역할 기준: ${BOT_OWNER_ROLE}\nOwner Telegram ID: ${ownerId}\n사용 DB: ${BOT_DB_NAME}`
+    );
+    return;
+  }
+  const candidates = await env.DB.prepare(`
+    SELECT telegram_id, name, username, score, status, evidence_json
+    FROM owner_candidates
+    ORDER BY score DESC, updated_at DESC
+    LIMIT 5
+  `).all();
+  const rows = candidates.results || [];
+  if (!rows.length) {
+    await sendMessage(
+      env,
+      chatId,
+      `아직 ${BOT_OWNER_NAME}님으로 확정된 owner가 없습니다.\n후보도 없습니다.\n권오혁님이 이 봇에 1:1 메시지를 보내거나 단체방에서 발화하면 자동 후보로 잡힙니다.`
+    );
+    return;
+  }
+  const lines = rows.map((c, idx) =>
+    `${idx + 1}. ${c.name || "이름 없음"} / ID: ${c.telegram_id} / 점수: ${c.score} / 상태: ${c.status}`
+  );
+  await sendMessage(env, chatId, `아직 owner가 확정되지 않았습니다.\n\nowner 후보:\n${lines.join("\n")}`);
 }
 
 async function upsertUser(env, from, chatId, source = "auto_message") {
@@ -1243,6 +1579,7 @@ async function handleUpdate(update, env, isRelay = false) {
   const text = message.text || message.caption || "";
   const hasFile = !!(message.document || message.photo);
 
+  await ensureOwnerProfile(env);
   await handleNewChatMembers(env, message);
   await upsertUser(env, message.from, chatType === "private" ? chatId : message.from.id, chatType === "private" ? "private_dm" : "group_message");
   if ((chatType === "private" || hasFile) && text.trim()) {
@@ -1258,6 +1595,12 @@ async function handleUpdate(update, env, isRelay = false) {
   if (chatType !== "private") {
     await upsertRoom(env, message.chat);
     await upsertRoomMember(env, message.chat, message.from, "message");
+    await maybeUpdateUserDisplayNameFromBareName(env, message);
+  }
+  await maybeDetectBotOwner(env, message);
+
+  if (await handleOwnerConfirmReject(env, chatId, message.from, text)) {
+    return;
   }
 
   if (message.new_chat_members?.some((m) => m.is_bot)) {
@@ -1267,19 +1610,12 @@ async function handleUpdate(update, env, isRelay = false) {
     return;
   }
 
-  if (text.split("@")[0].trim() === "/등록") {
+  if (isRegisterCommand(text)) {
+    await handleRegisterCommand(env, chatId, message.from);
     return;
   }
 
   const user = await getUser(userId, env);
-  if (user?.step === "waiting_name" && !hasFile && text.trim()) {
-    await handleRegisterStep2(userId, chatId, text.trim(), chatId, env);
-    return;
-  }
-  if (user?.step === "waiting_team" && !hasFile && text.trim()) {
-    await handleRegisterStep3(userId, chatId, text.trim(), env);
-    return;
-  }
 
   const isPrivate = chatType === "private";
   if (isPrivate) {
@@ -1300,7 +1636,6 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
 
   // 이름 입력 대기 중 → 등록 처리 (Dify 호출 없음) [기존 호환]
   if (user?.step === "waiting_name_auto") {
-    await handleAutoRegister(userId, chatId, text.trim(), env);
     return;
   }
 
@@ -1320,6 +1655,11 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
   // 기능 소개
   if (isIntroQuery(text)) {
     await handleIntro(chatId, env);
+    return;
+  }
+
+  if (isOwnerStatusQuery(text)) {
+    await handleOwnerStatus(env, chatId);
     return;
   }
 
@@ -1351,11 +1691,8 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
 
   // 등록자 목록 (관리자만)
   if (isUserListQuery(text)) {
-    const isAdmin = await checkIsAdmin(userId, env);
-    if (isAdmin) {
-      await handleUserList(chatId, env);
-      return;
-    }
+    await handleUserList(chatId, env);
+    return;
   }
 
   // 봇이 들어간 방 목록
@@ -1528,12 +1865,12 @@ async function handleRegisterInstant(userId, chatId, message, env) {
   const name = cleanName(tgName) || tgName;
   const existing = await getUser(userId, env);
   await saveUser(userId, { ...(existing || {}), id: userId, name, chat_id: chatId }, env);
-  await sendMessage(env, chatId, `${name}님으로 등록되었습니다.`);
+  await sendMessage(env, chatId, `${name}님으로 자동 등록되어 있습니다.\n텔레그램 ID: ${userId}`);
 }
 
 async function handleAutoRegister(userId, chatId, name, env) {
   await saveUser(userId, { id: userId, name, chat_id: chatId }, env);
-  await sendMessage(env, chatId, `${name}님으로 등록되었습니다.`);
+  await sendMessage(env, chatId, `${name}님으로 자동 등록되어 있습니다.\n텔레그램 ID: ${userId}`);
 }
 
 async function handleRegisterStep1(userId, chatId, env) {
@@ -1541,17 +1878,8 @@ async function handleRegisterStep1(userId, chatId, env) {
 }
 
 async function handleRegisterStep2(userId, chatId, name, currentChatId, env) {
-  if (ALLOWED_NAMES.has(name)) {
-    await saveUser(userId, { id: userId, name, chat_id: currentChatId }, env);
-    await sendMessage(env, chatId, `등록 완료되었습니다. ${name}님.`);
-  } else {
-    await saveUser(userId, { id: userId, name, chat_id: currentChatId, step: "waiting_team" }, env);
-    await sendMessage(
-      env,
-      chatId,
-      "소속 조직과 담당 업무를 알려주세요.\n(예: 6R전략실 담당 / 권오혁)"
-    );
-  }
+  await saveUser(userId, { id: userId, name, chat_id: currentChatId }, env);
+  await sendMessage(env, chatId, `${name}님으로 자동 등록되어 있습니다.\n텔레그램 ID: ${userId}`);
 }
 
 async function handleRegisterStep3(userId, chatId, input, env) {
@@ -1560,8 +1888,7 @@ async function handleRegisterStep3(userId, chatId, input, env) {
   const team = parts[0] || input.trim();
   const role = parts[1] || "";
   await saveUser(userId, { id: userId, name: user.name, team, role, chat_id: user.chat_id }, env);
-  const suffix = role ? ` (${team} / ${role})` : ` (${team})`;
-  await sendMessage(env, chatId, `등록 완료되었습니다. ${user.name}님${suffix}.`);
+  await sendMessage(env, chatId, `${user.name || userId}님으로 자동 등록되어 있습니다.\n텔레그램 ID: ${userId}`);
 }
 
 async function handleUserMessage(userId, chatId, text, sendReply, env, userName = "") {
@@ -1670,6 +1997,16 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
   const cleanText = cleanBotMention(text, env);
 
   if (!cleanText) {
+    return;
+  }
+
+  if (isOwnerStatusQuery(cleanText)) {
+    await handleOwnerStatus(env, chatId);
+    return;
+  }
+
+  if (isUserListQuery(cleanText)) {
+    await handleUserList(chatId, env);
     return;
   }
 
