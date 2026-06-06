@@ -652,20 +652,23 @@ async function getAllRooms(env) {
 
 // ── D1 (Cloudflare SQLite) ────────────────────────────────────
 // 방 대화 저장 (권오혁봇이 방에 있으면 담당)
-async function dbInsert(env, { roomId, roomTitle, senderId, senderName, content, savedBy }) {
+async function dbInsert(env, { roomId, roomTitle, senderId, senderName, content, savedBy, telegramMessageId = "", sourceType = "" }) {
   if (!env.DB || !content?.trim()) return;
   try {
     await env.DB.prepare(
-      `INSERT INTO messages (room_id, room_title, sender_id, sender_name, content, saved_by)
-       VALUES (?, ?, ?, ?, ?, ?)`
+      `INSERT INTO messages
+         (telegram_message_id, room_id, room_title, sender_id, sender_name, content, saved_by, source_type)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     )
       .bind(
+        String(telegramMessageId || ""),
         String(roomId),
         roomTitle || "",
         String(senderId),
         senderName || "",
         content.slice(0, 4000),
-        savedBy || "koh"
+        savedBy || "koh",
+        sourceType || "telegram_group"
       )
       .run();
   } catch (e) {
@@ -1103,7 +1106,37 @@ async function countTable(env, tableName) {
   return row?.count || 0;
 }
 
-async function handleDbStatus(env, chatId) {
+async function tableExists(env, tableName) {
+  if (!env.DB) return false;
+  const row = await env.DB.prepare(`
+    SELECT name
+    FROM sqlite_master
+    WHERE type='table' AND name=?
+    LIMIT 1
+  `).bind(tableName).first();
+  return !!row;
+}
+
+async function safeCountTable(env, tableName) {
+  const exists = await tableExists(env, tableName);
+  if (!exists) return { exists: false, count: 0 };
+  const row = await env.DB.prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).first();
+  return { exists: true, count: row?.count || 0 };
+}
+
+async function ensureCoreTablesExist(env) {
+  if (!env.DB) throw new Error("D1 binding env.DB is missing");
+  const required = ["users", "rooms", "room_members", "messages", "files", "meetings", "memory_profile"];
+  const missing = [];
+  for (const tableName of required) {
+    if (!(await tableExists(env, tableName))) missing.push(tableName);
+  }
+  if (missing.length) {
+    throw new Error(`D1 core tables missing: ${missing.join(", ")}. Run migration first.`);
+  }
+}
+
+async function handleDbStatusLegacy(env, chatId) {
   if (!env.DB) {
     await sendMessage(env, chatId, "D1 상태 확인 실패\n\n오류: env.DB binding이 없습니다.");
     return;
@@ -1151,6 +1184,61 @@ async function handleDbStatus(env, chatId) {
   }
 }
 
+async function handleDbStatus(env, chatId) {
+  if (!env.DB) {
+    await sendMessage(env, chatId, "D1 binding env.DB가 없음. wrangler.toml의 [[d1_databases]] binding = \"DB\" 확인 필요.");
+    return;
+  }
+  try {
+    const tables = ["users", "rooms", "room_members", "messages", "files", "meetings", "memory_profile", "external_sources"];
+    const statuses = [];
+    for (const tableName of tables) {
+      const status = await safeCountTable(env, tableName);
+      statuses.push(`${tableName}: ${status.exists ? status.count : "테이블 없음"}`);
+    }
+    let recentRoomsText = "없음";
+    if (await tableExists(env, "rooms")) {
+      const recentRooms = await env.DB.prepare(`
+        SELECT room_title, room_id, room_type, source, last_seen_at
+        FROM rooms
+        ORDER BY last_seen_at DESC
+        LIMIT 10
+      `).all();
+      recentRoomsText = (recentRooms.results || []).map((r, idx) =>
+        `${idx + 1}. ${r.room_title || "방 이름 없음"} / ${r.room_type || "type 없음"} / ${r.source || ""} / ${r.last_seen_at || ""}`
+      ).join("\n") || "없음";
+    }
+    let recentMessagesText = "없음";
+    if (await tableExists(env, "messages")) {
+      const recentMessages = await env.DB.prepare(`
+        SELECT room_title, sender_name, content, source_type, created_at
+        FROM messages
+        ORDER BY created_at DESC
+        LIMIT 10
+      `).all();
+      recentMessagesText = (recentMessages.results || []).map((m, idx) =>
+        `${idx + 1}. [${m.room_title || "방 없음"}] ${m.sender_name || "작성자 없음"} / ${m.source_type || ""} (${m.created_at || ""})\n${String(m.content || "").slice(0, 100)}`
+      ).join("\n\n") || "없음";
+    }
+    await sendMessage(env, chatId,
+      `D1 저장 상태\n\n` +
+      `${statuses.join("\n")}\n\n` +
+      `최근 등록 방\n${recentRoomsText}\n\n` +
+      `최근 저장 메시지\n${recentMessagesText}`
+    );
+  } catch (error) {
+    await sendMessage(env, chatId,
+      `D1 상태 확인 실패\n\n` +
+      `오류: ${String(error?.message || error)}\n\n` +
+      `확인 필요\n` +
+      `- wrangler.toml D1 binding이 DB인지 확인\n` +
+      `- migration 적용 여부 확인\n` +
+      `- 현재 Worker가 올바른 D1 database_id를 보는지 확인\n` +
+      `- /db_status가 SQL executor로 흘러가지 않도록 routeSlashCommand 우선 처리 확인`
+    );
+  }
+}
+
 function isImageStatusCommand(text) {
   return /^\/image_status\b/.test(String(text || "").trim());
 }
@@ -1178,6 +1266,115 @@ async function handleDiagnosticCommand(env, chatId, text) {
   if (isSearchStatusCommand(text)) return await handleSearchStatus(env, chatId);
   if (isDbStatusCommand(text)) return await handleDbStatus(env, chatId);
   if (isImageStatusCommand(text)) return await handleImageStatus(env, chatId);
+}
+
+async function handleRoomList(env, chatId) {
+  try {
+    if (!(await tableExists(env, "rooms"))) {
+      await sendMessage(env, chatId, "rooms 테이블이 없음. migration 적용 필요.");
+      return;
+    }
+    const result = await env.DB.prepare(`
+      SELECT room_id, room_title, room_type, source, last_seen_at
+      FROM rooms
+      ORDER BY last_seen_at DESC
+      LIMIT 100
+    `).all();
+    const rows = result.results || [];
+    if (!rows.length) {
+      await sendMessage(env, chatId,
+        `등록된 방이 없음.\n\n` +
+        `가능한 원인\n` +
+        `- 봇이 방에 추가됐지만 my_chat_member update를 저장하지 못했음\n` +
+        `- 그룹 메시지 저장 전에 return되고 있음\n` +
+        `- webhook allowed_updates에 my_chat_member/message가 빠짐\n` +
+        `- D1 binding이 다른 DB를 보고 있음`
+      );
+      return;
+    }
+    const lines = rows.map((r, idx) =>
+      `${idx + 1}. ${r.room_title || "방 이름 없음"} / ID: ${r.room_id} / ${r.room_type || "type 없음"} / ${r.source || ""} / ${r.last_seen_at || ""}`
+    );
+    await sendMessage(env, chatId, `등록된 방 ${rows.length}개임.\n\n${lines.join("\n")}`);
+  } catch (error) {
+    await sendMessage(env, chatId, `방 목록 조회 실패함\n오류: ${String(error?.message || error)}`);
+  }
+}
+
+function isSqlCommand(text) {
+  return /^\/sql\s+/i.test(String(text || "").trim());
+}
+
+function isAdminUser(env, from) {
+  return String(from?.id || "") === String(env.ADMIN_TELEGRAM_ID || "");
+}
+
+async function handleSqlCommand(env, message, text, chatId) {
+  if (!isSqlCommand(text)) return false;
+  if (!isAdminUser(env, message.from)) {
+    await sendMessage(env, chatId, "관리자만 SQL 진단 명령을 실행할 수 있음.");
+    return true;
+  }
+  const sql = String(text || "").replace(/^\/sql\s+/i, "").trim();
+  if (!/^(select|pragma)\b/i.test(sql)) {
+    await sendMessage(env, chatId, "안전상 SELECT/PRAGMA만 허용함.");
+    return true;
+  }
+  try {
+    const result = await env.DB.prepare(sql).all();
+    await sendMessage(env, chatId, JSON.stringify(result.results || [], null, 2).slice(0, 3000));
+  } catch (error) {
+    await sendMessage(env, chatId, `SQL 실행 실패함\n오류: ${String(error?.message || error)}`);
+  }
+  return true;
+}
+
+function getHelpText() {
+  return [
+    "사용 가능 명령",
+    "/db_status - D1 저장 상태 확인",
+    "/rooms - 등록된 방 목록 확인",
+    "/users - 등록 사용자 목록 확인",
+    "/search_status - 외부검색 설정 확인",
+    "/web_test 검색어 - Tavily 검색 테스트",
+    "/image_status - 이미지 분석 설정 확인",
+    "/sql SELECT ... - 관리자 전용 SQL 진단",
+  ].join("\n");
+}
+
+async function routeSlashCommand(env, message, text, chatId) {
+  const t = String(text || "").trim();
+  if (!t.startsWith("/")) return false;
+  if (await handleSqlCommand(env, message, t, chatId)) return true;
+  if (isDbStatusCommand(t)) {
+    await handleDbStatus(env, chatId);
+    return true;
+  }
+  if (/^\/rooms\b/.test(t) || isRoomListQuery(t)) {
+    await handleRoomList(env, chatId);
+    return true;
+  }
+  if (/^\/users\b/.test(t) || isUserListQuery(t)) {
+    await handleUserList(chatId, env);
+    return true;
+  }
+  if (isSearchStatusCommand(t)) {
+    await handleSearchStatus(env, chatId);
+    return true;
+  }
+  if (isWebSearchTestCommand(t)) {
+    await handleWebSearchTest(env, chatId, t);
+    return true;
+  }
+  if (isImageStatusCommand(t)) {
+    await handleImageStatus(env, chatId);
+    return true;
+  }
+  if (/^\/help\b/.test(t)) {
+    await sendMessage(env, chatId, getHelpText());
+    return true;
+  }
+  return false;
 }
 
 async function summarizeAllRooms(env, userId, { summaryType, days, keyword }) {
@@ -1958,19 +2155,79 @@ async function handleAdminForward(targetName, content, adminChatId, env) {
   await sendMessage(env, adminChatId, `${targetName}님께 전달 완료했습니다.`);
 }
 
+async function handleMyChatMemberUpdate(env, myChatMember) {
+  if (!env.DB || !myChatMember?.chat) return;
+  const chat = myChatMember.chat;
+  if (chat.type === "private") return;
+  const newStatus = myChatMember.new_chat_member?.status || "";
+  const roomId = String(chat.id);
+  const roomTitle = chat.title || chat.username || roomId;
+  if (["member", "administrator"].includes(newStatus)) {
+    await saveRoom(chat.id, roomTitle, env);
+    await dbRegisterRoom(env, chat.id, roomTitle, "koh");
+    await upsertRoom(env, chat);
+    try {
+      await env.DB.prepare(`
+        UPDATE rooms
+        SET source = ?, last_seen_at = CURRENT_TIMESTAMP
+        WHERE room_id = ?
+      `).bind("my_chat_member_added", roomId).run();
+    } catch (error) {
+      console.error("handleMyChatMemberUpdate added:", error);
+    }
+  }
+  if (["left", "kicked"].includes(newStatus)) {
+    try {
+      await env.DB.prepare(`
+        UPDATE rooms
+        SET source = ?, last_seen_at = CURRENT_TIMESTAMP
+        WHERE room_id = ?
+      `).bind("my_chat_member_removed", roomId).run();
+    } catch (error) {
+      console.error("handleMyChatMemberUpdate removed:", error);
+    }
+  }
+  console.log("my_chat_member handled", { roomId, roomTitle, newStatus });
+}
+
+async function persistIncomingMessage(env, message) {
+  if (!env.DB || !message?.chat || message._persisted) return;
+  const text = message.text || message.caption || "";
+  if (message.from?.is_bot) return;
+  await upsertUser(
+    env,
+    message.from,
+    message.chat.type === "private" ? message.chat.id : message.from?.id,
+    message.chat.type === "private" ? "private_dm" : "group_message"
+  );
+  if (message.chat.type !== "private") {
+    await upsertRoom(env, message.chat);
+    if (message.from) await upsertRoomMember(env, message.chat, message.from, "message");
+  }
+  if (!text.trim()) return;
+  await dbInsert(env, {
+    roomId: message.chat.id,
+    roomTitle: message.chat.type === "private"
+      ? "1:1"
+      : (message.chat.title || message.chat.username || String(message.chat.id)),
+    senderId: message.from?.id || "",
+    senderName: getSenderName(message.from),
+    content: getMessageTextForStorage(message),
+    savedBy: BOT_KEY,
+    telegramMessageId: message.message_id || "",
+    sourceType: message.chat.type === "private" ? "telegram_private" : "telegram_group",
+  });
+  await maybeLearnFromMessage(env, message);
+  message._persisted = true;
+}
+
 async function handleUpdate(update, env, isRelay = false) {
   if (update.my_chat_member) {
-    const mc = update.my_chat_member;
-    const newStatus = mc.new_chat_member?.status;
-    if ((newStatus === "member" || newStatus === "administrator") && mc.chat.type !== "private") {
-      await saveRoom(mc.chat.id, mc.chat.title, env);
-      await dbRegisterRoom(env, mc.chat.id, mc.chat.title, "koh");
-      await upsertRoom(env, mc.chat);
-    }
+    await handleMyChatMemberUpdate(env, update.my_chat_member);
     return;
   }
 
-  const message = update.message;
+  const message = update.message || update.edited_message;
   if (!message) return;
 
   const userId = String(message.from.id);
@@ -1981,8 +2238,11 @@ async function handleUpdate(update, env, isRelay = false) {
 
   await ensureOwnerProfile(env);
   await handleNewChatMembers(env, message);
-  await upsertUser(env, message.from, chatType === "private" ? chatId : message.from.id, chatType === "private" ? "private_dm" : "group_message");
-  if ((chatType === "private" || hasFile) && text.trim()) {
+  await persistIncomingMessage(env, message);
+  if (!message._persisted) {
+    await upsertUser(env, message.from, chatType === "private" ? chatId : message.from.id, chatType === "private" ? "private_dm" : "group_message");
+  }
+  if (!message._persisted && (chatType === "private" || hasFile) && text.trim()) {
     await dbInsert(env, {
       roomId: chatId,
       roomTitle: chatType === "private" ? "private_dm" : (message.chat.title || String(chatId)),
@@ -1990,14 +2250,20 @@ async function handleUpdate(update, env, isRelay = false) {
       senderName: getSenderName(message.from),
       content: getMessageTextForStorage(message),
       savedBy: BOT_KEY,
+      telegramMessageId: message.message_id || "",
+      sourceType: chatType === "private" ? "telegram_private" : "telegram_group",
     });
   }
-  if (chatType !== "private") {
+  if (!message._persisted && chatType !== "private") {
     await upsertRoom(env, message.chat);
     await upsertRoomMember(env, message.chat, message.from, "message");
     await maybeUpdateUserDisplayNameFromBareName(env, message);
   }
   await maybeDetectBotOwner(env, message);
+
+  if (await routeSlashCommand(env, message, text, chatId)) {
+    return;
+  }
 
   if (await handleOwnerConfirmReject(env, chatId, message.from, text)) {
     return;
@@ -2386,15 +2652,19 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
   }
 
   // D1에 대화 저장 (항상)
-  await dbInsert(env, {
-    roomId:     chatId,
-    roomTitle:  message.chat.title || String(chatId),
-    senderId:   userId,
-    senderName: user?.name || message.from?.first_name || "",
-    content:    getMessageTextForStorage(message),
-    savedBy:    "koh",
-  });
-  await maybeLearnFromMessage(env, message);
+  if (!message._persisted) {
+    await dbInsert(env, {
+      roomId:     chatId,
+      roomTitle:  message.chat.title || String(chatId),
+      senderId:   userId,
+      senderName: user?.name || message.from?.first_name || "",
+      content:    getMessageTextForStorage(message),
+      savedBy:    "koh",
+      telegramMessageId: message.message_id || "",
+      sourceType: "telegram_group",
+    });
+    await maybeLearnFromMessage(env, message);
+  }
   console.log(`[KOH DB저장] room=${message.chat.title} user=${user?.name} text=${text.slice(0, 30)}`);
 
   if (isDiagnosticCommand(text)) {
