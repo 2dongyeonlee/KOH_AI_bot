@@ -1,6 +1,9 @@
 const DIFY_API_URL = "https://api.dify.ai/v1";
 const SUMMARY_PROMPT =
-  "다음 파일의 내용을 핵심만 3줄로 요약해줘. 각 줄은 번호를 붙여줘. 한국어로.";
+  "다음 파일에서 아래 형식으로 추출해줘.\n" +
+  "요약: (핵심 3줄)\n" +
+  "안건: (주요 논의·결정 안건, 없으면 '없음')\n" +
+  "일정: (날짜·기한·마감이 언급된 일정, 없으면 '없음')";
 const TONE_RULE =
   "[응답 규칙: 존댓말 격식체 사용. ^^ 이모티콘 사용 금지. 불필요한 감탄사 사용 금지.]\n\n";
 const ADMIN_NAME = "권오혁";
@@ -1099,8 +1102,11 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
   const isMentioned = text.includes(botUsername);
   const isReply = message.reply_to_message?.from?.is_bot === true;
   const cleanText = text.replace(botUsername, "").trim();
-  const isQuestion = isActionQuery(cleanText);
+  const isQuestion =
+    /(해줘|알려줘|보여줘|정리해줘|요약해줘|찾아줘|뭐야|어때|있어|주세요|줘)$/.test(cleanText.trim()) ||
+    /[?？]/.test(cleanText);
 
+  // @멘션이면 무조건 응답 (질문 형식 아니어도)
   if (!isMentioned && !isReply && !isQuestion) return;
 
   if (!cleanText) {
@@ -1275,30 +1281,46 @@ async function sendDailyBriefing(env) {
   const schedules = await getTodaySchedules(env);
   let msg = "";
 
-  // 어제 공유된 자료 digest
+  // 어제 공유된 자료 digest → 안건·일정·요약 4섹션 브리핑
   const digest = await buildDigest(env, { days: 1 });
   if (digest) {
     try {
       const adminUser = await findAdminUser(env);
+      const scheduleLines =
+        schedules.length > 0
+          ? schedules
+              .sort((a, b) => (a.time || "").localeCompare(b.time || ""))
+              .map((s) => `${s.time} ${s.title}`)
+              .join("\n")
+          : "(없음)";
       const query =
         TONE_RULE +
-        "다음은 어제 팀에서 공유된 자료와 대화입니다. 핵심 내용을 3줄로 요약해줘.\n\n" +
-        digest;
+        `당신은 권오혁 담당의 AI 비서입니다. 오늘 아침 업무 브리핑을 작성하세요.\n\n` +
+        `[오늘 일정]\n${scheduleLines}\n\n` +
+        `[어제 공유된 자료·대화]\n${digest}\n\n` +
+        `[작성 규칙]\n` +
+        `- 다음 3개 섹션으로 구성: "공유 자료 속 안건·일정", "어제 공유 안건 요약", "챙길 일정"\n` +
+        `- 파일에 포함된 안건과 일정(마감·기한)을 반드시 별도로 뽑아낼 것\n` +
+        `- 자료 속 일정이 있으면 캘린더 일정이 아니어도 "챙길 일정"에 표시\n` +
+        `- 어제 공유 안건은 불릿 포인트(·)로 핵심만, 어느 방에서 나왔는지 표시\n` +
+        `- 마크다운 기호(*, #) 없이 순수 텍스트, 이모티콘으로 섹션 구분\n` +
+        `- 전체 700자 이내, 실무적으로`;
       const result = await difyChat(env, {
         query,
         user: String(adminUser?.id || "admin"),
         conversationId: "",
       });
-      if (result.answer) msg += `📦 어제 공유된 자료 요약\n\n${result.answer}\n\n`;
+      if (result.answer) msg = result.answer;
     } catch (e) {
       console.error("digest in briefing:", e);
     }
   }
 
-  if (schedules.length > 0) {
+  // digest 없을 때 일정만 표시
+  if (!msg && schedules.length > 0) {
     const sorted = schedules.sort((a, b) => (a.time || "").localeCompare(b.time || ""));
     const lines = sorted.map((s) => `${s.time} ${s.title}`).join("\n");
-    msg += `📅 오늘의 주요 일정\n\n${lines}`;
+    msg = `📅 오늘의 주요 일정\n\n${lines}`;
   }
 
   if (!msg) return;
