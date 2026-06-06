@@ -11,24 +11,92 @@ const BOT_OWNER_NAME = "권오혁";
 const BOT_PERSONA = "권오혁의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
+const BOT_USERNAME = "KOH_AI_bot";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
 ]);
 
 const PRIVATE_GREETING =
-  "안녕하세요! 저는 권오혁 담당님의 AI 비서입니다.\n" +
-  "성함을 알려주시면 누구신지 등록하겠습니다.";
+  "";
 
 const GROUP_WELCOME =
-  "안녕하세요. 저는 권오혁 담당님의 AI 비서 권오혁(A)입니다.\n" +
-  "원활한 소통을 위해 구성원 여러분의 성함을 등록해 주세요.\n" +
-  "/등록 을 입력하시면 등록됩니다.";
+  "";
 
 function getSenderName(from) {
   if (!from) return "이름 없음";
   const full = [from.first_name, from.last_name].filter(Boolean).join(" ").trim();
   return full || from.username || String(from.id || "이름 없음");
+}
+
+function getForwardLabel(message) {
+  if (message.forward_sender_name) return `Forwarded from ${message.forward_sender_name}`;
+  if (message.forward_from) return `Forwarded from ${getSenderName(message.forward_from)}`;
+  if (message.forward_origin?.sender_user) return `Forwarded from ${getSenderName(message.forward_origin.sender_user)}`;
+  if (message.forward_origin?.sender_user_name) return `Forwarded from ${message.forward_origin.sender_user_name}`;
+  return "";
+}
+
+function getMessageTextForStorage(message) {
+  const rawText = message?.text || message?.caption || "";
+  const forwardLabel = getForwardLabel(message || {});
+  return forwardLabel && rawText ? `[${forwardLabel}]\n${rawText}` : rawText;
+}
+
+function getBotUsernames(env) {
+  const names = [];
+  if (env.BOT_USERNAME) names.push(env.BOT_USERNAME.replace("@", "").toLowerCase());
+  if (typeof BOT_USERNAME !== "undefined" && BOT_USERNAME) names.push(BOT_USERNAME.replace("@", "").toLowerCase());
+  return [...new Set(names)];
+}
+
+function textMentionsThisBot(text, env) {
+  const lower = String(text || "").toLowerCase();
+  return getBotUsernames(env).some((name) => lower.includes(`@${name}`));
+}
+
+function textMentionsOtherKnownBot(text, env) {
+  const lower = String(text || "").toLowerCase();
+  const current = getBotUsernames(env);
+  const known = ["dylee_ai_bot", "koh_ai_bot", "KOH_AI_bot"].map((x) => x.toLowerCase());
+  return known.some((name) => lower.includes(`@${name}`) && !current.includes(name));
+}
+
+function isReplyToThisBot(message, env) {
+  const replyUser = message?.reply_to_message?.from;
+  if (!replyUser?.is_bot) return false;
+  return getBotUsernames(env).includes(String(replyUser.username || "").toLowerCase());
+}
+
+function shouldRespondInGroup(message, text, env) {
+  if (!message?.chat || message.chat.type === "private") return true;
+  if (textMentionsOtherKnownBot(text, env)) return false;
+  if (textMentionsThisBot(text, env)) return true;
+  if (isReplyToThisBot(message, env)) return true;
+  return /봇아|비서야|요약해줘|정리해줘|알려줘|찾아줘|전달해줘|전해줘|보고내용|확인해야\s*할\s*안건|확인해야할\s*안건/.test(text || "");
+}
+
+function cleanBotMention(text, env) {
+  let cleaned = String(text || "");
+  for (const name of getBotUsernames(env)) {
+    cleaned = cleaned.replace(new RegExp(`@${name}`, "ig"), "");
+  }
+  return cleaned.trim();
+}
+
+function isLongSharedContent(text) {
+  const t = String(text || "").trim();
+  if (t.length < 250) return false;
+  return !/(요약|정리|찾아|알려|분석|뭐야|어떻게|왜|해줘|해 줘)/.test(t);
+}
+
+async function handleLongSharedContent(env, chatId, message) {
+  await maybeLearnFromMessage(env, message);
+  await sendMessage(
+    env,
+    chatId,
+    "공유해주신 내용을 주요 업무 참고자료로 저장해두겠습니다.\n나중에 관련 안건을 물어보시면 출처와 함께 다시 정리해드릴 수 있습니다."
+  );
 }
 
 async function upsertUser(env, from, chatId, source = "auto_message") {
@@ -850,34 +918,160 @@ function isRoomSearchQuery(text) {
 }
 
 function isDigestQuery(text) {
-  return (
-    /(오늘|어제|이번주|최근).{0,10}(공유|올라온|전달된|업로드|자료|파일)/.test(text) ||
-    /(자료|파일|공유).{0,10}(정리|요약|모아)/.test(text) ||
-    /공유된\s*(자료|파일|내용)/.test(text)
-  );
+  const t = String(text || "").replace(/\s+/g, " ").trim();
+  const hasDigestVerb = /(요약|정리|브리핑|공유|알려줘|뽑아줘|추려줘|보고|리캡|recap|digest)/i.test(t);
+  const hasDigestObject = /(확인해야\s*할\s*안건|확인해야할\s*안건|봐야\s*할\s*것|주요\s*안건|주요\s*내용|보고내용|올라온\s*내용|단체방|단톡방|각종\s*방|각\s*방|방들|대화\s*내용|공유된\s*내용|오늘\s*내용|이번주\s*내용|최근\s*내용)/.test(t);
+  const directPatterns =
+    /(오늘|어제오늘|이번주|최근).{0,20}(요약|정리|브리핑|공유|알려줘|뽑아줘|추려줘)/.test(t) ||
+    /(확인해야\s*할\s*안건|확인해야할\s*안건).{0,20}(공유|알려줘|정리|요약)/.test(t) ||
+    /(단체방|단톡방|각종\s*방|방들).{0,30}(올라온|나온|공유된).{0,20}(내용|안건|자료|보고)/.test(t);
+  return directPatterns || (hasDigestVerb && hasDigestObject);
 }
 
-async function buildDigest(env, { days = 1, keyword = null } = {}) {
-  const [messages, files] = await Promise.all([
-    dbSearch(env, { days, keyword }),
-    dbSearchFiles(env, { days, keyword }),
-  ]);
-  let corpus = "";
-  if (files.length > 0) {
-    corpus += "=== 공유된 파일 ===\n";
-    corpus += files
-      .map((f) => `[${f.room_title}] ${f.sender_name}: ${f.file_name}\n요약: ${f.summary}`)
-      .join("\n\n");
-    corpus += "\n\n";
+function parseDigestRange(text) {
+  const t = String(text || "");
+  if (/어제오늘|어제\s*오늘/.test(t)) return { label: "어제오늘", days: 2 };
+  if (/오늘|금일/.test(t)) return { label: "오늘", days: 1 };
+  if (/이번\s*주|이번주|주간/.test(t)) return { label: "이번주", days: 7 };
+  if (/최근|요즘/.test(t)) return { label: "최근 3일", days: 3 };
+  return { label: "최근 2일", days: 2 };
+}
+
+async function getKnownRoomsText(env) {
+  if (!env.DB) return "";
+  try {
+    const result = await env.DB.prepare(`
+      SELECT room_title, room_id, room_type, last_seen_at
+      FROM rooms
+      ORDER BY last_seen_at DESC
+      LIMIT 20
+    `).all();
+    const rows = result.results || [];
+    return rows.map((r, idx) =>
+      `${idx + 1}. ${r.room_title || "방 이름 없음"} / ${r.room_type || "type 미상"} / ${r.last_seen_at || ""}`
+    ).join("\n");
+  } catch (e) {
+    console.error("getKnownRoomsText:", e);
+    return "";
   }
-  if (messages.length > 0) {
-    corpus += "=== 관련 대화 ===\n";
-    corpus += messages
-      .map((r) => `[${r.room_title}] ${r.sender_name}: ${r.content}`)
-      .join("\n")
-      .slice(0, 4000);
+}
+
+async function fetchDigestRows(env, days = 2, limit = 120) {
+  if (!env.DB) return [];
+  try {
+    const messages = await env.DB.prepare(`
+      SELECT 'message' AS type, room_title AS source, sender_name AS actor, content AS text, created_at, NULL AS file_name, NULL AS title
+      FROM messages
+      WHERE datetime(created_at) >= datetime('now', ?)
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).bind(`-${days} days`, limit).all();
+    const files = await env.DB.prepare(`
+      SELECT 'file' AS type, COALESCE(room_title, '') AS source, COALESCE(uploader_name, sender_name) AS actor,
+             COALESCE(summary, extracted_text, content, file_name) AS text, created_at, file_name, NULL AS title
+      FROM files
+      WHERE datetime(created_at) >= datetime('now', ?)
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).bind(`-${days} days`, Math.min(limit, 50)).all();
+    const meetings = await env.DB.prepare(`
+      SELECT 'meeting' AS type, COALESCE(source, title, '') AS source, created_by AS actor,
+             COALESCE(summary, decisions, action_items, raw_text) AS text, created_at, NULL AS file_name, title
+      FROM meetings
+      WHERE datetime(created_at) >= datetime('now', ?)
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).bind(`-${days} days`, Math.min(limit, 50)).all();
+    const facts = await env.DB.prepare(`
+      SELECT 'memory' AS type, COALESCE(source_room, subject, '') AS source, source_actor AS actor,
+             content AS text, created_at, NULL AS file_name, subject AS title
+      FROM learned_facts
+      WHERE datetime(created_at) >= datetime('now', ?)
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).bind(`-${days} days`, Math.min(limit, 80)).all();
+    return [
+      ...(messages.results || []),
+      ...(files.results || []),
+      ...(meetings.results || []),
+      ...(facts.results || []),
+    ].sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+  } catch (e) {
+    console.error("fetchDigestRows:", e);
+    return [];
   }
-  return corpus.trim() || null;
+}
+
+function buildDigestCorpus(rows) {
+  if (!rows?.length) return "";
+  return rows.map((r, idx) => {
+    const typeLabel =
+      r.type === "message" ? "대화" :
+      r.type === "file" ? "파일" :
+      r.type === "meeting" ? "회의록" :
+      r.type === "memory" ? "축적 기억" : "자료";
+    const extra = r.file_name ? ` / 파일명: ${r.file_name}` : r.title ? ` / 제목: ${r.title}` : "";
+    return `[${idx + 1}] ${typeLabel}
+출처: [${r.source || "출처 미상"}] ${r.actor || "작성자 미상"} (${r.created_at || "시간 미상"})${extra}
+내용:
+${String(r.text || "").slice(0, 1000)}`;
+  }).join("\n\n");
+}
+
+async function answerDigest(env, userText, userId) {
+  const range = parseDigestRange(userText);
+  const rows = await fetchDigestRows(env, range.days, 140);
+  if (!rows.length) {
+    const knownRooms = await getKnownRoomsText(env);
+    return `${range.label} 기준으로 저장된 대화 기록이 아직 없습니다.
+
+가능한 원인:
+1. 해당 기간에 봇이 받은 메시지가 없었습니다.
+2. BotFather Privacy Mode가 켜져 있어 그룹 일반 메시지를 받지 못하고 있습니다.
+3. D1 저장 로직이 아직 배포되지 않았거나 migration이 적용되지 않았습니다.
+4. 봇이 해당 단체방에 없었습니다.
+
+현재 이 봇에 등록된 방:
+${knownRooms || "등록된 방이 없습니다."}
+
+확인 필요:
+- BotFather에서 /setprivacy -> Disable 설정
+- 봇을 단체방에서 제거 후 다시 추가
+- wrangler.toml의 D1 binding 확인
+- messages 테이블에 최근 데이터가 쌓이는지 확인`;
+  }
+  const query =
+    TONE_RULE +
+    `[요청]\n${userText}\n\n` +
+    `[요약 범위]\n${range.label}\n\n` +
+    `[내부 기록]\n${buildDigestCorpus(rows)}\n\n` +
+    `[작성 지침]\n` +
+    `너는 ${BOT_OWNER_NAME}의 개인 업무 비서 AI OS입니다.\n` +
+    `아래 기록은 이 봇이 직접 들어가 있는 텔레그램 방, 1:1 대화, 파일, 회의록에서 수집한 내용입니다.\n` +
+    `단순 나열하지 말고, 사용자가 오늘 확인해야 할 안건 중심으로 압축해 주세요.\n\n` +
+    `[출력 형식]\n` +
+    `${range.label} 기준으로 이 봇이 저장한 기록을 확인했습니다.\n\n` +
+    `확인할 주요 안건 N건입니다.\n\n` +
+    `1. 안건명\n` +
+    `   핵심: 한 문장으로 요약\n` +
+    `   봐야 할 점: 사용자가 확인해야 할 포인트\n` +
+    `   출처: [방이름] 공유자명 (시간)\n\n` +
+    `우선 확인할 것\n- 항목 1\n- 항목 2\n- 항목 3\n\n` +
+    `[품질 기준]\n` +
+    `1. 최대 5개 안건까지만 선정합니다.\n` +
+    `2. 각 안건은 3줄 이내로 씁니다.\n` +
+    `3. 업무적으로 중요한 내용만 고릅니다.\n` +
+    `4. 잡담, 웃음, 단순 리액션은 제외합니다.\n` +
+    `5. 출처는 반드시 [방이름] 공유자명 (시간) 형식으로 표시합니다.\n` +
+    `6. 출처 없는 내용은 쓰지 않습니다.\n` +
+    `7. 전체 답변은 1500자 이내로 씁니다.\n` +
+    `8. 마크다운 기호는 쓰지 않습니다.\n`;
+  const result = await difyChat(env, { query, user: String(userId), conversationId: "" });
+  return result?.answer || "요약을 생성하지 못했습니다.";
+}
+
+async function buildDigest(env, { days = 1 } = {}) {
+  return buildDigestCorpus(await fetchDigestRows(env, days, 80));
 }
 
 function isCombinedAnalysis(text) {
@@ -1036,7 +1230,6 @@ async function handleUpdate(update, env, isRelay = false) {
       await saveRoom(mc.chat.id, mc.chat.title, env);
       await dbRegisterRoom(env, mc.chat.id, mc.chat.title, "koh");
       await upsertRoom(env, mc.chat);
-      await sendMessage(env, mc.chat.id, GROUP_WELCOME);
     }
     return;
   }
@@ -1052,6 +1245,16 @@ async function handleUpdate(update, env, isRelay = false) {
 
   await handleNewChatMembers(env, message);
   await upsertUser(env, message.from, chatType === "private" ? chatId : message.from.id, chatType === "private" ? "private_dm" : "group_message");
+  if ((chatType === "private" || hasFile) && text.trim()) {
+    await dbInsert(env, {
+      roomId: chatId,
+      roomTitle: chatType === "private" ? "private_dm" : (message.chat.title || String(chatId)),
+      senderId: userId,
+      senderName: getSenderName(message.from),
+      content: getMessageTextForStorage(message),
+      savedBy: BOT_KEY,
+    });
+  }
   if (chatType !== "private") {
     await upsertRoom(env, message.chat);
     await upsertRoomMember(env, message.chat, message.from, "message");
@@ -1061,12 +1264,10 @@ async function handleUpdate(update, env, isRelay = false) {
     await saveRoom(chatId, message.chat.title, env);
     await dbRegisterRoom(env, chatId, message.chat.title, "koh");
     await upsertRoom(env, message.chat);
-    await sendMessage(env, chatId, GROUP_WELCOME);
     return;
   }
 
   if (text.split("@")[0].trim() === "/등록") {
-    await handleRegisterInstant(userId, chatId, message, env);
     return;
   }
 
@@ -1112,8 +1313,7 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
         [message.from?.first_name, message.from?.last_name].filter(Boolean).join(" ").trim() ||
         `user_${userId}`;
       await saveUser(userId, { id: userId, name: tgName, chat_id: chatId }, env);
-      await sendMessage(env, chatId, PRIVATE_GREETING);
-      return;
+      user = await getUser(userId, env);
     }
   }
 
@@ -1179,6 +1379,12 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
+  if (isDigestQuery(text)) {
+    const answer = await answerDigest(env, text, userId);
+    await sendMessage(env, chatId, answer);
+    return;
+  }
+
   // 뉴스 조회 → RSS 직접 답변
   if (isNewsQuery(text)) {
     await handleNewsQuery(chatId, env);
@@ -1240,7 +1446,8 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     const q = parseSearch(text);
     const rows = await dbSearch(env, q);
     if (rows.length === 0) {
-      await sendMessage(env, chatId, "해당 조건의 대화 기록이 없습니다.");
+      const knownRooms = await getKnownRoomsText(env);
+      await sendMessage(env, chatId, `현재 이 봇의 D1 DB에는 해당 조건의 기록이 없습니다.\n\n현재 이 봇에 등록된 방:\n${knownRooms || "등록된 방이 없습니다."}\n\n확인 필요:\n- BotFather Privacy Mode 설정\n- 봇이 해당 방에 들어가 있는지\n- messages 테이블에 최근 데이터가 쌓이는지`);
       return;
     }
     const corpus = rows
@@ -1331,7 +1538,6 @@ async function handleAutoRegister(userId, chatId, name, env) {
 
 async function handleRegisterStep1(userId, chatId, env) {
   await saveUser(userId, { id: userId, step: "waiting_name" }, env);
-  await sendMessage(env, chatId, "성함을 입력해 주세요.");
 }
 
 async function handleRegisterStep2(userId, chatId, name, currentChatId, env) {
@@ -1402,7 +1608,10 @@ async function handleUserMessage(userId, chatId, text, sendReply, env, userName 
 }
 
 async function handleGroupMessage(message, userId, chatId, text, hasFile, user, env) {
+  const shouldRespond = shouldRespondInGroup(message, text, env);
+
   if (hasFile) {
+    if (!shouldRespond) return;
     await handleFile(message, userId, chatId, false, env);
     return;
   }
@@ -1430,7 +1639,7 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     roomTitle:  message.chat.title || String(chatId),
     senderId:   userId,
     senderName: user?.name || message.from?.first_name || "",
-    content:    text,
+    content:    getMessageTextForStorage(message),
     savedBy:    "koh",
   });
   await maybeLearnFromMessage(env, message);
@@ -1452,25 +1661,20 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     if (introName && introName.length >= 2) {
       const existing = await getUser(userId, env);
       await saveUser(userId, { ...(existing || {}), id: userId, name: introName, chat_id: chatId }, env);
-      await sendMessage(env, chatId, `${introName}님, 반갑습니다. 무엇을 도와드릴까요?`);
       return;
     }
   }
 
-  // 응답 조건: @멘션 OR 봇 reply OR 질문형 문장
-  const botUsername = "@KOH_AI_bot";
-  const isMentioned = text.includes(botUsername);
-  const isReply = message.reply_to_message?.from?.is_bot === true;
-  const cleanText = text.replace(botUsername, "").trim();
-  const isQuestion =
-    /(해줘|알려줘|보여줘|정리해줘|요약해줘|찾아줘|뭐야|어때|있어|주세요|줘)$/.test(cleanText.trim()) ||
-    /[?？]/.test(cleanText);
+  if (!shouldRespond) return;
 
-  // @멘션이면 무조건 응답 (질문 형식 아니어도)
-  if (!isMentioned && !isReply && !isQuestion) return;
+  const cleanText = cleanBotMention(text, env);
 
   if (!cleanText) {
-    await sendMessage(env, chatId, `네, ${user?.name || ""}님. 무엇을 도와드릴까요?`);
+    return;
+  }
+
+  if (isLongSharedContent(cleanText)) {
+    await handleLongSharedContent(env, chatId, message);
     return;
   }
 
@@ -1481,6 +1685,12 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
       await summarizeUrl(env, urlMatch[0], userId, chatId);
       return;
     }
+  }
+
+  if (isDigestQuery(cleanText)) {
+    const answer = await answerDigest(env, cleanText, userId);
+    await sendMessage(env, chatId, answer);
+    return;
   }
 
   // 전체 방 통합 요약
@@ -1512,7 +1722,8 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     const q = parseSearch(cleanText);
     const rows = await dbSearch(env, q);
     if (rows.length === 0) {
-      await sendMessage(env, chatId, "해당 조건의 대화 기록이 없습니다.");
+      const knownRooms = await getKnownRoomsText(env);
+      await sendMessage(env, chatId, `현재 이 봇의 D1 DB에는 해당 조건의 기록이 없습니다.\n\n현재 이 봇에 등록된 방:\n${knownRooms || "등록된 방이 없습니다."}\n\n확인 필요:\n- BotFather Privacy Mode 설정\n- 봇이 해당 방에 들어가 있는지\n- messages 테이블에 최근 데이터가 쌓이는지`);
       return;
     }
     const corpus = rows
