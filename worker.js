@@ -7,6 +7,10 @@ const SUMMARY_PROMPT =
 const TONE_RULE =
   "[응답 규칙: 존댓말 격식체 사용. ^^ 이모티콘 사용 금지. 불필요한 감탄사 사용 금지.]\n\n";
 const ADMIN_NAME = "권오혁";
+const BOT_OWNER_NAME = "권오혁";
+const BOT_PERSONA = "권오혁의 개인 업무 비서 AI OS";
+const BOT_DB_NAME = "6r-ai-db";
+const BOT_KEY = "koh";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -20,6 +24,120 @@ const GROUP_WELCOME =
   "안녕하세요. 저는 권오혁 담당님의 AI 비서 권오혁(A)입니다.\n" +
   "원활한 소통을 위해 구성원 여러분의 성함을 등록해 주세요.\n" +
   "/등록 을 입력하시면 등록됩니다.";
+
+function getSenderName(from) {
+  if (!from) return "이름 없음";
+  const full = [from.first_name, from.last_name].filter(Boolean).join(" ").trim();
+  return full || from.username || String(from.id || "이름 없음");
+}
+
+async function upsertUser(env, from, chatId, source = "auto_message") {
+  if (!env.DB || !from?.id || from.is_bot) return;
+  try {
+    const telegramId = String(from.id);
+    await env.DB.prepare(`
+      INSERT INTO users
+        (telegram_id, chat_id, name, username, first_name, last_name, source, last_seen_at)
+      VALUES
+        (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(telegram_id) DO UPDATE SET
+        chat_id = excluded.chat_id,
+        name = excluded.name,
+        username = excluded.username,
+        first_name = excluded.first_name,
+        last_name = excluded.last_name,
+        source = excluded.source,
+        last_seen_at = CURRENT_TIMESTAMP
+    `).bind(
+      telegramId,
+      String(chatId || from.id),
+      getSenderName(from),
+      from.username || "",
+      from.first_name || "",
+      from.last_name || "",
+      source
+    ).run();
+  } catch (e) {
+    console.error("upsertUser:", e);
+  }
+}
+
+async function upsertRoom(env, chat) {
+  if (!env.DB || !chat?.id || chat.type === "private") return;
+  try {
+    await dbRegisterRoom(env, chat.id, chat.title || chat.username || String(chat.id), BOT_KEY);
+  } catch (e) {
+    console.error("upsertRoom:", e);
+  }
+}
+
+async function upsertRoomMember(env, chat, from, source = "message") {
+  if (!env.DB || !chat?.id || !from?.id || chat.type === "private" || from.is_bot) return;
+  try {
+    await env.DB.prepare(`
+      INSERT INTO room_members (room_id, telegram_id, user_id, name, username, bot_name, last_seen_at)
+      VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(room_id, telegram_id) DO UPDATE SET
+        user_id = excluded.user_id,
+        name = excluded.name,
+        username = excluded.username,
+        bot_name = excluded.bot_name,
+        last_seen_at = CURRENT_TIMESTAMP
+    `).bind(
+      String(chat.id),
+      String(from.id),
+      String(from.id),
+      getSenderName(from),
+      from.username || "",
+      BOT_KEY
+    ).run();
+  } catch (e) {
+    console.error(`upsertRoomMember:${source}`, e);
+  }
+}
+
+async function handleNewChatMembers(env, message) {
+  if (!message?.new_chat_members?.length || !message.chat || message.chat.type === "private") return;
+  await upsertRoom(env, message.chat);
+  for (const member of message.new_chat_members) {
+    if (member.is_bot) continue;
+    await upsertUser(env, member, member.id, "new_chat_member");
+    await upsertRoomMember(env, message.chat, member, "new_chat_member");
+  }
+}
+
+function isImportantMemoryCandidate(text) {
+  return /(기억해|저장해|앞으로|선호|싫어|좋아|반복|원칙|성향|담당|결정|액션|마감|중요)/.test(text || "");
+}
+
+function detectMemorySubject(text, from) {
+  if (/(나|내|저는|나는|제)/.test(text || "")) return BOT_OWNER_NAME;
+  return getSenderName(from);
+}
+
+async function maybeLearnFromMessage(env, message) {
+  if (!env.DB || !message?.from || message.from.is_bot) return;
+  const text = message.text || message.caption || "";
+  if (!isImportantMemoryCandidate(text)) return;
+  try {
+    const chat = message.chat || {};
+    await env.DB.prepare(`
+      INSERT INTO learned_facts
+        (fact_type, subject, content, confidence, source_type, source_room, source_actor, source_time)
+      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    `).bind(
+      "message_signal",
+      detectMemorySubject(text, message.from),
+      text.slice(0, 1000),
+      /기억해|저장해/.test(text) ? 5 : 2,
+      chat.type === "private" ? "private" : "telegram_group",
+      chat.title || chat.username || String(chat.id || ""),
+      getSenderName(message.from)
+    ).run();
+  } catch (e) {
+    console.error("maybeLearnFromMessage:", e);
+  }
+}
 
 export default {
   async fetch(request, env) {
@@ -147,9 +265,14 @@ async function dbUpsertMember(env, roomId, userId, botName) {
   if (!env.DB) return;
   try {
     await env.DB.prepare(
-      `INSERT OR REPLACE INTO room_members (room_id, user_id, bot_name) VALUES (?, ?, ?)`
+      `INSERT INTO room_members (room_id, telegram_id, user_id, bot_name, last_seen_at)
+       VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(room_id, telegram_id) DO UPDATE SET
+         user_id = excluded.user_id,
+         bot_name = excluded.bot_name,
+         last_seen_at = CURRENT_TIMESTAMP`
     )
-      .bind(String(roomId), String(userId), botName || "koh")
+      .bind(String(roomId), String(userId), String(userId), botName || BOT_KEY)
       .run();
   } catch (e) {
     console.error("dbUpsertMember:", e);
@@ -161,9 +284,15 @@ async function dbRegisterKohInRoom(env, roomId) {
   if (!env.DB) return;
   try {
     await env.DB.prepare(
-      `INSERT OR REPLACE INTO room_members (room_id, user_id, bot_name) VALUES (?, ?, ?)`
+      `INSERT INTO room_members (room_id, telegram_id, user_id, name, bot_name, last_seen_at)
+       VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(room_id, telegram_id) DO UPDATE SET
+         user_id = excluded.user_id,
+         name = excluded.name,
+         bot_name = excluded.bot_name,
+         last_seen_at = CURRENT_TIMESTAMP`
     )
-      .bind(String(roomId), "koh_bot", "koh")
+      .bind(String(roomId), "koh_bot", "koh_bot", "KOH_AI_bot", BOT_KEY)
       .run();
   } catch (e) {
     console.error("dbRegisterKohInRoom:", e);
@@ -504,6 +633,192 @@ function isRoomListQuery(text) {
   );
 }
 
+function isExplicitMemorySaveQuery(text) {
+  return /(기억해줘|기억해 줘|저장해줘|저장해 줘|앞으로\s*참고|메모해줘|메모해 줘)/.test(text || "");
+}
+
+function isMemorySearchQuery(text) {
+  return /(찾아줘|찾아 줘|검색|기억|무슨\s*얘기|정리해줘|요약해줘|파일|회의록|자료).{0,30}/.test(text || "");
+}
+
+async function saveExplicitMemory(env, text, from, chatId) {
+  if (!env.DB) {
+    await sendMessage(env, chatId, "D1 DB가 연결되어 있지 않아 기억을 저장할 수 없습니다.");
+    return;
+  }
+  const content = String(text || "")
+    .replace(/기억해줘|기억해 줘|저장해줘|저장해 줘|앞으로\s*참고|메모해줘|메모해 줘/g, "")
+    .trim();
+  if (!content) {
+    await sendMessage(env, chatId, "저장할 내용을 찾지 못했습니다.");
+    return;
+  }
+  try {
+    await env.DB.prepare(`
+      INSERT INTO memory_profile (profile_key, profile_value, evidence, confidence)
+      VALUES (?, ?, ?, ?)
+    `).bind(
+      `manual_${Date.now()}`,
+      content.slice(0, 1000),
+      `사용자 직접 저장: ${getSenderName(from)}`,
+      5
+    ).run();
+    await sendMessage(env, chatId, "기억해두겠습니다.");
+  } catch (e) {
+    console.error("saveExplicitMemory:", e);
+    await sendMessage(env, chatId, "기억 저장 중 오류가 발생했습니다.");
+  }
+}
+
+function extractSearchKeyword(text) {
+  const cleaned = String(text || "")
+    .replace(/찾아줘|찾아 줘|검색|정리해줘|요약해줘|뭐야|무슨|얘기|파일|회의록|자료|관련/g, " ")
+    .replace(/[^\w가-힣A-Za-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const parts = cleaned.split(" ").filter((w) => w.length >= 2);
+  return parts.slice(0, 4).join(" ") || cleaned || text;
+}
+
+async function searchMemory(env, keyword, limit = 30) {
+  if (!env.DB || !keyword?.trim()) return [];
+  const like = `%${keyword}%`;
+  try {
+    const messages = await env.DB.prepare(`
+      SELECT 'message' AS type, room_title AS source, sender_name AS actor, content AS text, created_at, NULL AS file_name, NULL AS title
+      FROM messages
+      WHERE content LIKE ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).bind(like, limit).all();
+    const files = await env.DB.prepare(`
+      SELECT 'file' AS type, COALESCE(room_title, '') AS source, COALESCE(uploader_name, sender_name) AS actor,
+             COALESCE(summary, extracted_text, content, file_name) AS text, created_at, file_name, NULL AS title
+      FROM files
+      WHERE file_name LIKE ? OR extracted_text LIKE ? OR content LIKE ? OR summary LIKE ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).bind(like, like, like, like, limit).all();
+    const meetings = await env.DB.prepare(`
+      SELECT 'meeting' AS type, COALESCE(source, title, '') AS source, created_by AS actor,
+             COALESCE(summary, raw_text, decisions, action_items) AS text, created_at, NULL AS file_name, title
+      FROM meetings
+      WHERE title LIKE ? OR raw_text LIKE ? OR summary LIKE ? OR decisions LIKE ? OR action_items LIKE ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).bind(like, like, like, like, like, limit).all();
+    const facts = await env.DB.prepare(`
+      SELECT 'memory' AS type, COALESCE(source_room, subject, '') AS source, source_actor AS actor,
+             content AS text, created_at, NULL AS file_name, subject AS title
+      FROM learned_facts
+      WHERE subject LIKE ? OR content LIKE ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).bind(like, like, limit).all();
+    return [
+      ...(messages.results || []),
+      ...(files.results || []),
+      ...(meetings.results || []),
+      ...(facts.results || []),
+    ].sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, limit);
+  } catch (e) {
+    console.error("searchMemory:", e);
+    return [];
+  }
+}
+
+function buildSourceCorpus(rows) {
+  return rows.map((r, idx) => {
+    const typeLabel =
+      r.type === "message" ? "대화" :
+      r.type === "file" ? "파일" :
+      r.type === "meeting" ? "회의록" :
+      r.type === "memory" ? "축적 기억" : "자료";
+    const extra = r.file_name ? ` / 파일명: ${r.file_name}` : r.title ? ` / 제목: ${r.title}` : "";
+    return `[${idx + 1}] ${typeLabel}
+출처: ${r.source || "출처 미상"} / ${r.actor || "작성자 미상"} / ${r.created_at || "시간 미상"}${extra}
+내용:
+${String(r.text || "").slice(0, 1200)}`;
+  }).join("\n\n");
+}
+
+async function answerFromMemory(env, userText, userId) {
+  const keyword = extractSearchKeyword(userText);
+  const rows = await searchMemory(env, keyword, 30);
+  if (!rows.length) return `관련 기록을 찾지 못했습니다.\n검색어: ${keyword}`;
+  const query =
+    TONE_RULE +
+    `아래는 ${BOT_OWNER_NAME}봇이 직접 수집한 ${BOT_DB_NAME}의 업무 기록입니다. 다른 봇의 DB는 참고하지 않습니다.\n\n` +
+    `사용자 질문:\n${userText}\n\n검색어:\n${keyword}\n\n내부 기록:\n${buildSourceCorpus(rows)}\n\n` +
+    "요약, 확인된 내용, 참고 출처, 다음 액션 순서로 답변하세요. 출처 없는 내용은 추정이라고 표시하세요.";
+  const result = await difyChat(env, { query, user: String(userId), conversationId: "" });
+  return result?.answer || "검색 결과를 요약하지 못했습니다.";
+}
+
+async function getRecentContext(env, chatId, limit = 12) {
+  if (!env.DB) return "";
+  try {
+    const result = await env.DB.prepare(`
+      SELECT room_title, sender_name, content, created_at
+      FROM messages
+      WHERE room_id = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).bind(String(chatId), limit).all();
+    const rows = result.results || [];
+    return rows.reverse().map((r) =>
+      `출처: [${r.room_title || "대화방"}] ${r.sender_name || "이름 없음"} (${r.created_at})\n내용: ${r.content}`
+    ).join("\n\n");
+  } catch (e) {
+    console.error("getRecentContext:", e);
+    return "";
+  }
+}
+
+async function getBotMemory(env, limit = 20) {
+  if (!env.DB) return "";
+  try {
+    const facts = await env.DB.prepare(`
+      SELECT fact_type, subject, content, confidence, source_room, source_actor, source_time
+      FROM learned_facts
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).bind(limit).all();
+    const profiles = await env.DB.prepare(`
+      SELECT profile_key, profile_value, evidence, confidence
+      FROM memory_profile
+      ORDER BY updated_at DESC
+      LIMIT ?
+    `).bind(10).all();
+    const factText = (facts.results || []).map((f, idx) =>
+      `[기억 ${idx + 1}] 유형: ${f.fact_type} / 대상: ${f.subject || "미상"} / 신뢰도: ${f.confidence}
+내용: ${f.content}
+출처: ${f.source_room || "출처 미상"} / ${f.source_actor || "작성자 미상"} / ${f.source_time || "시간 미상"}`
+    ).join("\n\n");
+    const profileText = (profiles.results || []).map((p, idx) =>
+      `[프로필 ${idx + 1}] ${p.profile_key}: ${p.profile_value}
+근거: ${p.evidence || "근거 미상"} / 신뢰도: ${p.confidence}`
+    ).join("\n\n");
+    return [profileText, factText].filter(Boolean).join("\n\n");
+  } catch (e) {
+    console.error("getBotMemory:", e);
+    return "";
+  }
+}
+
+async function buildSmartQuery(env, text, message) {
+  const recentContext = message?.chat?.type !== "private"
+    ? await getRecentContext(env, message.chat.id, 12)
+    : "";
+  const botMemory = await getBotMemory(env, 20);
+  return TONE_RULE +
+    `[봇 정체성]\n${BOT_PERSONA}입니다. ${BOT_DB_NAME}에 저장된 이 봇의 기록만 참고합니다.\n\n` +
+    `[사용자 질문]\n${text}\n\n` +
+    (recentContext ? `[최근 대화]\n${recentContext}\n\n` : "") +
+    (botMemory ? `[축적 기억]\n${botMemory}\n\n` : "") +
+    "확인된 내용과 추정을 구분하고, 내부 기록을 사용하면 출처를 표시하세요.";
+}
+
 function isActionQuery(text) {
   return /(해줘|알려줘|보여줘|정리해줘|요약해줘|찾아줘|알려주세요|해주세요|주세요|줘)$/.test(text.trim())
     || /[?？]/.test(text);
@@ -651,6 +966,28 @@ async function handleIntro(chatId, env) {
 }
 
 async function handleUserList(chatId, env) {
+  if (env.DB) {
+    try {
+      const result = await env.DB.prepare(`
+        SELECT telegram_id, name, username, source, last_seen_at
+        FROM users
+        ORDER BY last_seen_at DESC
+        LIMIT 100
+      `).all();
+      const rows = result.results || [];
+      if (rows.length) {
+        const lines = rows.map((u, idx) => {
+          const username = u.username ? ` / @${u.username}` : "";
+          const source = u.source ? ` / ${u.source}` : "";
+          return `${idx + 1}. ${u.name || "이름 없음"} / ID: ${u.telegram_id}${username}${source}`;
+        });
+        await sendMessage(env, chatId, `등록된 사용자 ${rows.length}명\n\n${lines.join("\n")}`);
+        return;
+      }
+    } catch (e) {
+      console.error("handleUserList D1:", e);
+    }
+  }
   const list = await env.USERS.list({ prefix: "user_" });
   const users = [];
   for (const key of list.keys) {
@@ -698,6 +1035,7 @@ async function handleUpdate(update, env, isRelay = false) {
     if ((newStatus === "member" || newStatus === "administrator") && mc.chat.type !== "private") {
       await saveRoom(mc.chat.id, mc.chat.title, env);
       await dbRegisterRoom(env, mc.chat.id, mc.chat.title, "koh");
+      await upsertRoom(env, mc.chat);
       await sendMessage(env, mc.chat.id, GROUP_WELCOME);
     }
     return;
@@ -712,9 +1050,17 @@ async function handleUpdate(update, env, isRelay = false) {
   const text = message.text || message.caption || "";
   const hasFile = !!(message.document || message.photo);
 
+  await handleNewChatMembers(env, message);
+  await upsertUser(env, message.from, chatType === "private" ? chatId : message.from.id, chatType === "private" ? "private_dm" : "group_message");
+  if (chatType !== "private") {
+    await upsertRoom(env, message.chat);
+    await upsertRoomMember(env, message.chat, message.from, "message");
+  }
+
   if (message.new_chat_members?.some((m) => m.is_bot)) {
     await saveRoom(chatId, message.chat.title, env);
     await dbRegisterRoom(env, chatId, message.chat.title, "koh");
+    await upsertRoom(env, message.chat);
     await sendMessage(env, chatId, GROUP_WELCOME);
     return;
   }
@@ -828,6 +1174,11 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
+  if (isExplicitMemorySaveQuery(text)) {
+    await saveExplicitMemory(env, text, message.from, chatId);
+    return;
+  }
+
   // 뉴스 조회 → RSS 직접 답변
   if (isNewsQuery(text)) {
     await handleNewsQuery(chatId, env);
@@ -858,6 +1209,12 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
       newsText;
     const result = await difyChat(env, { query, user: userId, conversationId: "" });
     await sendMessage(env, chatId, result.answer || "분석 중 오류가 발생했습니다.");
+    return;
+  }
+
+  if (isMemorySearchQuery(text) && env.DB) {
+    const answer = await answerFromMemory(env, text, userId);
+    await sendMessage(env, chatId, answer);
     return;
   }
 
@@ -1005,7 +1362,9 @@ async function handleUserMessage(userId, chatId, text, sendReply, env, userName 
   try {
     const convKey = `conv_${userId}`;
     const conversationId = (await env.CONVERSATIONS.get(convKey)) || "";
-    const query = TONE_RULE + text;
+    const query = env.DB
+      ? await buildSmartQuery(env, text, { chat: { id: chatId, type: "private" } })
+      : TONE_RULE + text;
     let result;
 
     try {
@@ -1074,6 +1433,7 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     content:    text,
     savedBy:    "koh",
   });
+  await maybeLearnFromMessage(env, message);
   console.log(`[KOH DB저장] room=${message.chat.title} user=${user?.name} text=${text.slice(0, 30)}`);
 
   // 일정 감지 (브리핑 cron용)
@@ -1325,8 +1685,11 @@ async function sendDailyBriefing(env) {
 
   if (!msg) return;
 
-  const rooms = await getAllRooms(env);
-  await Promise.all(rooms.map((r) => sendMessage(env, r.id, msg)));
+  const adminUser = await findAdminUser(env);
+  const targetChatId = env.ADMIN_TELEGRAM_ID || adminUser?.chat_id;
+  if (targetChatId) {
+    await sendMessage(env, targetChatId, msg);
+  }
 }
 
 async function difyChat(env, { query, user, conversationId = "", files = [] }) {
@@ -1411,15 +1774,21 @@ async function tgGetFile(env, fileId) {
 }
 
 async function sendMessage(env, chatId, text) {
-  const clean = String(text)
-    .replace(/\*\*(.+?)\*\*/gs, "$1")
-    .replace(/\*(.+?)\*/gs, "$1")
-    .replace(/^#{1,6}\s+/gm, "")
-    .replace(/__(.+?)__/gs, "$1")
-    .replace(/`{1,3}([^`]*)`{1,3}/g, "$1");
+  const clean = stripMarkdown(text).slice(0, 3900);
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, text: clean }),
   });
+}
+
+function stripMarkdown(text) {
+  return String(text || "")
+    .replace(/\*\*(.*?)\*\*/gs, "$1")
+    .replace(/__(.*?)__/gs, "$1")
+    .replace(/`{1,3}([\s\S]*?)`{1,3}/g, "$1")
+    .replace(/^#{1,6}\s*/gm, "")
+    .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
+    .replace(/[ \t]+\n/g, "\n")
+    .trim();
 }
