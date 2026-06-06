@@ -1,9 +1,10 @@
 const DIFY_API_URL = "https://api.dify.ai/v1";
 const SUMMARY_PROMPT =
-  "다음 파일에서 아래 형식으로 추출해줘.\n" +
-  "요약: (핵심 3줄)\n" +
-  "안건: (주요 논의·결정 안건, 없으면 '없음')\n" +
-  "일정: (날짜·기한·마감이 언급된 일정, 없으면 '없음')";
+  "[요약 응답 규칙]\n" +
+  "- 답변은 보고 메모체로 작성합니다.\n" +
+  "- 문장 끝은 가급적 '~임', '~필요', '~확인 필요' 형식으로 작성합니다.\n" +
+  "다음 파일 내용을 업무 보고 메모체로 정리해줘.\n" +
+  "구성: 핵심 내용 / 안건 / 일정 / 확인할 일.";
 const TONE_RULE =
   "[응답 규칙: 존댓말 격식체 사용. ^^ 이모티콘 사용 금지. 불필요한 감탄사 사용 금지.]\n\n";
 const SUMMARY_TONE_RULE =
@@ -933,7 +934,7 @@ async function summarizeUrl(env, url, userText, userId) {
     return { url, title: content.title || "", summary, unsupported: true };
   }
   const query =
-    TONE_RULE +
+    SUMMARY_TONE_RULE +
     `[요청]\n사용자가 전달한 URL 내용을 요약해줘.\n\n` +
     `[사용자 질문]\n${userText}\n\n` +
     `[URL]\n${url}\n\n` +
@@ -1436,26 +1437,37 @@ async function dbSaveConversation(env, { userId, userName, question, answer, con
   }
 }
 
-async function dbSaveFile(env, { roomId, roomTitle, senderId, senderName, fileName, mimeType, summary, savedBy }) {
+async function dbSaveFile(env, data) {
   if (!env.DB) return;
   try {
-    await env.DB.prepare(
-      `INSERT INTO files (room_id, room_title, sender_id, sender_name, file_name, mime_type, summary, saved_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-      .bind(
-        String(roomId),
-        roomTitle || "",
-        String(senderId),
-        senderName || "",
-        fileName || "",
-        mimeType || "",
-        (summary || "").slice(0, 4000),
-        savedBy || "koh"
-      )
+    const table = await env.DB.prepare(`PRAGMA table_info(files)`).all();
+    const existing = new Set((table.results || []).map((c) => c.name));
+    const values = {
+      telegram_file_id: data.telegram_file_id || "",
+      telegram_file_unique_id: data.telegram_file_unique_id || "",
+      r2_key: data.r2_key || "",
+      room_id: String(data.room_id || data.roomId || ""),
+      room_title: data.room_title || data.roomTitle || "",
+      uploader_id: String(data.uploader_id || data.uploaderId || data.senderId || ""),
+      uploader_name: data.uploader_name || data.uploaderName || data.senderName || "",
+      sender_id: String(data.sender_id || data.senderId || data.uploader_id || data.uploaderId || ""),
+      sender_name: data.sender_name || data.senderName || data.uploader_name || data.uploaderName || "",
+      file_name: data.file_name || data.fileName || "",
+      file_type: data.file_type || data.fileType || data.mimeType || "",
+      mime_type: data.mime_type || data.mimeType || data.file_type || data.fileType || "",
+      extracted_text: String(data.extracted_text || data.content || "").slice(0, 50000),
+      summary: String(data.summary || "").slice(0, 3000),
+      tags_json: JSON.stringify(data.tags || []),
+      saved_by: data.saved_by || data.savedBy || BOT_KEY,
+    };
+    const columns = Object.keys(values).filter((name) => existing.has(name));
+    if (!columns.length) return;
+    const placeholders = columns.map(() => "?").join(", ");
+    await env.DB.prepare(`INSERT INTO files (${columns.join(", ")}) VALUES (${placeholders})`)
+      .bind(...columns.map((name) => values[name]))
       .run();
   } catch (e) {
-    console.error("dbSaveFile:", e);
+    console.error("dbSaveFile failed:", e);
   }
 }
 
@@ -1468,8 +1480,8 @@ async function dbSearchFiles(env, { roomTitle, keyword, days = 7 }) {
     const params = [since];
     if (roomTitle) { where += " AND room_title LIKE ?"; params.push(`%${roomTitle}%`); }
     if (keyword) {
-      where += " AND (file_name LIKE ? OR summary LIKE ?)";
-      params.push(`%${keyword}%`, `%${keyword}%`);
+      where += " AND (file_name LIKE ? OR extracted_text LIKE ? OR summary LIKE ?)";
+      params.push(`%${keyword}%`, `%${keyword}%`, `%${keyword}%`);
     }
     const query = `SELECT * FROM files WHERE ${where} ORDER BY created_at DESC LIMIT 50`;
     const result = await env.DB.prepare(query).bind(...params).all();
@@ -1694,12 +1706,12 @@ async function searchMemory(env, keyword, limit = 30) {
     `).bind(like, limit).all();
     const files = await env.DB.prepare(`
       SELECT 'file' AS type, COALESCE(room_title, '') AS source, COALESCE(uploader_name, sender_name) AS actor,
-             COALESCE(summary, extracted_text, content, file_name) AS text, created_at, file_name, NULL AS title
+             COALESCE(summary, extracted_text, file_name) AS text, created_at, file_name, NULL AS title
       FROM files
-      WHERE file_name LIKE ? OR extracted_text LIKE ? OR content LIKE ? OR summary LIKE ?
+      WHERE file_name LIKE ? OR extracted_text LIKE ? OR summary LIKE ?
       ORDER BY created_at DESC
       LIMIT ?
-    `).bind(like, like, like, like, limit).all();
+    `).bind(like, like, like, limit).all();
     const meetings = await env.DB.prepare(`
       SELECT 'meeting' AS type, COALESCE(source, title, '') AS source, created_by AS actor,
              COALESCE(summary, raw_text, decisions, action_items) AS text, created_at, NULL AS file_name, title
@@ -1901,7 +1913,7 @@ async function fetchDigestRows(env, days = 2, limit = 120) {
     `).bind(`-${days} days`, limit).all();
     const files = await env.DB.prepare(`
       SELECT 'file' AS type, COALESCE(room_title, '') AS source, COALESCE(uploader_name, sender_name) AS actor,
-             COALESCE(summary, extracted_text, content, file_name) AS text, created_at, file_name, NULL AS title
+             COALESCE(summary, extracted_text, file_name) AS text, created_at, file_name, NULL AS title
       FROM files
       WHERE datetime(created_at) >= datetime('now', ?)
       ORDER BY created_at DESC
@@ -1974,7 +1986,7 @@ ${knownRooms || "등록된 방이 없습니다."}
 - messages 테이블에 최근 데이터가 쌓이는지 확인`;
   }
   const query =
-    TONE_RULE +
+    SUMMARY_TONE_RULE +
     `[요청]\n${userText}\n\n` +
     `[요약 범위]\n${range.label}\n\n` +
     `[내부 기록]\n${buildDigestCorpus(rows)}\n\n` +
@@ -1992,7 +2004,7 @@ ${knownRooms || "등록된 방이 없습니다."}
     `우선 확인할 것\n- 항목 1\n- 항목 2\n- 항목 3\n\n` +
     `[품질 기준]\n` +
     `1. 최대 5개 안건까지만 선정합니다.\n` +
-    `2. 각 안건은 3줄 이내로 씁니다.\n` +
+    `2. 각 안건은 현상, 의미, 확인할 일 중심으로 짧게 씁니다.\n` +
     `3. 업무적으로 중요한 내용만 고릅니다.\n` +
     `4. 잡담, 웃음, 단순 리액션은 제외합니다.\n` +
     `5. 출처는 반드시 [방이름] 공유자명 (시간) 형식으로 표시합니다.\n` +
@@ -2001,6 +2013,45 @@ ${knownRooms || "등록된 방이 없습니다."}
     `8. 마크다운 기호는 쓰지 않습니다.\n`;
   const result = await difyChat(env, { query, user: String(userId), conversationId: "" });
   return result?.answer || "요약을 생성하지 못했습니다.";
+}
+
+function isScheduleDigestQuery(text) {
+  return /(다음주|내주|이번주|오늘|최근).{0,30}(참석|일정|회의|미팅|세션|포럼|행사|방문|콜|call|meeting).{0,30}(정리|알려|요약|공유)/i.test(text || "")
+    || /(참석해야\s*할|참석할).{0,20}(일정|회의|미팅|세션|포럼|행사)/.test(text || "");
+}
+
+async function answerScheduleDigest(env, userText, userId) {
+  const range = { label: "최근 기록 기준", days: 7 };
+  const rows = await fetchDigestRows(env, range.days, 200);
+  if (!rows.length) {
+    return `최근 기록 기준 저장된 대화 기록이 없음.\n\n- /db_status로 messages 적재 여부 확인 필요\n- 단체방 및 1:1 메시지 저장 로직 확인 필요`;
+  }
+  const filtered = rows.filter((r) =>
+    /(참석|일정|회의|미팅|세션|포럼|행사|방문|콜|call|meeting|다음주|내주|이번주|날짜|오전|오후|\d{1,2}\/\d{1,2}|\d{1,2}월\s*\d{1,2}일)/i.test(String(r.text || ""))
+  );
+  const targetRows = filtered.length ? filtered : rows;
+  const corpus = buildDigestCorpus(targetRows.slice(0, 80));
+  const query =
+    SUMMARY_TONE_RULE +
+    `[요청]\n${userText}\n\n` +
+    `[내부 기록]\n${corpus}\n\n` +
+    `[작성 지침]\n` +
+    `- 사용자가 다음주 또는 향후 참석해야 할 일정, 회의, 행사만 추려 정리할 것\n` +
+    `- 날짜, 시간, 행사명, 참석 주체, 확인할 일을 우선 추출할 것\n` +
+    `- 명확한 일정이 아니면 일정 후보로 표시할 것\n` +
+    `- 출처는 반드시 [방이름] 공유자명 (시간) 형식으로 표시할 것\n\n` +
+    `[출력 형식]\n` +
+    `참석/확인 필요 일정 N건임.\n\n` +
+    `1. 일정명\n` +
+    `- 일시: ...확인 필요\n` +
+    `- 내용: ...임\n` +
+    `- 확인할 일: ...필요\n` +
+    `- 출처: [방이름] 공유자명 (시간)\n\n` +
+    `우선 확인할 것\n` +
+    `- 참석자 확정 필요\n` +
+    `- 일정 캘린더 반영 필요`;
+  const result = await difyChat(env, { query, user: String(userId), conversationId: "" });
+  return result?.answer || "일정 요약을 생성하지 못했음.";
 }
 
 async function buildDigest(env, { days = 1 } = {}) {
@@ -2398,6 +2449,12 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
+  if (isScheduleDigestQuery(text)) {
+    const answer = await answerScheduleDigest(env, text, userId);
+    await sendMessage(env, chatId, answer);
+    return;
+  }
+
   if (isDigestQuery(text)) {
     const answer = await answerDigest(env, text, userId);
     await sendMessage(env, chatId, answer);
@@ -2736,6 +2793,12 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     }
   }
 
+  if (isScheduleDigestQuery(cleanText)) {
+    const answer = await answerScheduleDigest(env, cleanText, userId);
+    await sendMessage(env, chatId, answer);
+    return;
+  }
+
   if (isDigestQuery(cleanText)) {
     const answer = await answerDigest(env, cleanText, userId);
     await sendMessage(env, chatId, answer);
@@ -2829,7 +2892,18 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
     if (mimeType.startsWith("image/") && (env.GEMINI_API_KEY || (env.VISION_PROVIDER === "openai" && env.OPENAI_API_KEY))) {
       const buffer = await fetch(fileUrl).then((r) => r.arrayBuffer());
       const answer = await analyzeImageWithClaude(env, buffer, mimeType, message.caption || "");
-      await dbSaveFile(env, { roomId, roomTitle, senderId: userId, senderName, fileName, mimeType, summary: answer, savedBy: "koh" });
+      await dbSaveFile(env, {
+        telegram_file_id: fileId,
+        telegram_file_unique_id: message.document?.file_unique_id || message.photo?.[message.photo.length - 1]?.file_unique_id || "",
+        roomId,
+        roomTitle,
+        senderId: userId,
+        senderName,
+        fileName,
+        mimeType,
+        summary: answer,
+        tags: ["image", "analysis"],
+      });
       await sendMessage(env, chatId, answer);
       return;
     }
@@ -2843,7 +2917,7 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
       : "";
 
     const filePayload = {
-      query: TONE_RULE + SUMMARY_PROMPT,
+      query: SUMMARY_PROMPT,
       user: userId,
       files: [{ type: difyFileType(mimeType), transfer_method: "local_file", upload_file_id: uploaded.id }],
     };
@@ -2865,7 +2939,18 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
     }
 
     const summary = result.answer || "";
-    await dbSaveFile(env, { roomId, roomTitle, senderId: userId, senderName, fileName, mimeType, summary, savedBy: "koh" });
+    await dbSaveFile(env, {
+      telegram_file_id: fileId,
+      telegram_file_unique_id: message.document?.file_unique_id || "",
+      roomId,
+      roomTitle,
+      senderId: userId,
+      senderName,
+      fileName,
+      mimeType,
+      summary,
+      tags: ["document"],
+    });
     await sendMessage(env, chatId, summary || "요약 중 오류가 발생했어요.");
   } catch (e) {
     console.error("handleFile error:", e);
