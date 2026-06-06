@@ -749,35 +749,280 @@ async function dbSearch(env, { roomTitle, keyword, days = 7 }) {
   }
 }
 
-async function summarizeUrl(env, url, userId, chatId) {
-  try {
-    const res = await fetch(url, {
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; bot)" },
-      redirect: "follow",
-    });
-    if (!res.ok) {
-      await sendMessage(env, chatId, "해당 링크에 접근할 수 없습니다.");
-      return;
-    }
-    const html = await res.text();
-    const text = html
-      .replace(/<script[\s\S]*?<\/script>/gi, "")
-      .replace(/<style[\s\S]*?<\/style>/gi, "")
+function isExternalSearchEnabled(env) {
+  return String(env.EXTERNAL_SEARCH_ENABLED || "").toLowerCase() === "true";
+}
+
+function hasTavilyConfig(env) {
+  return !!env.TAVILY_API_KEY;
+}
+
+function extractUrls(text) {
+  const matches = String(text || "").match(/https?:\/\/[^\s<>)"]+/g);
+  if (!matches) return [];
+  return [...new Set(matches.map((u) => u.replace(/[.,)]$/, "")))];
+}
+
+function hasUrl(text) {
+  return extractUrls(text).length > 0;
+}
+
+function isUrlSummaryQuery(text) {
+  return hasUrl(text) && /(요약|정리|무슨\s*내용|핵심|참고|분석|봐줘|읽어줘|이해|설명)/.test(text || "");
+}
+
+function needsExternalSearch(text) {
+  const t = String(text || "");
+  if (hasUrl(t)) return false;
+  return /(뉴스|기사|최신|최근\s*동향|외부\s*자료|참고\s*자료|검색해|찾아봐|웹에서|인터넷|URL|링크|근거|출처|잘\s*이해가\s*안|이해가\s*안|무슨\s*말인지|관련\s*자료|비슷한\s*사례|시장\s*동향|정책\s*동향|해외\s*동향|레퍼런스|reference)/i.test(t);
+}
+
+function buildExternalSearchQuery(text) {
+  return String(text || "")
+    .replace(/뉴스|기사|최신|최근\s*동향|외부\s*자료|참고\s*자료|검색해줘|검색해|찾아봐|찾아줘|웹에서|인터넷|근거|출처|이해가\s*안|관련\s*자료|레퍼런스|reference/g, " ")
+    .replace(/https?:\/\/[^\s<>)"]+/g, " ")
+    .replace(/[^\w가-힣A-Za-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+}
+
+async function searchTavily(env, query, maxResults = 5) {
+  if (!isExternalSearchEnabled(env) || !hasTavilyConfig(env)) return [];
+  const res = await fetch("https://api.tavily.com/search", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${env.TAVILY_API_KEY}`,
+    },
+    body: JSON.stringify({
+      query,
+      search_depth: "basic",
+      max_results: maxResults,
+      include_answer: false,
+      include_raw_content: false,
+      include_images: false,
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`Tavily search failed: ${JSON.stringify(data)}`);
+  return (data.results || []).map((item) => ({
+    provider: "tavily",
+    title: item.title || "",
+    url: item.url || "",
+    snippet: item.content || "",
+    score: item.score || 0,
+  }));
+}
+
+async function extractWithTavily(env, url) {
+  if (!isExternalSearchEnabled(env) || !hasTavilyConfig(env)) throw new Error("Tavily API key is not configured");
+  const res = await fetch("https://api.tavily.com/extract", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${env.TAVILY_API_KEY}`,
+    },
+    body: JSON.stringify({ urls: [url], extract_depth: "basic", include_images: false }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`Tavily extract failed: ${JSON.stringify(data)}`);
+  const item = data.results?.[0] || data.response?.[0] || null;
+  if (!item) throw new Error("Tavily extract returned no result");
+  return { url, title: item.title || "", text: item.raw_content || item.content || "", provider: "tavily_extract" };
+}
+
+function cleanHtmlText(text) {
+  return String(text || "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function htmlToPlainText(html) {
+  return cleanHtmlText(
+    String(html || "")
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+      .replace(/<header[\s\S]*?<\/header>/gi, " ")
+      .replace(/<footer[\s\S]*?<\/footer>/gi, " ")
+      .replace(/<nav[\s\S]*?<\/nav>/gi, " ")
       .replace(/<[^>]+>/g, " ")
-      .replace(/\s{2,}/g, " ")
-      .trim()
-      .slice(0, 5000);
-    if (text.length < 100) {
-      await sendMessage(env, chatId, "본문을 추출할 수 없는 링크입니다.");
-      return;
-    }
-    const query = TONE_RULE + "아래 기사/문서 내용을 핵심 3줄로 요약해줘. 출처·광고·메뉴 내용은 제외.\n\n" + text;
-    const result = await difyChat(env, { query, user: String(userId), conversationId: "" });
-    await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했습니다.");
-  } catch (e) {
-    console.error("summarizeUrl:", e);
-    await sendMessage(env, chatId, "링크 접근 중 오류가 발생했습니다.");
+  );
+}
+
+async function fetchUrlContent(url) {
+  const res = await fetch(url, {
+    method: "GET",
+    headers: { "User-Agent": "Mozilla/5.0 AI-Bot-Assistant/1.0" },
+  });
+  const contentType = res.headers.get("content-type") || "";
+  if (!res.ok) throw new Error(`URL fetch failed: ${res.status}`);
+  if (!contentType.includes("text/html") && !contentType.includes("text/plain")) {
+    return { url, title: "", text: "", contentType, unsupported: true, provider: "worker_fetch" };
   }
+  const html = await res.text();
+  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  return {
+    url,
+    title: titleMatch ? cleanHtmlText(titleMatch[1]).slice(0, 200) : "",
+    text: htmlToPlainText(html).slice(0, 12000),
+    contentType,
+    unsupported: false,
+    provider: "worker_fetch",
+  };
+}
+
+async function extractUrlContent(env, url) {
+  if (isExternalSearchEnabled(env) && hasTavilyConfig(env)) {
+    try {
+      const result = await extractWithTavily(env, url);
+      if (result.text?.trim()) return result;
+    } catch (error) {
+      console.error("Tavily extract failed, fallback to Worker fetch", String(error?.message || error));
+    }
+  }
+  return await fetchUrlContent(url);
+}
+
+async function saveExternalSource(env, row) {
+  if (!env.DB) return;
+  await env.DB.prepare(`
+    INSERT INTO external_sources
+      (source_type, query, url, title, snippet, extracted_text, summary, provider)
+    VALUES
+      (?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    row.source_type || "",
+    row.query || "",
+    row.url || "",
+    row.title || "",
+    row.snippet || "",
+    row.extracted_text || "",
+    row.summary || "",
+    row.provider || ""
+  ).run();
+}
+
+async function summarizeUrl(env, url, userText, userId) {
+  const content = await extractUrlContent(env, url);
+  if (content.unsupported || !content.text) {
+    const summary = `이 URL은 현재 직접 본문 추출이 어렵습니다. Content-Type: ${content.contentType || "unknown"}`;
+    await saveExternalSource(env, { source_type: "url", query: userText, url, title: content.title || "", summary, provider: content.provider || "url" });
+    return { url, title: content.title || "", summary, unsupported: true };
+  }
+  const query =
+    TONE_RULE +
+    `[요청]\n사용자가 전달한 URL 내용을 요약해줘.\n\n` +
+    `[사용자 질문]\n${userText}\n\n` +
+    `[URL]\n${url}\n\n` +
+    `[페이지 제목]\n${content.title || "제목 없음"}\n\n` +
+    `[본문]\n${content.text.slice(0, 10000)}\n\n` +
+    `[작성 지침]\n1. 핵심 내용을 5줄 이내로 요약합니다.\n2. 업무적으로 참고할 점을 2개 이내로 정리합니다.\n3. 출처 URL을 반드시 표시합니다.\n4. 본문에 없는 내용은 추정하지 않습니다.\n5. 마크다운 기호는 쓰지 않습니다.`;
+  const result = await difyChat(env, { query, user: String(userId), conversationId: "" });
+  const summary = result?.answer || "URL 요약을 생성하지 못했습니다.";
+  await saveExternalSource(env, {
+    source_type: "url",
+    query: userText,
+    url,
+    title: content.title || "",
+    extracted_text: content.text.slice(0, 12000),
+    summary,
+    provider: content.provider || "url",
+  });
+  return { url, title: content.title || "", summary, unsupported: false };
+}
+
+async function answerUrlSummary(env, text, userId) {
+  const results = [];
+  for (const url of extractUrls(text).slice(0, 3)) {
+    try {
+      results.push(await summarizeUrl(env, url, text, userId));
+    } catch (error) {
+      results.push({ url, title: "", summary: `URL을 읽지 못했습니다. 사유: ${String(error?.message || error)}`, unsupported: true });
+    }
+  }
+  return results.map((r, idx) => `${idx + 1}. ${r.title || "URL 요약"}\n${r.summary}\n출처: ${r.url}`).join("\n\n");
+}
+
+async function saveExternalSearchResults(env, query, results) {
+  if (!env.DB || !results?.length) return;
+  for (const r of results) {
+    await saveExternalSource(env, {
+      source_type: "search",
+      query,
+      url: r.url || "",
+      title: r.title || "",
+      snippet: r.snippet || "",
+      provider: r.provider || "tavily",
+    });
+  }
+}
+
+function buildExternalCorpus(results) {
+  return (results || []).map((r, idx) =>
+    `[외부자료 ${idx + 1}]\n제목: ${r.title || "제목 없음"}\n요약: ${r.snippet || "요약 없음"}\nURL: ${r.url || ""}\n제공: ${r.provider || "external"}`
+  ).join("\n\n");
+}
+
+async function answerExternalSearchNotConfigured(env, text) {
+  const internalKeyword = extractSearchKeyword(text);
+  const internalRows = await searchMemory(env, internalKeyword, 20);
+  const internalCorpus = buildSourceCorpus(internalRows);
+  if (internalRows.length) {
+    return `외부검색 미설정 상태라 내부 기록 기준으로만 확인했습니다.\n\n${internalCorpus.slice(0, 2500)}\n\n외부검색을 사용하려면 Cloudflare에 EXTERNAL_SEARCH_ENABLED=true와 TAVILY_API_KEY를 설정해야 합니다.`;
+  }
+  return "외부검색 미설정 상태입니다.\n\n필요 설정:\n1. Cloudflare Secret TAVILY_API_KEY 등록\n2. EXTERNAL_SEARCH_ENABLED=true 설정\n\n현재는 내부 D1 기록만 검색할 수 있습니다.";
+}
+
+async function answerWithExternalSearch(env, text, userId) {
+  const internalKeyword = extractSearchKeyword(text);
+  const internalRows = await searchMemory(env, internalKeyword, 20);
+  const internalCorpus = buildSourceCorpus(internalRows);
+  const searchQuery = buildExternalSearchQuery(text) || internalKeyword;
+  const externalResults = await searchTavily(env, searchQuery, 5);
+  await saveExternalSearchResults(env, searchQuery, externalResults);
+  if (!externalResults.length && !internalRows.length) {
+    return `내부 기록과 외부 검색 모두에서 충분한 참고자료를 찾지 못했습니다.\n\n검색어: ${searchQuery}\n\n확인 필요:\n1. EXTERNAL_SEARCH_ENABLED=true인지 확인\n2. TAVILY_API_KEY 등록 여부 확인\n3. Tavily 무료 credit 잔여량 확인`;
+  }
+  const query =
+    TONE_RULE +
+    `[사용자 질문]\n${text}\n\n` +
+    `[내부 기록]\n${internalCorpus || "관련 내부 기록 없음"}\n\n` +
+    `[외부 검색 결과]\n${buildExternalCorpus(externalResults) || "외부 검색 결과 없음"}\n\n` +
+    `[작성 지침]\n1. 사용자가 이해하기 어려워한 내용을 먼저 쉽게 풀어 설명합니다.\n2. 내부 기록이 있으면 내부 맥락을 먼저 정리합니다.\n3. 외부 검색 결과는 참고자료로 연결합니다.\n4. 내부 출처와 외부 URL을 구분해 표시합니다.\n5. 답변 마지막에 참고 URL 3개 이내를 정리합니다.\n6. 검색 결과에 없는 내용은 단정하지 않습니다.\n7. 전문적인 문체로 간결하게 작성합니다.\n8. 마크다운 기호는 쓰지 않습니다.`;
+  const result = await difyChat(env, { query, user: String(userId), conversationId: "" });
+  const answer = result?.answer || "외부 검색 기반 답변을 생성하지 못했습니다.";
+  const sourceLines = externalResults.slice(0, 3).map((r, idx) =>
+    `${idx + 1}. 제목: ${r.title || "제목 없음"}\n요약: ${r.snippet || "요약 없음"}\nURL: ${r.url || ""}`
+  ).join("\n\n");
+  return sourceLines ? `${answer}\n\n참고자료\n${sourceLines}` : answer;
+}
+
+function isWebSearchTestCommand(text) {
+  return /^\/web_test\s+/.test(String(text || "").trim());
+}
+
+async function handleWebSearchTest(env, chatId, text) {
+  const query = String(text || "").replace(/^\/web_test\s+/, "").trim();
+  if (!query) {
+    await sendMessage(env, chatId, "검색어를 입력해 주세요. 예: /web_test HBM SK하이닉스");
+    return;
+  }
+  if (!isExternalSearchEnabled(env) || !hasTavilyConfig(env)) {
+    await sendMessage(env, chatId, "외부검색 미설정 상태입니다. EXTERNAL_SEARCH_ENABLED=true와 TAVILY_API_KEY를 확인해 주세요.");
+    return;
+  }
+  const results = await searchTavily(env, query, 5);
+  await saveExternalSearchResults(env, query, results);
+  const lines = results.map((r, idx) => `${idx + 1}. ${r.title}\n${r.snippet}\n${r.url}\n제공: ${r.provider}`);
+  await sendMessage(env, chatId, `외부검색 테스트 결과\n\n${lines.join("\n\n") || "검색 결과가 없습니다."}`);
 }
 
 async function summarizeAllRooms(env, userId, { summaryType, days, keyword }) {
@@ -1716,8 +1961,27 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
+  if (isWebSearchTestCommand(text)) {
+    await handleWebSearchTest(env, chatId, text);
+    return;
+  }
+
+  if (isUrlSummaryQuery(text)) {
+    const answer = await answerUrlSummary(env, text, userId);
+    await sendMessage(env, chatId, answer);
+    return;
+  }
+
   if (isDigestQuery(text)) {
     const answer = await answerDigest(env, text, userId);
+    await sendMessage(env, chatId, answer);
+    return;
+  }
+
+  if (needsExternalSearch(text)) {
+    const answer = isExternalSearchEnabled(env) && hasTavilyConfig(env)
+      ? await answerWithExternalSearch(env, text, userId)
+      : await answerExternalSearchNotConfigured(env, text);
     await sendMessage(env, chatId, answer);
     return;
   }
@@ -1830,7 +2094,8 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
   if (isUrlText(text)) {
     const urlMatch = text.match(/https?:\/\/[^\s]+/);
     if (urlMatch) {
-      await summarizeUrl(env, urlMatch[0], userId, chatId);
+      const answer = await answerUrlSummary(env, text, userId);
+      await sendMessage(env, chatId, answer);
       return;
     }
   }
@@ -2000,6 +2265,17 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     return;
   }
 
+  if (isWebSearchTestCommand(cleanText)) {
+    await handleWebSearchTest(env, chatId, cleanText);
+    return;
+  }
+
+  if (isUrlSummaryQuery(cleanText)) {
+    const answer = await answerUrlSummary(env, cleanText, userId);
+    await sendMessage(env, chatId, answer);
+    return;
+  }
+
   if (isOwnerStatusQuery(cleanText)) {
     await handleOwnerStatus(env, chatId);
     return;
@@ -2019,13 +2295,22 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
   if (isUrlText(cleanText)) {
     const urlMatch = cleanText.match(/https?:\/\/[^\s]+/);
     if (urlMatch) {
-      await summarizeUrl(env, urlMatch[0], userId, chatId);
+      const answer = await answerUrlSummary(env, cleanText, userId);
+      await sendMessage(env, chatId, answer);
       return;
     }
   }
 
   if (isDigestQuery(cleanText)) {
     const answer = await answerDigest(env, cleanText, userId);
+    await sendMessage(env, chatId, answer);
+    return;
+  }
+
+  if (needsExternalSearch(cleanText)) {
+    const answer = isExternalSearchEnabled(env) && hasTavilyConfig(env)
+      ? await answerWithExternalSearch(env, cleanText, userId)
+      : await answerExternalSearchNotConfigured(env, cleanText);
     await sendMessage(env, chatId, answer);
     return;
   }
