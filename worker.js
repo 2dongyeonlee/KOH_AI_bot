@@ -1118,11 +1118,21 @@ async function tableExists(env, tableName) {
   return !!row;
 }
 
+async function columnExists(env, tableName, columnName) {
+  if (!(await tableExists(env, tableName))) return false;
+  try {
+    const result = await env.DB.prepare(`PRAGMA table_info(${tableName})`).all();
+    return (result.results || []).some(r => r.name === columnName);
+  } catch (e) { return false; }
+}
+
 async function safeCountTable(env, tableName) {
   const exists = await tableExists(env, tableName);
   if (!exists) return { exists: false, count: 0 };
-  const row = await env.DB.prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).first();
-  return { exists: true, count: row?.count || 0 };
+  try {
+    const row = await env.DB.prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).first();
+    return { exists: true, count: row?.count || 0 };
+  } catch (e) { return { exists: true, count: -1 }; }
 }
 
 async function ensureCoreTablesExist(env) {
@@ -1199,26 +1209,24 @@ async function handleDbStatus(env, chatId) {
     }
     let recentRoomsText = "없음";
     if (await tableExists(env, "rooms")) {
-      const recentRooms = await env.DB.prepare(`
-        SELECT room_title, room_id, room_type, source, last_seen_at
-        FROM rooms
-        ORDER BY last_seen_at DESC
-        LIMIT 10
-      `).all();
+      const hasRoomExtra = await columnExists(env, "rooms", "last_seen_at");
+      const roomSql = hasRoomExtra
+        ? `SELECT room_title, room_id, room_type, source, last_seen_at FROM rooms ORDER BY last_seen_at DESC LIMIT 10`
+        : `SELECT room_title, room_id FROM rooms LIMIT 10`;
+      const recentRooms = await env.DB.prepare(roomSql).all();
       recentRoomsText = (recentRooms.results || []).map((r, idx) =>
-        `${idx + 1}. ${r.room_title || "방 이름 없음"} / ${r.room_type || "type 없음"} / ${r.source || ""} / ${r.last_seen_at || ""}`
+        `${idx + 1}. ${r.room_title || "방 이름 없음"} / ${r.room_id} / ${hasRoomExtra ? (r.room_type || "type없음") : "migration 미적용"} / ${hasRoomExtra ? (r.last_seen_at || "").slice(0, 16) : ""}`
       ).join("\n") || "없음";
     }
     let recentMessagesText = "없음";
     if (await tableExists(env, "messages")) {
-      const recentMessages = await env.DB.prepare(`
-        SELECT room_title, sender_name, content, source_type, created_at
-        FROM messages
-        ORDER BY created_at DESC
-        LIMIT 10
-      `).all();
+      const hasSourceType = await columnExists(env, "messages", "source_type");
+      const msgSql = hasSourceType
+        ? `SELECT room_title, sender_name, content, source_type, created_at FROM messages ORDER BY created_at DESC LIMIT 10`
+        : `SELECT room_title, sender_name, content, created_at FROM messages ORDER BY created_at DESC LIMIT 10`;
+      const recentMessages = await env.DB.prepare(msgSql).all();
       recentMessagesText = (recentMessages.results || []).map((m, idx) =>
-        `${idx + 1}. [${m.room_title || "방 없음"}] ${m.sender_name || "작성자 없음"} / ${m.source_type || ""} (${m.created_at || ""})\n${String(m.content || "").slice(0, 100)}`
+        `${idx + 1}. [${m.room_title || "방 없음"}] ${m.sender_name || "작성자 없음"} / ${hasSourceType ? (m.source_type || "") : "old schema"} (${(m.created_at || "").slice(0, 16)})\n${String(m.content || "").slice(0, 80)}`
       ).join("\n\n") || "없음";
     }
     await sendMessage(env, chatId,
@@ -1275,26 +1283,25 @@ async function handleRoomList(env, chatId) {
       await sendMessage(env, chatId, "rooms 테이블이 없음. migration 적용 필요.");
       return;
     }
-    const result = await env.DB.prepare(`
-      SELECT room_id, room_title, room_type, source, last_seen_at
-      FROM rooms
-      ORDER BY last_seen_at DESC
-      LIMIT 100
-    `).all();
+    const hasExtra = await columnExists(env, "rooms", "last_seen_at");
+    const roomSql = hasExtra
+      ? `SELECT room_id, room_title, room_type, source, last_seen_at FROM rooms ORDER BY last_seen_at DESC LIMIT 100`
+      : `SELECT room_id, room_title FROM rooms LIMIT 100`;
+    const result = await env.DB.prepare(roomSql).all();
     const rows = result.results || [];
     if (!rows.length) {
       await sendMessage(env, chatId,
-        `등록된 방이 없음.\n\n` +
+        `등록된 방 없음.\n\n` +
         `가능한 원인\n` +
-        `- 봇이 방에 추가됐지만 my_chat_member update를 저장하지 못했음\n` +
-        `- 그룹 메시지 저장 전에 return되고 있음\n` +
-        `- webhook allowed_updates에 my_chat_member/message가 빠짐\n` +
-        `- D1 binding이 다른 DB를 보고 있음`
+        `- migration 미적용 (npx wrangler d1 execute 6r-ai-db --file=migrations/0004_personal_ai_os.sql --remote)\n` +
+        `- 봇이 방에 추가됐지만 my_chat_member update 미처리\n` +
+        `- messages에 단체방 기록 있으면 backfill SQL 실행 필요\n` +
+        `  INSERT OR IGNORE INTO rooms(room_id,room_title) SELECT DISTINCT room_id,room_title FROM messages WHERE room_id!=''`
       );
       return;
     }
     const lines = rows.map((r, idx) =>
-      `${idx + 1}. ${r.room_title || "방 이름 없음"} / ID: ${r.room_id} / ${r.room_type || "type 없음"} / ${r.source || ""} / ${r.last_seen_at || ""}`
+      `${idx + 1}. ${r.room_title || "이름없음"} / ID: ${r.room_id}${hasExtra ? ` / ${r.room_type || "?"} / ${(r.last_seen_at || "").slice(0, 16)}` : ""}`
     );
     await sendMessage(env, chatId, `등록된 방 ${rows.length}개임.\n\n${lines.join("\n")}`);
   } catch (error) {
