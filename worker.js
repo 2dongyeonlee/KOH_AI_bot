@@ -6,6 +6,15 @@ const SUMMARY_PROMPT =
   "일정: (날짜·기한·마감이 언급된 일정, 없으면 '없음')";
 const TONE_RULE =
   "[응답 규칙: 존댓말 격식체 사용. ^^ 이모티콘 사용 금지. 불필요한 감탄사 사용 금지.]\n\n";
+const SUMMARY_TONE_RULE =
+  "[요약 응답 규칙]\n" +
+  "- 답변은 보고 메모체로 작성합니다.\n" +
+  "- 문장 끝은 가급적 '~임', '~필요', '~확인 필요', '~예상' 형식으로 작성합니다.\n" +
+  "- 불필요한 인사말과 장황한 배경 설명은 생략합니다.\n" +
+  "- 최대 5개 안건으로 압축합니다.\n" +
+  "- 각 안건은 현상, 의미, 확인할 일, 출처 중심으로 작성합니다.\n" +
+  "- 출처가 없으면 확인 필요로 표시합니다.\n" +
+  "- 마크다운 강조 기호는 사용하지 않습니다.\n\n";
 const ADMIN_NAME = "권오혁";
 const BOT_OWNER_NAME = "권오혁";
 const BOT_OWNER_ROLE = "6R전략담당";
@@ -787,8 +796,11 @@ function buildExternalSearchQuery(text) {
     .slice(0, 120);
 }
 
-async function searchTavily(env, query, maxResults = 5) {
-  if (!isExternalSearchEnabled(env) || !hasTavilyConfig(env)) return [];
+async function searchTavily(env, query, options = {}) {
+  const maxResults = typeof options === "number" ? options : (options.maxResults || 5);
+  const searchDepth = typeof options === "object" ? (options.searchDepth || "basic") : "basic";
+  if (!isExternalSearchEnabled(env)) throw new Error("EXTERNAL_SEARCH_ENABLED is not true");
+  if (!hasTavilyConfig(env)) throw new Error("TAVILY_API_KEY is missing");
   const res = await fetch("https://api.tavily.com/search", {
     method: "POST",
     headers: {
@@ -797,7 +809,7 @@ async function searchTavily(env, query, maxResults = 5) {
     },
     body: JSON.stringify({
       query,
-      search_depth: "basic",
+      search_depth: searchDepth,
       max_results: maxResults,
       include_answer: false,
       include_raw_content: false,
@@ -805,7 +817,7 @@ async function searchTavily(env, query, maxResults = 5) {
     }),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`Tavily search failed: ${JSON.stringify(data)}`);
+  if (!res.ok) throw new Error(`Tavily API ${res.status}: ${JSON.stringify(data)}`);
   return (data.results || []).map((item) => ({
     provider: "tavily",
     title: item.title || "",
@@ -983,26 +995,37 @@ async function answerExternalSearchNotConfigured(env, text) {
 
 async function answerWithExternalSearch(env, text, userId) {
   const internalKeyword = extractSearchKeyword(text);
-  const internalRows = await searchMemory(env, internalKeyword, 20);
-  const internalCorpus = buildSourceCorpus(internalRows);
   const searchQuery = buildExternalSearchQuery(text) || internalKeyword;
-  const externalResults = await searchTavily(env, searchQuery, 5);
-  await saveExternalSearchResults(env, searchQuery, externalResults);
-  if (!externalResults.length && !internalRows.length) {
-    return `내부 기록과 외부 검색 모두에서 충분한 참고자료를 찾지 못했습니다.\n\n검색어: ${searchQuery}\n\n확인 필요:\n1. EXTERNAL_SEARCH_ENABLED=true인지 확인\n2. TAVILY_API_KEY 등록 여부 확인\n3. Tavily 무료 credit 잔여량 확인`;
+  try {
+    const internalRows = await searchMemory(env, internalKeyword, 20);
+    const internalCorpus = buildSourceCorpus(internalRows);
+    const externalResults = await searchTavily(env, searchQuery, { maxResults: 5, searchDepth: "basic" });
+    await saveExternalSearchResults(env, searchQuery, externalResults);
+    if (!externalResults.length && !internalRows.length) {
+      return `내부 기록과 외부 검색 모두에서 충분한 자료를 찾지 못했음.\n\n- 검색어: ${searchQuery}\n- 확인 필요: /web_test ${searchQuery}`;
+    }
+    const query =
+      SUMMARY_TONE_RULE +
+      `[사용자 질문]\n${text}\n\n` +
+      `[내부 기록]\n${internalCorpus || "관련 내부 기록 없음"}\n\n` +
+      `[외부 검색 결과]\n${buildExternalCorpus(externalResults) || "외부 검색 결과 없음"}\n\n` +
+      `[작성 지침]\n` +
+      `- 핵심만 요약체로 작성할 것\n` +
+      `- 문장 끝은 가급적 '~임', '~필요', '~확인 필요' 형식으로 작성할 것\n` +
+      `- 참고 URL을 반드시 포함할 것\n`;
+    const result = await difyChat(env, { query, user: String(userId), conversationId: "" });
+    const answer = result?.answer || "외부 검색 기반 답변을 생성하지 못했음.";
+    const sourceLines = externalResults.slice(0, 3).map((r, idx) =>
+      `${idx + 1}. 제목: ${r.title || "제목 없음"}\n요약: ${r.snippet || "요약 없음"}\nURL: ${r.url || ""}`
+    ).join("\n\n");
+    return sourceLines ? `${answer}\n\n참고자료\n${sourceLines}` : answer;
+  } catch (error) {
+    return `뉴스검색 실패함\n\n` +
+      `- 검색어: ${searchQuery}\n` +
+      `- 원인 후보: Tavily API Key 미설정 또는 Worker Secret 미반영 가능성 있음\n` +
+      `- 확인 필요: /search_status, /web_test ${searchQuery} 실행 필요\n` +
+      `- 오류: ${String(error?.message || error)}`;
   }
-  const query =
-    TONE_RULE +
-    `[사용자 질문]\n${text}\n\n` +
-    `[내부 기록]\n${internalCorpus || "관련 내부 기록 없음"}\n\n` +
-    `[외부 검색 결과]\n${buildExternalCorpus(externalResults) || "외부 검색 결과 없음"}\n\n` +
-    `[작성 지침]\n1. 사용자가 이해하기 어려워한 내용을 먼저 쉽게 풀어 설명합니다.\n2. 내부 기록이 있으면 내부 맥락을 먼저 정리합니다.\n3. 외부 검색 결과는 참고자료로 연결합니다.\n4. 내부 출처와 외부 URL을 구분해 표시합니다.\n5. 답변 마지막에 참고 URL 3개 이내를 정리합니다.\n6. 검색 결과에 없는 내용은 단정하지 않습니다.\n7. 전문적인 문체로 간결하게 작성합니다.\n8. 마크다운 기호는 쓰지 않습니다.`;
-  const result = await difyChat(env, { query, user: String(userId), conversationId: "" });
-  const answer = result?.answer || "외부 검색 기반 답변을 생성하지 못했습니다.";
-  const sourceLines = externalResults.slice(0, 3).map((r, idx) =>
-    `${idx + 1}. 제목: ${r.title || "제목 없음"}\n요약: ${r.snippet || "요약 없음"}\nURL: ${r.url || ""}`
-  ).join("\n\n");
-  return sourceLines ? `${answer}\n\n참고자료\n${sourceLines}` : answer;
 }
 
 function isWebSearchTestCommand(text) {
@@ -1012,17 +1035,149 @@ function isWebSearchTestCommand(text) {
 async function handleWebSearchTest(env, chatId, text) {
   const query = String(text || "").replace(/^\/web_test\s+/, "").trim();
   if (!query) {
-    await sendMessage(env, chatId, "검색어를 입력해 주세요. 예: /web_test HBM SK하이닉스");
+    await sendMessage(env, chatId, "검색어를 입력해 주세요. 예: /web_test 하이닉스 HBM");
     return;
   }
-  if (!isExternalSearchEnabled(env) || !hasTavilyConfig(env)) {
-    await sendMessage(env, chatId, "외부검색 미설정 상태입니다. EXTERNAL_SEARCH_ENABLED=true와 TAVILY_API_KEY를 확인해 주세요.");
+  if (!isExternalSearchEnabled(env)) {
+    await sendMessage(env, chatId, "EXTERNAL_SEARCH_ENABLED가 true가 아닙니다.");
     return;
   }
-  const results = await searchTavily(env, query, 5);
-  await saveExternalSearchResults(env, query, results);
-  const lines = results.map((r, idx) => `${idx + 1}. ${r.title}\n${r.snippet}\n${r.url}\n제공: ${r.provider}`);
-  await sendMessage(env, chatId, `외부검색 테스트 결과\n\n${lines.join("\n\n") || "검색 결과가 없습니다."}`);
+  if (!hasTavilyConfig(env)) {
+    await sendMessage(env, chatId, "TAVILY_API_KEY가 Worker Secret에 없습니다.");
+    return;
+  }
+  try {
+    const results = await searchTavily(env, query, { maxResults: 5, searchDepth: "basic" });
+    await saveExternalSearchResults(env, query, results);
+    if (!results.length) {
+      await sendMessage(env, chatId, `검색 결과가 없습니다.\n검색어: ${query}`);
+      return;
+    }
+    const lines = results.map((r, idx) =>
+      `${idx + 1}. ${r.title || "제목 없음"}\n${r.snippet || "요약 없음"}\n${r.url || "URL 없음"}`
+    );
+    await sendMessage(env, chatId, `외부검색 테스트 결과\n검색어: ${query}\n\n${lines.join("\n\n")}`);
+  } catch (error) {
+    await sendMessage(env, chatId,
+      `Tavily 검색 오류\n\n` +
+      `검색어: ${query}\n` +
+      `오류: ${String(error?.message || error)}\n\n` +
+      `확인 필요\n` +
+      `- /search_status 실행\n` +
+      `- TAVILY_API_KEY 값 확인\n` +
+      `- Authorization: Bearer 형식 확인\n` +
+      `- Tavily credit 잔여량 확인\n` +
+      `- Worker 최신 배포 여부 확인`
+    );
+  }
+}
+
+function isSearchStatusCommand(text) {
+  return /^\/search_status\b/.test(String(text || "").trim());
+}
+
+async function handleSearchStatus(env, chatId) {
+  const enabled = isExternalSearchEnabled(env);
+  const hasKey = hasTavilyConfig(env);
+  const keyPrefix = hasKey ? String(env.TAVILY_API_KEY).slice(0, 8) + "..." : "없음";
+  let msg =
+    `외부검색 설정 상태\n\n` +
+    `EXTERNAL_SEARCH_ENABLED: ${enabled ? "true" : "false"}\n` +
+    `TAVILY_API_KEY: ${keyPrefix}\n`;
+  if (!enabled || !hasKey) {
+    msg +=
+      `\n조치 필요\n` +
+      `- Cloudflare Worker Variables에 EXTERNAL_SEARCH_ENABLED=true 설정\n` +
+      `- Secret으로 TAVILY_API_KEY 등록\n` +
+      `- 배포 후 /web_test 하이닉스 HBM 실행`;
+  }
+  await sendMessage(env, chatId, msg);
+}
+
+function isDbStatusCommand(text) {
+  return /^\/db_status\b/.test(String(text || "").trim());
+}
+
+async function countTable(env, tableName) {
+  const row = await env.DB.prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).first();
+  return row?.count || 0;
+}
+
+async function handleDbStatus(env, chatId) {
+  if (!env.DB) {
+    await sendMessage(env, chatId, "D1 상태 확인 실패\n\n오류: env.DB binding이 없습니다.");
+    return;
+  }
+  try {
+    const [users, rooms, messages, files] = await Promise.all([
+      countTable(env, "users"),
+      countTable(env, "rooms"),
+      countTable(env, "messages"),
+      countTable(env, "files"),
+    ]);
+    const recentRooms = await env.DB.prepare(`
+      SELECT room_title, room_id, last_seen_at
+      FROM rooms
+      ORDER BY last_seen_at DESC
+      LIMIT 5
+    `).all();
+    const recentMessages = await env.DB.prepare(`
+      SELECT room_title, sender_name, content, created_at
+      FROM messages
+      ORDER BY created_at DESC
+      LIMIT 5
+    `).all();
+    const roomLines = (recentRooms.results || []).map((r, idx) =>
+      `${idx + 1}. ${r.room_title || "방 이름 없음"} / ${r.last_seen_at || ""}`
+    ).join("\n");
+    const msgLines = (recentMessages.results || []).map((m, idx) =>
+      `${idx + 1}. [${m.room_title || "방 없음"}] ${m.sender_name || "작성자 없음"} (${m.created_at || ""})\n${String(m.content || "").slice(0, 80)}`
+    ).join("\n\n");
+    await sendMessage(env, chatId,
+      `D1 저장 상태\n\n` +
+      `users: ${users}\nrooms: ${rooms}\nmessages: ${messages}\nfiles: ${files}\n\n` +
+      `최근 등록 방\n${roomLines || "없음"}\n\n` +
+      `최근 메시지\n${msgLines || "없음"}`
+    );
+  } catch (error) {
+    await sendMessage(env, chatId,
+      `D1 상태 확인 실패\n\n` +
+      `오류: ${String(error?.message || error)}\n\n` +
+      `확인 필요\n` +
+      `- wrangler.toml D1 binding이 DB인지 확인\n` +
+      `- migration 적용 여부 확인\n` +
+      `- 현재 Worker가 올바른 D1 database_id를 보는지 확인`
+    );
+  }
+}
+
+function isImageStatusCommand(text) {
+  return /^\/image_status\b/.test(String(text || "").trim());
+}
+
+async function handleImageStatus(env, chatId) {
+  await sendMessage(env, chatId,
+    `이미지 분석 설정 상태\n\n` +
+    `TELEGRAM_BOT_TOKEN: ${env.TELEGRAM_BOT_TOKEN ? "있음" : "없음"}\n` +
+    `DIFY_API_KEY: ${env.DIFY_API_KEY ? "있음" : "없음"}\n` +
+    `GEMINI_API_KEY: ${env.GEMINI_API_KEY ? "있음" : "없음"}\n` +
+    `VISION_PROVIDER: ${env.VISION_PROVIDER || "미설정"}\n` +
+    `OPENAI_API_KEY: ${env.OPENAI_API_KEY ? "있음" : "없음"}\n\n` +
+    `확인 필요\n` +
+    `- Telegram getFile로 이미지 다운로드 가능한지 확인\n` +
+    `- Gemini 또는 VISION_PROVIDER=openai + OPENAI_API_KEY 설정 여부 확인\n` +
+    `- 이미지 분석 실패 시 구체 오류 메시지 확인`
+  );
+}
+
+function isDiagnosticCommand(text) {
+  return isSearchStatusCommand(text) || isDbStatusCommand(text) || isImageStatusCommand(text);
+}
+
+async function handleDiagnosticCommand(env, chatId, text) {
+  if (isSearchStatusCommand(text)) return await handleSearchStatus(env, chatId);
+  if (isDbStatusCommand(text)) return await handleDbStatus(env, chatId);
+  if (isImageStatusCommand(text)) return await handleImageStatus(env, chatId);
 }
 
 async function summarizeAllRooms(env, userId, { summaryType, days, keyword }) {
@@ -1880,6 +2035,11 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
   if (!text.trim()) return;
 
   // 이름 입력 대기 중 → 등록 처리 (Dify 호출 없음) [기존 호환]
+  if (isDiagnosticCommand(text)) {
+    await handleDiagnosticCommand(env, chatId, text);
+    return;
+  }
+
   if (user?.step === "waiting_name_auto") {
     return;
   }
@@ -2237,6 +2397,11 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
   await maybeLearnFromMessage(env, message);
   console.log(`[KOH DB저장] room=${message.chat.title} user=${user?.name} text=${text.slice(0, 30)}`);
 
+  if (isDiagnosticCommand(text)) {
+    await handleDiagnosticCommand(env, chatId, text);
+    return;
+  }
+
   // 일정 감지 (브리핑 cron용)
   const schedule = extractSchedule(text, getTodayKST());
   if (schedule) {
@@ -2391,9 +2556,9 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
     const fileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
 
     // 이미지는 Gemini로, 문서는 Dify로 처리
-    if (mimeType.startsWith("image/") && env.GEMINI_API_KEY) {
+    if (mimeType.startsWith("image/") && (env.GEMINI_API_KEY || (env.VISION_PROVIDER === "openai" && env.OPENAI_API_KEY))) {
       const buffer = await fetch(fileUrl).then((r) => r.arrayBuffer());
-      const answer = await analyzeImageWithClaude(env, buffer, mimeType);
+      const answer = await analyzeImageWithClaude(env, buffer, mimeType, message.caption || "");
       await dbSaveFile(env, { roomId, roomTitle, senderId: userId, senderName, fileName, mimeType, summary: answer, savedBy: "koh" });
       await sendMessage(env, chatId, answer);
       return;
@@ -2434,11 +2599,58 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
     await sendMessage(env, chatId, summary || "요약 중 오류가 발생했어요.");
   } catch (e) {
     console.error("handleFile error:", e);
-    await sendMessage(env, chatId, `파일 처리 오류\n${e.message}`);
+    await sendMessage(env, chatId, `파일 처리 오류\n\n오류: ${e.message}\n\n확인 필요\n- /db_status 실행\n- /image_status 실행\n- Telegram getFile 다운로드 가능 여부\n- Dify 또는 Vision provider 설정 여부`);
   }
 }
 
-async function analyzeImageWithClaude(env, buffer, mimeType) {
+function arrayBufferToBase64(buffer) {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode.apply(null, chunk);
+  }
+  return btoa(binary);
+}
+
+async function analyzeImageWithOpenAI(env, imageBuffer, contentType, userPrompt = "") {
+  if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is missing");
+  const dataUrl = `data:${contentType || "image/jpeg"};base64,${arrayBufferToBase64(imageBuffer)}`;
+  const prompt =
+    `이미지를 업무 문서 관점에서 분석해줘.\n` +
+    `답변은 보고 메모체로 작성하고, 문장 끝은 가급적 '~임', '~필요', '~확인 필요' 형식으로 작성해줘.\n` +
+    `구성: 핵심 내용 / 주요 수치 및 고유명사 / 확인할 일 / 요약.\n\n` +
+    `사용자 요청: ${userPrompt || "이미지 내용 분석"}`;
+  const res = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: env.OPENAI_VISION_MODEL || "gpt-4.1-mini",
+      input: [{
+        role: "user",
+        content: [
+          { type: "input_text", text: prompt },
+          { type: "input_image", image_url: dataUrl },
+        ],
+      }],
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`OpenAI vision failed: ${JSON.stringify(data)}`);
+  return data.output_text || data.output?.[0]?.content?.[0]?.text || "이미지 분석 결과를 가져오지 못했음.";
+}
+
+async function analyzeImageWithClaude(env, buffer, mimeType, userPrompt = "") {
+  if (env.VISION_PROVIDER === "openai") {
+    return await analyzeImageWithOpenAI(env, buffer, mimeType, userPrompt);
+  }
+  if (!env.GEMINI_API_KEY) {
+    throw new Error("GEMINI_API_KEY is missing. Set GEMINI_API_KEY or VISION_PROVIDER=openai with OPENAI_API_KEY.");
+  }
   const validMimes = ["image/jpeg", "image/png", "image/gif", "image/webp"];
   const imgMime = validMimes.includes(mimeType) ? mimeType : "image/jpeg";
 
