@@ -95,3 +95,45 @@ npx wrangler d1 execute 6r-ai-db --remote --file migrations/0009_room_file_canon
 npx wrangler d1 execute 6r-ai-db --remote --command "UPDATE files SET source_type = 'telegram_private' WHERE CAST(room_id AS INTEGER) > 0;"
 npx wrangler d1 execute 6r-ai-db --remote --command "UPDATE files SET source_type = 'telegram_group' WHERE CAST(room_id AS INTEGER) < 0;"
 ```
+
+## Project Briefing Format
+
+주요 안건 요약은 프로젝트별로 묶어서 짧게 출력합니다.
+
+```text
+지난주 주요 안건 N건 공유드립니다.
+
+[프로젝트] 프로젝트/안건명
+- 핵심 내용: 1~2문장
+- 확인 필요: 다음 액션 1~2문장
+
+🗓 일자: MM/DD
+👤 공유자: 대표 이름
+📍 방: 실제 방 제목 또는 1:1
+📎 자료: 파일명 또는 없음
+🔎 위치: 방 제목 > 파일명
+```
+
+## Canonical User Name
+
+공유자 이름은 `telegram_id` 기준으로 `users.canonical_name`을 우선 사용합니다.
+컬럼이 없거나 값이 없으면 `users.name`을 사용합니다.
+이름 후보가 여러 개 쌓이면 1:1 DM에서 대표 이름 선택을 요청합니다.
+
+```bash
+npx wrangler d1 execute 6r-ai-db --remote --file migrations/0010_user_canonical_name.sql
+```
+
+## 08:00 DM Briefing
+
+Cloudflare cron `0 23 * * *`는 KST 08:00에 실행됩니다.
+월요일은 지난주 안건과 이번주 일정/과제를, 화요일~일요일은 전일 안건과 오늘 일정/과제를 운영자 DM으로 보냅니다.
+
+수동 테스트:
+
+```text
+/briefing_mock
+지난주 내가 포함된 방들에서 공유된 내용을 프로젝트별로 요약해줘
+/files
+/rooms
+```
