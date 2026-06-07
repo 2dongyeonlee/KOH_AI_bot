@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-save-debug-20260607-1305";
+const BUILD_VERSION = "koh-file-room-user-20260608-0900";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -71,6 +71,38 @@ function getRoomTitleForMessage(message) {
 
 function getSourceTypeForMessage(message) {
   return isPrivateChat(message?.chat) ? "telegram_private" : "telegram_group";
+}
+
+function resolveFileRoomInfo(message) {
+  const chat = message?.chat || {};
+  if (isGroupChat(chat) || Number(chat.id) < 0) {
+    return {
+      roomId: String(chat.id),
+      roomTitle: chat.title || chat.username || String(chat.id),
+      roomType: chat.type || "group",
+      sourceType: "telegram_group",
+      tags: [],
+    };
+  }
+  const originChat = message?.forward_origin?.chat || message?.forward_from_chat || null;
+  if (originChat?.id) {
+    return {
+      roomId: String(originChat.id),
+      roomTitle: originChat.title || originChat.username || String(originChat.id),
+      roomType: originChat.type || "group",
+      sourceType: originChat.type === "private" ? "telegram_private" : "telegram_group",
+      tags: ["forwarded"],
+    };
+  }
+  return {
+    roomId: String(chat.id || ""),
+    roomTitle: "1:1",
+    roomType: "private",
+    sourceType: "telegram_private",
+    tags: message?.forward_origin || message?.forward_from || message?.forward_sender_name
+      ? ["forwarded", "원본방 확인 불가 / 1:1 전달본"]
+      : [],
+  };
 }
 
 function getBotUsernames(env) {
@@ -124,6 +156,46 @@ function looksLikeBareKoreanName(text) {
   return /^[가-힣]{2,4}$/.test(String(text || "").trim());
 }
 
+function isWeakUserName(name) {
+  const n = String(name || "").trim();
+  if (!n) return true;
+  return /^(계획|담당|팀|관리자|미상|이름 없음|unknown|user_\d+)$/i.test(n);
+}
+
+function isBetterUserName(nextName, prevName) {
+  const next = String(nextName || "").trim();
+  const prev = String(prevName || "").trim();
+  if (!next) return false;
+  if (isWeakUserName(prev)) return true;
+  if (isWeakUserName(next)) return false;
+  return next.length >= prev.length && next !== prev;
+}
+
+async function getCanonicalUserName(env, telegramUser) {
+  if (!telegramUser?.id) return getSenderName(telegramUser);
+  const telegramId = String(telegramUser.id);
+  const displayName = getSenderName(telegramUser);
+  if (!env.DB) return displayName;
+  try {
+    const row = await env.DB.prepare(`SELECT name, username FROM users WHERE telegram_id = ? LIMIT 1`)
+      .bind(telegramId)
+      .first();
+    const storedName = String(row?.name || "").trim();
+    const canonical = isBetterUserName(displayName, storedName) ? displayName : (storedName || displayName || (telegramUser.username ? `@${telegramUser.username}` : telegramId));
+    if (canonical && canonical !== storedName) {
+      await env.DB.prepare(`
+        UPDATE users
+        SET name = ?, username = COALESCE(NULLIF(?, ''), username), last_seen_at = CURRENT_TIMESTAMP
+        WHERE telegram_id = ?
+      `).bind(canonical, telegramUser.username || "", telegramId).run();
+    }
+    return canonical;
+  } catch (e) {
+    console.error("getCanonicalUserName:", e);
+    return displayName;
+  }
+}
+
 async function maybeUpdateUserDisplayNameFromBareName(env, message) {
   if (!env.DB || !message?.from?.id || !looksLikeBareKoreanName(message.text || "")) return;
   await env.DB.prepare(`
@@ -153,6 +225,9 @@ async function upsertUser(env, from, chatId, source = "auto_message") {
   if (!env.DB || !from?.id || from.is_bot) return;
   try {
     const telegramId = String(from.id);
+    const prev = await env.DB.prepare(`SELECT name FROM users WHERE telegram_id = ? LIMIT 1`).bind(telegramId).first();
+    const displayName = getSenderName(from);
+    const finalName = isBetterUserName(displayName, prev?.name) ? displayName : (prev?.name || displayName);
     await env.DB.prepare(`
       INSERT INTO users
         (telegram_id, chat_id, name, username, first_name, last_name, source, last_seen_at)
@@ -169,7 +244,7 @@ async function upsertUser(env, from, chatId, source = "auto_message") {
     `).bind(
       telegramId,
       String(chatId || from.id),
-      getSenderName(from),
+      finalName,
       from.username || "",
       from.first_name || "",
       from.last_name || "",
@@ -192,6 +267,7 @@ async function upsertRoom(env, chat) {
 async function upsertRoomMember(env, chat, from, source = "message") {
   if (!env.DB || !chat?.id || !from?.id || chat.type === "private" || from.is_bot) return;
   try {
+    const canonicalName = await getCanonicalUserName(env, from);
     await env.DB.prepare(`
       INSERT INTO room_members (room_id, telegram_id, user_id, name, username, bot_name, last_seen_at)
       VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -205,7 +281,7 @@ async function upsertRoomMember(env, chat, from, source = "message") {
       String(chat.id),
       String(from.id),
       String(from.id),
-      getSenderName(from),
+      canonicalName,
       from.username || "",
       BOT_KEY
     ).run();
@@ -1001,6 +1077,7 @@ function getHelpText() {
     "/db_status - D1 저장 상태 확인",
     "/rooms - 등록된 방 목록 확인",
     "/files - 최근 저장 파일 확인",
+    "/debug_file - 파일 저장 상태 확인",
     "/debug_save - messages 직접 저장 테스트",
     "/debug_env - Worker 버전 확인",
     "/users - 등록 사용자 목록 확인",
@@ -1034,6 +1111,10 @@ async function routeSlashCommand(env, message, text, chatId) {
   }
   if (/^\/files\b/.test(t)) {
     await handleFilesCommand(env, chatId);
+    return true;
+  }
+  if (/^\/debug_files?\b/.test(t)) {
+    await handleDebugFiles(env, chatId);
     return true;
   }
   if (/^\/users\b/.test(t) || isUserListQuery(t)) {
@@ -1114,8 +1195,8 @@ async function dbSaveConversation(env, { userId, userName, question, answer, con
   }
 }
 
-async function dbSaveFile(env, data) {
-  if (!env.DB) return;
+async function dbSaveFile(env, data, options = {}) {
+  if (!env.DB) return false;
   try {
     const table = await env.DB.prepare(`PRAGMA table_info(files)`).all();
     const existing = new Set((table.results || []).map((c) => c.name));
@@ -1133,17 +1214,25 @@ async function dbSaveFile(env, data) {
       file_type: data.file_type || data.fileType || data.mimeType || "",
       mime_type: data.mime_type || data.mimeType || data.file_type || data.fileType || "",
       file_size: Number(data.file_size || data.fileSize || 0) || 0,
+      source_type: data.source_type || data.sourceType || "",
       extracted_text: String(data.extracted_text || "").slice(0, 50000),
       summary: String(data.summary || "").slice(0, 3000),
       tags_json: JSON.stringify(data.tags || []),
       saved_by: data.saved_by || data.savedBy || BOT_KEY,
     };
     const columns = Object.keys(values).filter((name) => existing.has(name));
-    if (!columns.length) return;
+    if (!columns.length) throw new Error("files table has no writable columns");
     const uniqueId = values.telegram_file_unique_id;
     if (uniqueId && existing.has("telegram_file_unique_id")) {
-      const prev = await env.DB.prepare(`SELECT id FROM files WHERE telegram_file_unique_id = ? ORDER BY id DESC LIMIT 1`)
-        .bind(uniqueId)
+      const prev = await env.DB.prepare(`
+        SELECT id FROM files
+        WHERE telegram_file_unique_id = ?
+          AND COALESCE(room_id, '') = ?
+          AND COALESCE(uploader_id, sender_id, '') = ?
+        ORDER BY id DESC
+        LIMIT 1
+      `)
+        .bind(uniqueId, values.room_id, values.uploader_id || values.sender_id)
         .first();
       if (prev?.id) {
         const updateColumns = columns.filter((name) => name !== "telegram_file_unique_id" && name !== "telegram_file_id");
@@ -1152,15 +1241,18 @@ async function dbSaveFile(env, data) {
             .bind(...updateColumns.map((name) => values[name]), prev.id)
             .run();
         }
-        return;
+        return true;
       }
     }
     const placeholders = columns.map(() => "?").join(", ");
     await env.DB.prepare(`INSERT INTO files (${columns.join(", ")}) VALUES (${placeholders})`)
       .bind(...columns.map((name) => values[name]))
       .run();
+    return true;
   } catch (e) {
     console.error("dbSaveFile failed:", e);
+    if (options.throwOnError) throw e;
+    return false;
   }
 }
 
@@ -1207,19 +1299,38 @@ function hasGeneratedSummary(summary) {
   return !!s && !/요약 미생성/.test(s);
 }
 
+function fileDedupeKey(row) {
+  const unique = String(row.telegram_file_unique_id || "").trim();
+  if (unique) return `${unique}|${row.room_id || ""}|${row.uploader_id || row.sender_id || ""}`;
+  return `${row.file_name || ""}|${row.room_id || ""}|${row.uploader_id || row.sender_id || ""}`;
+}
+
+function preferFileRow(next, prev) {
+  if (!prev) return next;
+  const nextHasSummary = hasGeneratedSummary(next.summary);
+  const prevHasSummary = hasGeneratedSummary(prev.summary);
+  if (nextHasSummary && !prevHasSummary) return next;
+  if (!nextHasSummary && prevHasSummary) return prev;
+  return String(next.created_at || "").localeCompare(String(prev.created_at || "")) >= 0 ? next : prev;
+}
+
 async function handleFilesCommand(env, chatId) {
   if (!env.DB || !(await tableExists(env, "files"))) {
     await sendMessage(env, chatId, "최근 저장 파일 0건임.");
     return;
   }
   try {
-    const result = await env.DB.prepare(`
-      SELECT file_name, created_at, uploader_name, sender_name, room_title, summary
-      FROM files
-      ORDER BY created_at DESC
-      LIMIT 10
-    `).all();
-    const rows = result.results || [];
+    const orderColumn = await columnExists(env, "files", "created_at") ? "created_at" : "id";
+    const result = await env.DB.prepare(`SELECT * FROM files ORDER BY ${orderColumn} DESC LIMIT 50`).all();
+    const rawRows = result.results || [];
+    const byKey = new Map();
+    for (const row of rawRows) {
+      const key = fileDedupeKey(row);
+      byKey.set(key, preferFileRow(row, byKey.get(key)));
+    }
+    const rows = [...byKey.values()]
+      .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))
+      .slice(0, 10);
     if (!rows.length) {
       await sendMessage(env, chatId, "최근 저장 파일 0건임.");
       return;
@@ -1234,7 +1345,35 @@ async function handleFilesCommand(env, chatId) {
     await sendMessage(env, chatId, `최근 저장 파일 ${rows.length}건임.\n\n${lines.join("\n\n")}`);
   } catch (e) {
     console.error("handleFilesCommand:", e);
-    await sendMessage(env, chatId, "파일 목록 조회 실패함.");
+    await sendMessage(env, chatId, `파일 목록 조회 실패함.\n${String(e?.message || e).slice(0, 500)}`);
+  }
+}
+
+async function handleDebugFiles(env, chatId) {
+  try {
+    if (!env.DB || !(await tableExists(env, "files"))) {
+      await sendMessage(env, chatId, "files 테이블 없음.");
+      return;
+    }
+    const table = await env.DB.prepare(`PRAGMA table_info(files)`).all();
+    const columns = (table.results || []).map((c) => c.name).join(", ");
+    const count = await env.DB.prepare(`SELECT COUNT(*) AS count FROM files`).first();
+    const orderColumn = await columnExists(env, "files", "created_at") ? "created_at" : "id";
+    const recent = await env.DB.prepare(`SELECT * FROM files ORDER BY ${orderColumn} DESC LIMIT 5`).all();
+    const recentText = (recent.results || []).map((f) =>
+      `id=${f.id || ""} / ${f.file_name || ""}\n` +
+      `room=${f.room_id || ""} / ${f.room_title || ""}\n` +
+      `uploader=${f.uploader_id || ""} / ${f.uploader_name || ""}\n` +
+      `sender=${f.sender_name || ""} / mime=${f.mime_type || ""} / ${f.created_at || ""}`
+    ).join("\n\n") || "최근 파일 없음";
+    const last = env.CONVERSATIONS ? await env.CONVERSATIONS.get("debug_files_last") : "";
+    await sendMessage(
+      env,
+      chatId,
+      `files count: ${count?.count || 0}\ncolumns: ${columns || "없음"}\nlast file save: ${last || "기록 없음"}\n\n${recentText}`
+    );
+  } catch (e) {
+    await sendMessage(env, chatId, `debug files 실패\n${String(e?.stack || e?.message || e).slice(0, 1200)}`);
   }
 }
 
@@ -1977,11 +2116,12 @@ async function persistIncomingMessage(env, message) {
     if (message.from) await upsertRoomMember(env, message.chat, message.from, "message");
   }
   if (!text.trim()) return;
+  const senderName = await getCanonicalUserName(env, message.from);
   const saved = await dbInsert(env, {
     roomId: message.chat.id,
     roomTitle: getRoomTitleForMessage(message),
     senderId: message.from?.id || "",
-    senderName: getSenderName(message.from),
+    senderName,
     content: getMessageTextForStorage(message),
     savedBy: BOT_KEY,
     telegramMessageId: message.message_id || "",
@@ -1991,7 +2131,7 @@ async function persistIncomingMessage(env, message) {
   if (!saved) {
     console.error("persistIncomingMessage failed", {
       room_title: getRoomTitleForMessage(message),
-      sender_name: getSenderName(message.from),
+      sender_name: senderName,
       source_type: getSourceTypeForMessage(message),
       message_id: message.message_id || "",
     });
@@ -2018,23 +2158,42 @@ async function persistIncomingFile(env, message) {
   if (!env.DB || !message?.document || message.from?.is_bot || message._filePersisted) return;
   if (!isSupportedDocument(message)) return;
   try {
+    const room = resolveFileRoomInfo(message);
+    if (room.sourceType === "telegram_group") {
+      await dbRegisterRoom(env, room.roomId, room.roomTitle, BOT_KEY, room.roomType);
+    }
+    const canonicalName = await getCanonicalUserName(env, message.from);
     await dbSaveFile(env, {
       telegram_file_id: message.document.file_id || "",
       telegram_file_unique_id: message.document.file_unique_id || "",
-      roomId: message.chat.id,
-      roomTitle: getRoomTitleForMessage(message),
+      roomId: room.roomId,
+      roomTitle: room.roomTitle,
       senderId: message.from?.id || "",
-      senderName: getSenderName(message.from),
+      senderName: canonicalName,
+      uploaderId: message.from?.id || "",
+      uploaderName: canonicalName,
       fileName: message.document.file_name || "document",
       fileType: getDocumentFileType(message.document.file_name || "", message.document.mime_type || ""),
       mimeType: message.document.mime_type || "",
       fileSize: message.document.file_size || 0,
-      summary: "요약 미생성 / 파일 저장 완료",
-      tags: ["document"],
-    });
+      sourceType: room.sourceType,
+      extracted_text: "",
+      summary: room.tags.includes("원본방 확인 불가 / 1:1 전달본")
+        ? "요약 미생성 / 파일 저장 완료 / 원본방 확인 불가 / 1:1 전달본"
+        : "요약 미생성 / 파일 저장 완료",
+      tags: ["document", ...room.tags],
+    }, { throwOnError: true });
     message._filePersisted = true;
+    if (env.CONVERSATIONS) await env.CONVERSATIONS.put("debug_files_last", "파일 메타 저장 성공", { expirationTtl: 86400 });
   } catch (e) {
     console.error("persistIncomingFile:", e);
+    if (env.CONVERSATIONS) {
+      await env.CONVERSATIONS.put(
+        "debug_files_last",
+        String(e?.stack || e?.message || e).slice(0, 1500),
+        { expirationTtl: 86400 }
+      );
+    }
   }
 }
 
@@ -2630,10 +2789,10 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
       mimeType = "image/jpeg";
     }
 
-    const roomId = message.chat.id;
-    const roomTitle = getRoomTitleForMessage(message);
-    const senderUser = await getUser(userId, env);
-    const senderName = senderUser?.name || getSenderName(message.from);
+    const room = resolveFileRoomInfo(message);
+    const roomId = room.roomId;
+    const roomTitle = room.roomTitle;
+    const senderName = await getCanonicalUserName(env, message.from);
 
     const fileInfo = await tgGetFile(env, fileId);
     const fileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
@@ -2649,12 +2808,15 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
         roomTitle,
         senderId: userId,
         senderName,
+        uploaderId: userId,
+        uploaderName: senderName,
         fileName,
         fileType: getDocumentFileType(fileName, mimeType),
         mimeType,
         fileSize: message.document?.file_size || 0,
+        sourceType: room.sourceType,
         summary: answer,
-        tags: ["image", "analysis"],
+        tags: ["image", "analysis", ...room.tags],
       });
       await sendMessage(env, chatId, answer);
       return;
@@ -2704,13 +2866,16 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
       roomTitle,
       senderId: userId,
       senderName,
+      uploaderId: userId,
+      uploaderName: senderName,
       fileName,
       fileType: getDocumentFileType(fileName, mimeType),
       mimeType,
       fileSize: message.document?.file_size || 0,
+      sourceType: room.sourceType,
       extracted_text: extractedText,
       summary,
-      tags: ["document"],
+      tags: ["document", ...room.tags],
     });
     await sendMessage(env, chatId, summary || "파일은 저장됐으나 요약은 아직 미생성임.");
   } catch (e) {
