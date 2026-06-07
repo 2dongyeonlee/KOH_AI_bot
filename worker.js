@@ -171,23 +171,128 @@ function isBetterUserName(nextName, prevName) {
   return next.length >= prev.length && next !== prev;
 }
 
+function uniqueNames(...names) {
+  const seen = new Set();
+  const result = [];
+  for (const raw of names.flat()) {
+    const name = String(raw || "").trim();
+    if (!name || isWeakUserName(name) || seen.has(name)) continue;
+    seen.add(name);
+    result.push(name);
+  }
+  return result;
+}
+
+function parseNameCandidates(value) {
+  try {
+    const parsed = JSON.parse(String(value || "[]"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function getUserNameColumnInfo(env) {
+  if (!env.DB || !(await tableExists(env, "users"))) {
+    return { hasCanonical: false, hasCandidates: false };
+  }
+  return {
+    hasCanonical: await columnExists(env, "users", "canonical_name"),
+    hasCandidates: await columnExists(env, "users", "name_candidates"),
+  };
+}
+
+async function getCanonicalNameByTelegramId(env, telegramId, fallback = "") {
+  if (!env.DB || !telegramId) return fallback || "";
+  try {
+    const { hasCanonical } = await getUserNameColumnInfo(env);
+    const selectName = hasCanonical
+      ? "COALESCE(NULLIF(canonical_name, ''), NULLIF(name, ''), ?)"
+      : "COALESCE(NULLIF(name, ''), ?)";
+    const row = await env.DB.prepare(`
+      SELECT ${selectName} AS name
+      FROM users
+      WHERE telegram_id = ?
+      LIMIT 1
+    `).bind(fallback || "", String(telegramId)).first();
+    return String(row?.name || fallback || "").trim();
+  } catch (e) {
+    console.error("getCanonicalNameByTelegramId:", e);
+    return fallback || "";
+  }
+}
+
+async function maybeAskCanonicalNameConflict(env, telegramId, chatId, candidates) {
+  if (!env.CONVERSATIONS || !chatId || candidates.length < 3) return;
+  const key = `canonical_name_choice_${telegramId}`;
+  const existing = await env.CONVERSATIONS.get(key);
+  if (existing) return;
+  await env.CONVERSATIONS.put(key, JSON.stringify({ telegramId, chatId, candidates, askedAt: new Date().toISOString() }), { expirationTtl: 7 * 86400 });
+  await sendMessage(
+    env,
+    chatId,
+    `같은 사용자 ID에 대해 이름이 여러 개로 저장되어 있습니다.\n대표 이름으로 사용할 이름을 선택해주세요.\n` +
+    candidates.slice(0, 3).map((name, idx) => `${idx + 1}. ${name}`).join("\n") +
+    `\n직접 입력도 가능합니다.`
+  );
+}
+
+async function handleCanonicalNameChoice(env, message, text) {
+  if (!env.DB || !env.CONVERSATIONS || message.chat?.type !== "private" || !message.from?.id) return false;
+  const telegramId = String(message.from.id);
+  const key = `canonical_name_choice_${telegramId}`;
+  const raw = await env.CONVERSATIONS.get(key);
+  if (!raw) return false;
+  const state = JSON.parse(raw);
+  const candidates = state.candidates || [];
+  const trimmed = String(text || "").trim();
+  if (!trimmed || trimmed.startsWith("/")) return false;
+  const numeric = trimmed.match(/^[1-3]$/) ? Number(trimmed) - 1 : -1;
+  const chosen = cleanName(numeric >= 0 ? candidates[numeric] : trimmed) || (numeric >= 0 ? candidates[numeric] : trimmed);
+  if (!chosen) return false;
+  const { hasCanonical } = await getUserNameColumnInfo(env);
+  if (hasCanonical) {
+    await env.DB.prepare(`
+      UPDATE users
+      SET canonical_name = ?, name = ?, last_seen_at = CURRENT_TIMESTAMP
+      WHERE telegram_id = ?
+    `).bind(chosen, chosen, telegramId).run();
+  } else {
+    await env.DB.prepare(`
+      UPDATE users
+      SET name = ?, last_seen_at = CURRENT_TIMESTAMP
+      WHERE telegram_id = ?
+    `).bind(chosen, telegramId).run();
+  }
+  await env.CONVERSATIONS.delete(key);
+  await sendMessage(env, message.chat.id, `대표 이름을 ${chosen}으로 저장했습니다.`);
+  return true;
+}
+
 async function getCanonicalUserName(env, telegramUser) {
   if (!telegramUser?.id) return getSenderName(telegramUser);
   const telegramId = String(telegramUser.id);
   const displayName = getSenderName(telegramUser);
   if (!env.DB) return displayName;
   try {
-    const row = await env.DB.prepare(`SELECT name, username FROM users WHERE telegram_id = ? LIMIT 1`)
+    const { hasCanonical } = await getUserNameColumnInfo(env);
+    const row = await env.DB.prepare(`
+      SELECT name, ${hasCanonical ? "canonical_name" : "NULL AS canonical_name"}, username
+      FROM users
+      WHERE telegram_id = ?
+      LIMIT 1
+    `)
       .bind(telegramId)
       .first();
+    const canonicalName = String(row?.canonical_name || "").trim();
     const storedName = String(row?.name || "").trim();
-    const canonical = isBetterUserName(displayName, storedName) ? displayName : (storedName || displayName || (telegramUser.username ? `@${telegramUser.username}` : telegramId));
-    if (canonical && canonical !== storedName) {
+    const canonical = canonicalName || (isBetterUserName(displayName, storedName) ? displayName : (storedName || displayName || (telegramUser.username ? `@${telegramUser.username}` : telegramId)));
+    if (canonical && (canonical !== storedName || (hasCanonical && canonical !== canonicalName))) {
       await env.DB.prepare(`
         UPDATE users
-        SET name = ?, username = COALESCE(NULLIF(?, ''), username), last_seen_at = CURRENT_TIMESTAMP
+        SET name = ?, ${hasCanonical ? "canonical_name = COALESCE(NULLIF(canonical_name, ''), ?)," : ""} username = COALESCE(NULLIF(?, ''), username), last_seen_at = CURRENT_TIMESTAMP
         WHERE telegram_id = ?
-      `).bind(canonical, telegramUser.username || "", telegramId).run();
+      `).bind(...(hasCanonical ? [canonical, canonical, telegramUser.username || "", telegramId] : [canonical, telegramUser.username || "", telegramId])).run();
     }
     return canonical;
   } catch (e) {
@@ -225,31 +330,47 @@ async function upsertUser(env, from, chatId, source = "auto_message") {
   if (!env.DB || !from?.id || from.is_bot) return;
   try {
     const telegramId = String(from.id);
-    const prev = await env.DB.prepare(`SELECT name FROM users WHERE telegram_id = ? LIMIT 1`).bind(telegramId).first();
+    const { hasCanonical, hasCandidates } = await getUserNameColumnInfo(env);
+    const prev = await env.DB.prepare(`
+      SELECT name, ${hasCanonical ? "canonical_name" : "NULL AS canonical_name"}, ${hasCandidates ? "name_candidates" : "NULL AS name_candidates"}
+      FROM users
+      WHERE telegram_id = ?
+      LIMIT 1
+    `).bind(telegramId).first();
     const displayName = getSenderName(from);
-    const finalName = isBetterUserName(displayName, prev?.name) ? displayName : (prev?.name || displayName);
+    const candidates = uniqueNames(parseNameCandidates(prev?.name_candidates), prev?.name, prev?.canonical_name, displayName);
+    const finalName = String(prev?.canonical_name || "").trim()
+      || (isBetterUserName(displayName, prev?.name) ? displayName : (prev?.name || displayName));
+    const columns = ["telegram_id", "chat_id", "name", "username", "first_name", "last_name", "source", "last_seen_at"];
+    const values = [telegramId, String(chatId || from.id), finalName, from.username || "", from.first_name || "", from.last_name || "", source, "CURRENT_TIMESTAMP"];
+    if (hasCanonical) {
+      columns.push("canonical_name");
+      values.push(finalName);
+    }
+    if (hasCandidates) {
+      columns.push("name_candidates");
+      values.push(JSON.stringify(candidates));
+    }
+    const placeholders = columns.map((name) => name === "last_seen_at" ? "CURRENT_TIMESTAMP" : "?").join(", ");
+    const bindValues = values.filter((_, idx) => columns[idx] !== "last_seen_at");
+    const updateSets = [
+      "chat_id = excluded.chat_id",
+      "name = excluded.name",
+      "username = excluded.username",
+      "first_name = excluded.first_name",
+      "last_name = excluded.last_name",
+      "source = excluded.source",
+      ...(hasCanonical ? ["canonical_name = COALESCE(NULLIF(canonical_name, ''), excluded.canonical_name)"] : []),
+      ...(hasCandidates ? ["name_candidates = excluded.name_candidates"] : []),
+      "last_seen_at = CURRENT_TIMESTAMP",
+    ];
     await env.DB.prepare(`
-      INSERT INTO users
-        (telegram_id, chat_id, name, username, first_name, last_name, source, last_seen_at)
-      VALUES
-        (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      INSERT INTO users (${columns.join(", ")})
+      VALUES (${placeholders})
       ON CONFLICT(telegram_id) DO UPDATE SET
-        chat_id = excluded.chat_id,
-        name = excluded.name,
-        username = excluded.username,
-        first_name = excluded.first_name,
-        last_name = excluded.last_name,
-        source = excluded.source,
-        last_seen_at = CURRENT_TIMESTAMP
-    `).bind(
-      telegramId,
-      String(chatId || from.id),
-      finalName,
-      from.username || "",
-      from.first_name || "",
-      from.last_name || "",
-      source
-    ).run();
+        ${updateSets.join(",\n        ")}
+    `).bind(...bindValues).run();
+    await maybeAskCanonicalNameConflict(env, telegramId, String(chatId || from.id), candidates);
   } catch (e) {
     console.error("upsertUser:", e);
   }
@@ -1219,6 +1340,10 @@ async function routeSlashCommand(env, message, text, chatId) {
     await handleWebSearchTest(env, chatId, t);
     return true;
   }
+  if (/^\/briefing_mock\b/.test(t)) {
+    await sendDailyBriefing(env, { targetChatId: chatId, mock: true });
+    return true;
+  }
   if (/^\/help\b/.test(t)) {
     await sendMessage(env, chatId, getHelpText());
     return true;
@@ -1564,6 +1689,29 @@ async function getTodaySchedules(env) {
   const today = getTodayKST().replace(/-/g, "");
   const raw = await env.SCHEDULES.get(`schedules_${today}`);
   return raw ? JSON.parse(raw) : [];
+}
+
+async function getSchedulesForDate(env, isoDate) {
+  const key = String(isoDate || getTodayKST()).replace(/-/g, "");
+  const raw = await env.SCHEDULES.get(`schedules_${key}`);
+  return raw ? JSON.parse(raw) : [];
+}
+
+async function getSchedulesForRange(env, startISO, days = 1) {
+  const result = [];
+  const start = new Date(`${startISO}T00:00:00Z`);
+  for (let i = 0; i < days; i++) {
+    const d = new Date(start);
+    d.setUTCDate(d.getUTCDate() + i);
+    const iso = d.toISOString().slice(0, 10);
+    const items = await getSchedulesForDate(env, iso);
+    for (const item of items) result.push({ ...item, date: item.date || iso });
+  }
+  return result;
+}
+
+function getKstDayOfWeek() {
+  return new Date(Date.now() + 9 * 60 * 60 * 1000).getUTCDay();
 }
 
 function extractSchedule(text, todayISO) {
@@ -1919,8 +2067,18 @@ async function fetchDigestRows(env, days = 2, limit = 120) {
     const fileLimit = 30;
     const fileDays = Math.max(Number(days) || 14, 30);
     const hasRooms = await tableExists(env, "rooms");
+    const hasUsers = await tableExists(env, "users");
+    const { hasCanonical } = await getUserNameColumnInfo(env);
     const roomJoin = hasRooms ? "LEFT JOIN rooms r ON r.room_id = m.room_id" : "";
     const fileRoomJoin = hasRooms ? "LEFT JOIN rooms r ON r.room_id = f.room_id" : "";
+    const userJoin = hasUsers ? "LEFT JOIN users u ON u.telegram_id = m.sender_id" : "";
+    const fileUserJoin = hasUsers ? "LEFT JOIN users u ON u.telegram_id = f.uploader_id" : "";
+    const actorExpr = hasUsers
+      ? (hasCanonical ? "COALESCE(NULLIF(u.canonical_name, ''), NULLIF(u.name, ''), m.sender_name, 'unknown')" : "COALESCE(NULLIF(u.name, ''), m.sender_name, 'unknown')")
+      : "COALESCE(m.sender_name, 'unknown')";
+    const fileActorExpr = hasUsers
+      ? (hasCanonical ? "COALESCE(NULLIF(u.canonical_name, ''), NULLIF(u.name, ''), f.uploader_name, f.sender_name, 'unknown')" : "COALESCE(NULLIF(u.name, ''), f.uploader_name, f.sender_name, 'unknown')")
+      : "COALESCE(f.uploader_name, f.sender_name, 'unknown')";
     const messageSourceExpr = hasRooms
       ? `COALESCE(
           CASE WHEN CAST(m.room_id AS INTEGER) > 0 THEN '1:1' END,
@@ -1955,13 +2113,14 @@ async function fetchDigestRows(env, days = 2, limit = 120) {
         m.room_id,
         m.source_type,
         ${messageSourceExpr} AS source,
-        m.sender_name AS actor,
+        ${actorExpr} AS actor,
         m.content AS text,
         m.created_at,
         NULL AS file_name,
         NULL AS title
       FROM messages m
       ${roomJoin}
+      ${userJoin}
       WHERE datetime(m.created_at) >= datetime('now', ?)
       ORDER BY m.created_at DESC
       LIMIT ?
@@ -1972,13 +2131,14 @@ async function fetchDigestRows(env, days = 2, limit = 120) {
         f.room_id,
         'telegram_file' AS source_type,
         ${fileSourceExpr} AS source,
-        COALESCE(f.uploader_name, f.sender_name, 'unknown') AS actor,
+        ${fileActorExpr} AS actor,
         COALESCE(f.summary, f.extracted_text, f.file_name) AS text,
         f.created_at,
         f.file_name,
         NULL AS title
       FROM files f
       ${fileRoomJoin}
+      ${fileUserJoin}
       WHERE datetime(f.created_at) >= datetime('now', ?)
       ORDER BY f.created_at DESC
       LIMIT ?
@@ -1995,13 +2155,14 @@ async function fetchDigestRows(env, days = 2, limit = 120) {
           m.room_id,
           m.source_type,
           ${messageSourceExpr} AS source,
-          m.sender_name AS actor,
+          ${actorExpr} AS actor,
           m.content AS text,
           m.created_at,
           NULL AS file_name,
           NULL AS title
         FROM messages m
         ${roomJoin}
+        ${userJoin}
         ORDER BY m.created_at DESC
         LIMIT ?
       `).bind(messageLimit).all();
@@ -2011,13 +2172,14 @@ async function fetchDigestRows(env, days = 2, limit = 120) {
           f.room_id,
           'telegram_file' AS source_type,
           ${fileSourceExpr} AS source,
-          COALESCE(f.uploader_name, f.sender_name, 'unknown') AS actor,
+          ${fileActorExpr} AS actor,
           COALESCE(f.summary, f.extracted_text, f.file_name) AS text,
           f.created_at,
           f.file_name,
           NULL AS title
         FROM files f
         ${fileRoomJoin}
+        ${fileUserJoin}
         ORDER BY f.created_at DESC
         LIMIT ?
       `).bind(fileLimit).all() : { results: [] };
@@ -2062,6 +2224,22 @@ async function answerDigest(env, userText, userId) {
     `[요약 범위]\n${range.label}\n\n` +
     `[내부 기록]\n${buildDigestCorpus(rows)}\n\n` +
     `아래는 사용자가 포함된 Telegram 방과 1:1에서 수집된 최근 업무 기록이다. 프로젝트/안건 단위로 묶어 요약하라. 단순 나열하지 말고 유사 주제를 병합하라. 각 안건마다 출처 방, 공유자, 일자를 표시하라. 없는 내용은 추정하지 말라.\n\n` +
+    `[보고서 출력 형식]\n` +
+    `${range.label} 주요 안건 N건 공유드립니다.\n\n` +
+    `[프로젝트] 프로젝트/안건명\n` +
+    `- 핵심 내용: 1~2문장. 짧게.\n` +
+    `- 확인 필요: 다음 액션 1~2문장. 짧게.\n\n` +
+    `🗓 일자: MM/DD\n` +
+    `👤 공유자: telegram_id 기준 대표 이름\n` +
+    `📍 방: 실제 room_title 또는 1:1\n` +
+    `📎 자료: 파일명 또는 없음\n` +
+    `🔎 위치: 방 제목 > 파일명 또는 방 제목 > 메시지 일부\n\n` +
+    `[프로젝트 묶음 규칙]\n` +
+    `- 비전선포식/New Vision/선포의 장/서울랜드/이든&앨리스는 같은 프로젝트로 묶어라.\n` +
+    `- AI Agent/1인 1 AI Agent/Comm. 총괄/6R Comm 전략팀은 같은 프로젝트로 묶어라.\n` +
+    `- M15/화재/고객사 Letter/대외 커뮤니케이션은 같은 프로젝트로 묶어라.\n` +
+    `- 같은 파일, 같은 행사, 같은 TF, 같은 회의는 하나로 병합하라.\n` +
+    `- 최대 5개 프로젝트, 전체 1500자 이내. 장문 설명 금지.\n\n` +
     `[작성 지침]\n` +
     `너는 ${BOT_OWNER_NAME}의 개인 업무 비서 AI OS입니다.\n` +
     `아래 기록은 이 봇이 직접 들어가 있는 텔레그램 방, 1:1 대화, 파일, 회의록에서 수집한 내용입니다.\n` +
@@ -2083,7 +2261,18 @@ async function answerDigest(env, userText, userId) {
     `5. 출처는 반드시 [방이름] 공유자명 (시간) 형식으로 표시합니다.\n` +
     `6. 출처 없는 내용은 쓰지 않습니다.\n` +
     `7. 전체 답변은 1500자 이내로 씁니다.\n` +
-    `8. 마크다운 기호는 쓰지 않습니다.\n`;
+    `8. 마크다운 기호는 쓰지 않습니다.\n` +
+    `\n[최종 출력 강제]\n` +
+    `${range.label} 주요 안건 N건 공유드립니다.\n\n` +
+    `[프로젝트] 프로젝트/안건명\n` +
+    `- 핵심 내용: 1~2문장 이내. 짧게.\n` +
+    `- 확인 필요: 다음 액션 1~2문장 이내. 짧게.\n\n` +
+    `🗓 일자: MM/DD\n` +
+    `👤 공유자: telegram_id 기준 대표 이름\n` +
+    `📍 방: 실제 방 제목 또는 1:1\n` +
+    `📎 자료: 파일명 또는 없음\n` +
+    `🔎 위치: 방 제목 > 파일명 또는 방 제목 > 메시지 일부\n\n` +
+    `이 형식 외 다른 형식은 사용하지 마라. source_type은 출력하지 마라. 전체 1500자 이내.\n`;
   const result = await difyChat(env, { query, user: String(userId), conversationId: "" });
   return result?.answer || "요약을 생성하지 못했습니다.";
 }
@@ -2459,6 +2648,10 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
   }
 
   if (!text.trim()) return;
+
+  if (await handleCanonicalNameChoice(env, message, text)) {
+    return;
+  }
 
   // 이름 입력 대기 중 → 등록 처리 (Dify 호출 없음) [기존 호환]
   if (isDiagnosticCommand(text)) {
@@ -3177,6 +3370,68 @@ async function sendDailyBriefing(env) {
   if (targetChatId) {
     await sendMessage(env, targetChatId, msg);
   }
+}
+
+async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) {
+  const today = getTodayKST();
+  const day = getKstDayOfWeek();
+  const isMonday = day === 1;
+  const digestDays = isMonday ? 7 : 1;
+  const title = isMonday ? "지난주 주요 안건 공유드립니다." : "전일 주요 안건 및 오늘 일정 공유드립니다.";
+  const section1 = isMonday ? "지난주 주요 안건" : "전일 주요 안건";
+  const section2 = isMonday ? "이번주 일정" : "오늘 일정";
+  const section3 = isMonday ? "이번주 확인 과제" : "오늘 확인 과제";
+  const schedules = isMonday ? await getSchedulesForRange(env, today, 7) : await getSchedulesForDate(env, today);
+  const scheduleLines = schedules.length
+    ? schedules
+        .sort((a, b) => `${a.date || ""} ${a.time || ""}`.localeCompare(`${b.date || ""} ${b.time || ""}`))
+        .slice(0, 10)
+        .map((s) => `- ${formatShortDate(s.date || today)} ${s.time || ""} ${s.title || s.text || "일정"}`.replace(/\s+/g, " ").trim())
+        .join("\n")
+    : "- 오늘 일정 데이터가 없습니다.";
+  const rows = await fetchDigestRows(env, digestDays, 140);
+  if (!rows.length && !schedules.length) {
+    if (mock && targetChatId) await sendMessage(env, targetChatId, "최근 자료를 찾지 못했습니다.");
+    return;
+  }
+  let msg = "";
+  try {
+    const adminUser = await findAdminUser(env);
+    const query =
+      TONE_RULE +
+      `[브리핑 제목]\n${title}\n\n` +
+      `[수집 기록]\n${buildDigestCorpus(rows)}\n\n` +
+      `[일정]\n${scheduleLines}\n\n` +
+      `[출력 형식]\n` +
+      `${title}\n\n` +
+      `1) ${section1}\n` +
+      `[프로젝트] 프로젝트/안건명\n` +
+      `- 핵심 내용: 1~2문장 이내.\n` +
+      `- 확인 필요: 다음 액션 1문장.\n\n` +
+      `2) ${section2}\n` +
+      `- MM/DD HH:MM 일정명\n\n` +
+      `3) ${section3}\n` +
+      `- 확인할 일\n\n` +
+      `[작성 규칙]\n` +
+      `- 프로젝트별로 병합하고 시간순 나열은 금지.\n` +
+      `- source_type은 출력하지 말 것.\n` +
+      `- 전체 1200자 이내. 짧고 보고형.\n` +
+      `- 없는 내용은 추정하지 말 것.`;
+    const result = await difyChat(env, {
+      query,
+      user: String(adminUser?.id || "admin"),
+      conversationId: "",
+    });
+    msg = result.answer || "";
+  } catch (e) {
+    console.error("sendDailyBriefing:", e);
+  }
+  if (!msg) {
+    msg = `${title}\n\n1) ${section1}\n- 최근 자료를 찾지 못했습니다.\n\n2) ${section2}\n${scheduleLines}\n\n3) ${section3}\n- 확인 과제 데이터가 없습니다.`;
+  }
+  const adminUser = await findAdminUser(env);
+  const target = targetChatId || env.BOT_OWNER_TELEGRAM_ID || env.ADMIN_TELEGRAM_ID || adminUser?.chat_id;
+  if (target) await sendMessage(env, target, msg);
 }
 
 async function difyChat(env, { query, user, conversationId = "", files = [] }) {
