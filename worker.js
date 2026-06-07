@@ -1591,6 +1591,55 @@ async function handleFilesCommand(env, chatId) {
   }
 }
 
+async function handleFilesCommand(env, chatId) {
+  if (!env.DB || !(await tableExists(env, "files"))) {
+    await sendMessage(env, chatId, "최근 저장 자료 0건임.");
+    return;
+  }
+  try {
+    const orderColumn = await columnExists(env, "files", "created_at") ? "created_at" : "id";
+    const hasRooms = await tableExists(env, "rooms");
+    const result = hasRooms
+      ? await env.DB.prepare(`
+        SELECT f.*, r.room_title AS joined_room_title
+        FROM files f
+        LEFT JOIN rooms r ON r.room_id = f.room_id
+        ORDER BY f.${orderColumn} DESC
+        LIMIT 50
+      `).all()
+      : await env.DB.prepare(`SELECT * FROM files ORDER BY ${orderColumn} DESC LIMIT 50`).all();
+    const byKey = new Map();
+    for (const row of result.results || []) {
+      const key = fileDedupeKey(row);
+      byKey.set(key, preferFileRow(row, byKey.get(key)));
+    }
+    const rows = [...byKey.values()]
+      .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))
+      .slice(0, 10);
+    if (!rows.length) {
+      await sendMessage(env, chatId, "최근 저장 자료 0건임.");
+      return;
+    }
+    const lines = rows.map((f, idx) => {
+      f.room_title = normalizeRoomTitle(f);
+      const fileName = f.file_name || "파일명 없음";
+      const roomTitle = f.room_title || "알 수 없는 방";
+      const summary = hasGeneratedSummary(f.summary)
+        ? String(f.summary || "").replace(/\s+/g, " ").slice(0, 140)
+        : "요약 미생성임.";
+      return `${idx + 1}. <b>${fileName}</b>\n` +
+        `   • <b>요약</b>: ${summary}\n` +
+        `   🗓 ${formatShortDate(f.created_at)}  📍 ${roomTitle}\n` +
+        `   👤 ${f.uploader_name || f.sender_name || "공유자 미상"}\n` +
+        `   🔎 위치: ${roomTitle} > ${fileName}`;
+    });
+    await sendMessage(env, chatId, `최근 저장 자료 ${rows.length}건임.\n\n${lines.join("\n\n")}`, { parseMode: "HTML" });
+  } catch (e) {
+    console.error("handleFilesCommand:", e);
+    await sendMessage(env, chatId, `파일 목록 조회 실패함.\n${String(e?.message || e).slice(0, 300)}`);
+  }
+}
+
 async function handleDebugFiles(env, chatId) {
   try {
     if (!env.DB || !(await tableExists(env, "files"))) {
@@ -1621,6 +1670,173 @@ async function handleDebugFiles(env, chatId) {
 
 function isFileSearchQuery(text) {
   return /(자료|파일).{0,20}(어디|찾아|요약|정리|있지|있어)|지난번.{0,20}(자료|파일)|단체방.{0,20}(자료|파일).{0,20}(정리|요약)|그\s*자료\s*어디/i.test(String(text || ""));
+}
+
+function isFileResendQuery(text) {
+  // file resend intent: must be handled before external search.
+  const t = String(text || "").trim();
+  return /(자료|파일|첨부파일|문서).{0,30}(보내줘|보내|공유해줘|공유|전송|다시\s*줘|줘)|방금\s*요약한\s*자료|공유된\s*자료.{0,20}(보내|공유)/i.test(t);
+}
+
+function extractFileKeyword(text) {
+  const cleaned = String(text || "")
+    .replace(/(자료|파일|첨부파일|문서|공유된|관련|보내줘|보내|공유해줘|공유|전송|다시|줘|찾아줘|찾아|요약한|방금)/gi, " ")
+    .replace(/\b\d{1,2}\s*\/\s*\d{1,2}\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const tokens = cleaned
+    .split(/\s+/)
+    .map((t) => t.replace(/(에|에서|된거|된|것|거|좀|관련)$/g, ""))
+    .filter((t) => t && !/^(에|에서|된거|된|것|거|좀|요청)$/i.test(t));
+  if (tokens.length <= 2) return tokens.join(" ");
+  return tokens[0] || cleaned;
+}
+
+function parseDateFilter(text) {
+  const t = String(text || "");
+  const kstNow = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  if (/어제/.test(t)) {
+    const d = new Date(kstNow);
+    d.setUTCDate(d.getUTCDate() - 1);
+    const date = d.toISOString().slice(0, 10);
+    return { label: "어제", start: `${date} 00:00:00`, end: `${date} 23:59:59` };
+  }
+  if (/지난\s*주|지난주/.test(t)) {
+    const d = new Date(kstNow);
+    d.setUTCDate(d.getUTCDate() - 7);
+    return { label: "지난주", start: `${d.toISOString().slice(0, 10)} 00:00:00`, end: `${kstNow.toISOString().slice(0, 10)} 23:59:59` };
+  }
+  const m = t.match(/(\d{1,2})\s*\/\s*(\d{1,2})/);
+  if (!m) return null;
+  const year = kstNow.getUTCFullYear();
+  const mm = String(Number(m[1])).padStart(2, "0");
+  const dd = String(Number(m[2])).padStart(2, "0");
+  const date = `${year}-${mm}-${dd}`;
+  return { label: `${Number(m[1])}/${Number(m[2])}`, start: `${date} 00:00:00`, end: `${date} 23:59:59` };
+}
+
+function fileLocation(row) {
+  const room = normalizeRoomTitle(row) || "알 수 없는 방";
+  const file = row.file_name || "파일명 없음";
+  return `${room} > ${file}`;
+}
+
+function fileCaption(row) {
+  const file = escapeHtml(row.file_name || "파일명 없음");
+  const room = escapeHtml(normalizeRoomTitle(row) || "알 수 없는 방");
+  const actor = escapeHtml(row.actor || row.uploader_name || row.sender_name || "공유자 미상");
+  const date = escapeHtml(formatShortDate(row.created_at));
+  return `자료 확인했습니다. 아래 파일을 공유드립니다.\n\n` +
+    `📎 <b>${file}</b>\n` +
+    `🔎 위치: ${room} &gt; ${file}\n` +
+    `👤 공유자: ${actor}\n` +
+    `🗓 일자: ${date}`;
+}
+
+async function searchFilesForResend(env, text) {
+  if (!env.DB || !(await tableExists(env, "files"))) return { files: [], messages: [], exactDateMiss: false, keyword: "" };
+  const keyword = extractFileKeyword(text);
+  const like = `%${keyword || ""}%`;
+  const date = parseDateFilter(text);
+  const hasRooms = await tableExists(env, "rooms");
+  const hasUsers = await tableExists(env, "users");
+  const { hasCanonical } = await getUserNameColumnInfo(env);
+  const joins = `${hasRooms ? "LEFT JOIN rooms r ON r.room_id = f.room_id" : ""} ${hasUsers ? "LEFT JOIN users u ON u.telegram_id = f.uploader_id" : ""}`;
+  const sourceExpr = hasRooms
+    ? `COALESCE(CASE WHEN CAST(f.room_id AS INTEGER) > 0 THEN '1:1' END, CASE WHEN CAST(f.room_id AS INTEGER) < 0 THEN COALESCE(r.room_title, NULLIF(f.room_title, '1:1'), '알 수 없는 방') END, f.room_title, '알 수 없는 방')`
+    : `COALESCE(CASE WHEN CAST(f.room_id AS INTEGER) > 0 THEN '1:1' END, NULLIF(f.room_title, ''), '알 수 없는 방')`;
+  const actorExpr = hasUsers
+    ? (hasCanonical ? "COALESCE(NULLIF(u.canonical_name, ''), NULLIF(u.name, ''), f.uploader_name, f.sender_name, '공유자 미상')" : "COALESCE(NULLIF(u.name, ''), f.uploader_name, f.sender_name, '공유자 미상')")
+    : "COALESCE(f.uploader_name, f.sender_name, '공유자 미상')";
+  const baseSelect = `
+    SELECT f.*, ${sourceExpr} AS joined_room_title, ${actorExpr} AS actor
+    FROM files f
+    ${joins}
+    WHERE (f.file_name LIKE ? OR f.summary LIKE ? OR f.extracted_text LIKE ? OR f.room_title LIKE ?)
+  `;
+  const params = [like, like, like, like];
+  let files = [];
+  let exactDateMiss = false;
+  if (date) {
+    files = (await env.DB.prepare(`${baseSelect} AND datetime(f.created_at) BETWEEN datetime(?) AND datetime(?) ORDER BY f.created_at DESC LIMIT 6`)
+      .bind(...params, date.start, date.end).all()).results || [];
+    exactDateMiss = files.length === 0;
+  }
+  if (!files.length) {
+    files = (await env.DB.prepare(`${baseSelect} AND datetime(f.created_at) >= datetime('now', '-14 days') ORDER BY f.created_at DESC LIMIT 6`)
+      .bind(...params).all()).results || [];
+  }
+  let messages = [];
+  if (!files.length && await tableExists(env, "messages")) {
+    messages = (await env.DB.prepare(`
+      SELECT content, room_title, sender_name, created_at
+      FROM messages
+      WHERE content LIKE ? AND datetime(created_at) >= datetime('now', '-14 days')
+      ORDER BY created_at DESC
+      LIMIT 5
+    `).bind(like).all()).results || [];
+  }
+  return { files, messages, exactDateMiss, keyword, date };
+}
+
+async function sendFileRow(env, chatId, row) {
+  const document = row.telegram_file_id || row.file_id || "";
+  if (!document) {
+    await sendMessage(env, chatId, "파일 원본 재전송용 ID가 저장되어 있지 않음.");
+    return;
+  }
+  await sendMessage(env, chatId, `자료 확인했습니다. 아래 파일을 공유드립니다.\n📎 ${row.file_name || "파일명 없음"}\n🔎 위치: ${fileLocation(row)}`);
+  await sendDocument(env, chatId, document, fileCaption(row));
+}
+
+async function handleFileResendSelection(env, message, text) {
+  if (!env.CONVERSATIONS || !message?.from?.id) return false;
+  const n = Number(String(text || "").trim());
+  if (!Number.isInteger(n) || n < 1 || n > 3) return false;
+  const key = `file_resend_${message.from.id}`;
+  const raw = await env.CONVERSATIONS.get(key);
+  if (!raw) return false;
+  const state = JSON.parse(raw);
+  const row = state.files?.[n - 1];
+  if (!row) return false;
+  await env.CONVERSATIONS.delete(key);
+  await sendFileRow(env, message.chat.id, row);
+  return true;
+}
+
+async function handleFileResendRequest(env, message, text, chatId) {
+  const result = await searchFilesForResend(env, text);
+  const prefix = result.exactDateMiss && result.date
+    ? `${result.date.label} 자료는 직접 확인되지 않아 최근 관련 자료 기준으로 찾았습니다.\n\n`
+    : "";
+  if (result.files.length === 1) {
+    if (prefix) await sendMessage(env, chatId, prefix.trim());
+    await sendFileRow(env, chatId, result.files[0]);
+    return true;
+  }
+  if (result.files.length > 1) {
+    const candidates = result.files.slice(0, 3);
+    if (env.CONVERSATIONS && message.from?.id) {
+      await env.CONVERSATIONS.put(`file_resend_${message.from.id}`, JSON.stringify({ files: candidates, createdAt: new Date().toISOString() }), { expirationTtl: 600 });
+    }
+    const lines = candidates.map((f, idx) =>
+      `${idx + 1}. ${f.file_name || "파일명 없음"}\n` +
+      `   • 위치: ${fileLocation(f)}\n` +
+      `   • 일자: ${formatShortDate(f.created_at)}`
+    );
+    await sendMessage(env, chatId, `${prefix}자료 후보 ${candidates.length}건임.\n\n${lines.join("\n\n")}\n\n원하는 번호를 입력해주세요.`, { parseMode: "HTML" });
+    return true;
+  }
+  if (result.messages.length) {
+    const lines = result.messages.slice(0, 3).map((m, idx) =>
+      `${idx + 1}. ${formatShortDate(m.created_at)} / ${normalizeRoomTitle(m)}\n- ${String(m.content || "").slice(0, 90)}`
+    );
+    await sendMessage(env, chatId, `${result.date?.label || ""} 저장된 관련 파일은 없음.\n관련 메시지는 확인됨.\n\n${lines.join("\n\n")}`.trim());
+    return true;
+  }
+  const dateLabel = result.date?.label ? `${result.date.label}에 저장된 ` : "";
+  await sendMessage(env, chatId, `${dateLabel}${result.keyword || "요청"} 관련 자료는 확인되지 않음.\n최근 14일 기준 관련 파일/메시지도 없음.`);
+  return true;
 }
 
 async function answerFileSearch(env, text) {
@@ -2264,15 +2480,14 @@ async function answerDigest(env, userText, userId) {
     `8. 마크다운 기호는 쓰지 않습니다.\n` +
     `\n[최종 출력 강제]\n` +
     `${range.label} 주요 안건 N건 공유드립니다.\n\n` +
-    `[프로젝트] 프로젝트/안건명\n` +
-    `- 핵심 내용: 1~2문장 이내. 짧게.\n` +
-    `- 확인 필요: 다음 액션 1~2문장 이내. 짧게.\n\n` +
-    `🗓 일자: MM/DD\n` +
-    `👤 공유자: telegram_id 기준 대표 이름\n` +
-    `📍 방: 실제 방 제목 또는 1:1\n` +
+    `<b>[프로젝트] 프로젝트명</b>\n` +
+    `• <b>핵심</b>: 1~2줄 요약임.\n` +
+    `• <b>확인</b>: 확인 필요사항 1줄임.\n\n` +
+    `🗓 MM/DD  📍 방 이름\n` +
+    `👤 공유자  📎 파일명 또는 없음\n` +
     `📎 자료: 파일명 또는 없음\n` +
-    `🔎 위치: 방 제목 > 파일명 또는 방 제목 > 메시지 일부\n\n` +
-    `이 형식 외 다른 형식은 사용하지 마라. source_type은 출력하지 마라. 전체 1500자 이내.\n`;
+    `🔎 위치: 방 이름 &gt; 파일명 또는 방 이름 &gt; 메시지 일부\n\n` +
+    `이 형식 외 다른 형식은 사용하지 마라. source_type은 출력하지 마라. HTML 태그는 <b>만 사용하라. 전체 1500자 이내.\n`;
   const result = await difyChat(env, { query, user: String(userId), conversationId: "" });
   return result?.answer || "요약을 생성하지 못했습니다.";
 }
@@ -2653,6 +2868,10 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
+  if (await handleFileResendSelection(env, message, text)) {
+    return;
+  }
+
   // 이름 입력 대기 중 → 등록 처리 (Dify 호출 없음) [기존 호환]
   if (isDiagnosticCommand(text)) {
     await handleDiagnosticCommand(env, chatId, text);
@@ -2742,6 +2961,11 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
+  if (isFileResendQuery(text)) {
+    await handleFileResendRequest(env, message, text, chatId);
+    return;
+  }
+
   if (isFileSearchQuery(text)) {
     const answer = await answerFileSearch(env, text);
     await sendMessage(env, chatId, answer);
@@ -2756,7 +2980,7 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
 
   if (isDigestQuery(text)) {
     const answer = await answerDigest(env, text, userId);
-    await sendMessage(env, chatId, answer);
+    await sendMessage(env, chatId, answer, { parseMode: "HTML" });
     return;
   }
 
@@ -3054,6 +3278,10 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     return;
   }
 
+  if (await handleFileResendSelection(env, message, cleanText)) {
+    return;
+  }
+
   if (isWebSearchTestCommand(cleanText)) {
     await handleWebSearchTest(env, chatId, cleanText);
     return;
@@ -3062,6 +3290,11 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
   if (isUrlSummaryQuery(cleanText)) {
     const answer = await answerUrlSummary(env, cleanText, userId);
     await sendMessage(env, chatId, answer);
+    return;
+  }
+
+  if (isFileResendQuery(cleanText)) {
+    await handleFileResendRequest(env, message, cleanText, chatId);
     return;
   }
 
@@ -3099,7 +3332,7 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
 
   if (isDigestQuery(cleanText)) {
     const answer = await answerDigest(env, cleanText, userId);
-    await sendMessage(env, chatId, answer);
+    await sendMessage(env, chatId, answer, { parseMode: "HTML" });
     return;
   }
 
@@ -3515,13 +3748,47 @@ async function tgGetFile(env, fileId) {
   return data.result;
 }
 
-async function sendMessage(env, chatId, text) {
-  const clean = stripMarkdown(text).slice(0, 3900);
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function sanitizeTelegramHtml(value) {
+  return escapeHtml(value)
+    .replace(/&lt;b&gt;/g, "<b>")
+    .replace(/&lt;\/b&gt;/g, "</b>");
+}
+
+async function sendMessage(env, chatId, text, options = {}) {
+  const clean = options.parseMode === "HTML"
+    ? sanitizeTelegramHtml(text).slice(0, 3900)
+    : stripMarkdown(text).slice(0, 3900);
+  const body = { chat_id: chatId, text: clean };
+  if (options.parseMode === "HTML") body.parse_mode = "HTML";
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text: clean }),
+    body: JSON.stringify(body),
   });
+}
+
+async function sendDocument(env, chatId, document, caption = "") {
+  const body = {
+    chat_id: chatId,
+    document,
+    caption: String(caption || "").slice(0, 1000),
+    parse_mode: "HTML",
+  };
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendDocument`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok === false) throw new Error(data.description || `sendDocument failed: ${res.status}`);
+  return data;
 }
 
 function stripMarkdown(text) {
