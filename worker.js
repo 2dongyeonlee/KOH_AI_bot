@@ -23,6 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
+const BUILD_VERSION = "koh-save-debug-20260607-1305";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -323,28 +324,38 @@ async function getAllRooms(env) {
 
 // ── D1 (Cloudflare SQLite) ────────────────────────────────────
 // 방 대화 저장 (권오혁봇이 방에 있으면 담당)
-async function dbInsert(env, { roomId, roomTitle, senderId, senderName, content, savedBy, telegramMessageId = "", sourceType = "" }) {
+async function dbInsert(env, { roomId, roomTitle, senderId, senderName, content, savedBy, telegramMessageId = "", sourceType = "" }, options = {}) {
   if (!env.DB || !content?.trim()) return false;
   try {
-    await env.DB.prepare(
-      `INSERT INTO messages
-         (telegram_message_id, room_id, room_title, sender_id, sender_name, content, saved_by, source_type)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-      .bind(
-        String(telegramMessageId || ""),
-        String(roomId),
-        roomTitle || "",
-        String(senderId),
-        senderName || "",
-        content.slice(0, 4000),
-        savedBy || "koh",
-        sourceType || "telegram_group"
-      )
+    const table = await env.DB.prepare(`PRAGMA table_info(messages)`).all();
+    const existing = new Set((table.results || []).map((c) => c.name));
+    if (!existing.has("room_id") || !existing.has("content")) {
+      throw new Error(`messages schema missing required columns: ${[...existing].join(",")}`);
+    }
+    const values = {
+      telegram_message_id: String(telegramMessageId || ""),
+      room_id: String(roomId),
+      room_title: roomTitle || "",
+      sender_id: String(senderId || ""),
+      sender_name: senderName || "",
+      content: content.slice(0, 4000),
+      saved_by: savedBy || "koh",
+      source_type: sourceType || "telegram_group",
+    };
+    const columns = Object.keys(values).filter((name) => existing.has(name));
+    const placeholders = columns.map(() => "?").join(", ");
+    await env.DB.prepare(`INSERT INTO messages (${columns.join(", ")}) VALUES (${placeholders})`)
+      .bind(...columns.map((name) => values[name]))
       .run();
+    console.log("message saved", {
+      room_title: values.room_title,
+      sender_name: values.sender_name,
+      source_type: values.source_type,
+    });
     return true;
   } catch (e) {
     console.error("dbInsert:", e);
+    if (options.throwOnError) throw e;
     return false;
   }
 }
@@ -962,12 +973,36 @@ async function handleSqlCommand(env, message, text, chatId) {
   return false;
 }
 
+async function handleDebugEnv(env, chatId) {
+  await sendMessage(env, chatId, `BUILD_VERSION: ${BUILD_VERSION}\nDB binding: ${env.DB ? "있음" : "없음"}`);
+}
+
+async function handleDebugSave(env, message, chatId) {
+  try {
+    await dbInsert(env, {
+      roomId: message.chat.id,
+      roomTitle: getRoomTitleForMessage(message),
+      senderId: message.from?.id || "",
+      senderName: getSenderName(message.from),
+      content: `[debug_save] ${BUILD_VERSION}`,
+      savedBy: BOT_KEY,
+      telegramMessageId: `debug_${Date.now()}`,
+      sourceType: getSourceTypeForMessage(message),
+    }, { throwOnError: true });
+    await sendMessage(env, chatId, "debug save 성공");
+  } catch (e) {
+    await sendMessage(env, chatId, `debug save 실패\n${String(e?.stack || e?.message || e).slice(0, 1500)}`);
+  }
+}
+
 function getHelpText() {
   return [
     "사용 가능 명령",
     "/db_status - D1 저장 상태 확인",
     "/rooms - 등록된 방 목록 확인",
     "/files - 최근 저장 파일 확인",
+    "/debug_save - messages 직접 저장 테스트",
+    "/debug_env - Worker 버전 확인",
     "/users - 등록 사용자 목록 확인",
     "/search_status - 외부검색 설정 확인",
     "/web_test 검색어 - Tavily 검색 테스트",
@@ -979,6 +1014,14 @@ async function routeSlashCommand(env, message, text, chatId) {
   if (!t.startsWith("/")) return false;
   if (/^\/등록\b/.test(t)) {
     await handleRegisterCommand(env, chatId, message.from);
+    return true;
+  }
+  if (/^\/debug_env\b/.test(t)) {
+    await handleDebugEnv(env, chatId);
+    return true;
+  }
+  if (/^\/debug_save\b/.test(t)) {
+    await handleDebugSave(env, message, chatId);
     return true;
   }
   if (isDbStatusCommand(t)) {
@@ -1945,6 +1988,14 @@ async function persistIncomingMessage(env, message) {
     sourceType: getSourceTypeForMessage(message),
   });
   message._persisted = saved;
+  if (!saved) {
+    console.error("persistIncomingMessage failed", {
+      room_title: getRoomTitleForMessage(message),
+      sender_name: getSenderName(message.from),
+      source_type: getSourceTypeForMessage(message),
+      message_id: message.message_id || "",
+    });
+  }
 }
 
 function getDocumentFileType(fileName, mimeType) {
