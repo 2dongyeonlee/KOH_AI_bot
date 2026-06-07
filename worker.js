@@ -1384,6 +1384,17 @@ function formatShortDate(value) {
   return m ? `${m[1]}/${m[2]}` : "";
 }
 
+function normalizeRoomTitle(row, titleKey = "room_title", joinedKey = "joined_room_title") {
+  const roomId = Number(row?.room_id);
+  const joined = String(row?.[joinedKey] || "").trim();
+  const own = String(row?.[titleKey] || "").trim();
+  if (Number.isFinite(roomId) && roomId > 0) return "1:1";
+  if (Number.isFinite(roomId) && roomId < 0) {
+    return joined || (own && own !== "1:1" ? own : "unknown_group");
+  }
+  return joined || own || "미상";
+}
+
 function hasGeneratedSummary(summary) {
   const s = String(summary || "").trim();
   return !!s && !/요약 미생성/.test(s);
@@ -1411,7 +1422,16 @@ async function handleFilesCommand(env, chatId) {
   }
   try {
     const orderColumn = await columnExists(env, "files", "created_at") ? "created_at" : "id";
-    const result = await env.DB.prepare(`SELECT * FROM files ORDER BY ${orderColumn} DESC LIMIT 50`).all();
+    const hasRooms = await tableExists(env, "rooms");
+    const result = hasRooms
+      ? await env.DB.prepare(`
+        SELECT f.*, r.room_title AS joined_room_title
+        FROM files f
+        LEFT JOIN rooms r ON r.room_id = f.room_id
+        ORDER BY f.${orderColumn} DESC
+        LIMIT 50
+      `).all()
+      : await env.DB.prepare(`SELECT * FROM files ORDER BY ${orderColumn} DESC LIMIT 50`).all();
     const rawRows = result.results || [];
     const byKey = new Map();
     for (const row of rawRows) {
@@ -1427,6 +1447,7 @@ async function handleFilesCommand(env, chatId) {
     }
     const lines = rows.map((f, idx) => {
       const fileName = f.file_name || "파일명 없음";
+      f.room_title = normalizeRoomTitle(f);
       const roomTitle = f.room_title || "미상";
       const summary = hasGeneratedSummary(f.summary)
         ? String(f.summary || "").replace(/\s+/g, " ").slice(0, 140)
@@ -1759,6 +1780,8 @@ function buildSourceCorpus(rows) {
       r.type === "memory" ? "축적 기억" : "자료";
     const extra = r.file_name ? ` / 파일명: ${r.file_name}` : r.title ? ` / 제목: ${r.title}` : "";
     return `[${idx + 1}] ${typeLabel}
+room_id: ${r.room_id || ""}
+source_type: ${r.source_type || ""}
 출처: ${r.source || "출처 미상"} / ${r.actor || "작성자 미상"} / ${r.created_at || "시간 미상"}${extra}
 내용:
 ${String(r.text || "").slice(0, 1200)}`;
@@ -1848,11 +1871,13 @@ function isRoomSearchQuery(text) {
 function isDigestQuery(text) {
   const t = String(text || "").replace(/\s+/g, " ").trim();
   const hasDigestVerb = /(요약|정리|브리핑|공유|알려줘|뽑아줘|추려줘|보고|리캡|recap|digest)/i.test(t);
-  const hasDigestObject = /(확인해야\s*할\s*안건|확인해야할\s*안건|봐야\s*할\s*것|주요\s*안건|주요\s*내용|보고내용|올라온\s*내용|단체방|단톡방|각종\s*방|각\s*방|방들|대화\s*내용|공유된\s*내용|오늘\s*내용|이번주\s*내용|최근\s*내용|회의체\s*이슈|자료\s*요약)/.test(t);
+  const hasDigestObject = /(확인해야\s*할\s*안건|확인해야할\s*안건|봐야\s*할\s*것|주요\s*안건|주요\s*내용|프로젝트별|프로젝트\s*안건|보고내용|올라온\s*내용|내가\s*포함된\s*방|단체방|단톡방|각종\s*방|각\s*방|방들|대화\s*내용|공유된\s*내용|공유자료|공유\s*자료|오늘\s*내용|이번주\s*내용|지난주\s*내용|최근\s*내용|회의체\s*이슈|자료\s*요약)/.test(t);
   const directPatterns =
     /^(내용|자료)\s*(요약|정리)해줘?$/.test(t) ||
     /회의체\s*이슈.{0,20}(알려줘|정리|요약)/.test(t) ||
-    /(오늘|어제오늘|이번주|최근).{0,20}(요약|정리|브리핑|공유|알려줘|뽑아줘|추려줘)/.test(t) ||
+    /(오늘|어제오늘|이번주|지난주|최근).{0,30}(요약|정리|브리핑|공유|알려줘|뽑아줘|추려줘)/.test(t) ||
+    /(내가\s*포함된\s*방|방들|단체방).{0,40}(공유|내용|자료|프로젝트|안건).{0,30}(요약|정리)/.test(t) ||
+    /(프로젝트별|프로젝트\s*별).{0,30}(요약|정리)/.test(t) ||
     /(확인해야\s*할\s*안건|확인해야할\s*안건).{0,20}(공유|알려줘|정리|요약)/.test(t) ||
     /(단체방|단톡방|각종\s*방|방들).{0,30}(올라온|나온|공유된).{0,20}(내용|안건|자료|보고)/.test(t);
   return directPatterns || (hasDigestVerb && hasDigestObject);
@@ -1863,8 +1888,9 @@ function parseDigestRange(text) {
   if (/어제오늘|어제\s*오늘/.test(t)) return { label: "어제오늘", days: 2 };
   if (/오늘|금일/.test(t)) return { label: "오늘", days: 1 };
   if (/이번\s*주|이번주|주간/.test(t)) return { label: "이번주", days: 7 };
-  if (/최근|요즘/.test(t)) return { label: "최근 7일", days: 7 };
-  return { label: "최근 7일", days: 7 };
+  if (/지난\s*주|지난주/.test(t)) return { label: "지난주", days: 14 };
+  if (/최근|요즘/.test(t)) return { label: "최근 14일", days: 14 };
+  return { label: "최근 14일", days: 14 };
 }
 
 async function getKnownRoomsText(env) {
@@ -1891,38 +1917,108 @@ async function fetchDigestRows(env, days = 2, limit = 120) {
   try {
     const messageLimit = Math.min(limit, 80);
     const fileLimit = 30;
+    const fileDays = Math.max(Number(days) || 14, 30);
+    const hasRooms = await tableExists(env, "rooms");
+    const roomJoin = hasRooms ? "LEFT JOIN rooms r ON r.room_id = m.room_id" : "";
+    const fileRoomJoin = hasRooms ? "LEFT JOIN rooms r ON r.room_id = f.room_id" : "";
+    const messageSourceExpr = hasRooms
+      ? `COALESCE(
+          CASE WHEN CAST(m.room_id AS INTEGER) > 0 THEN '1:1' END,
+          CASE WHEN CAST(m.room_id AS INTEGER) < 0 THEN COALESCE(r.room_title, NULLIF(m.room_title, '1:1'), 'unknown_group') END,
+          r.room_title,
+          m.room_title,
+          'unknown_group'
+        )`
+      : `COALESCE(
+          CASE WHEN CAST(m.room_id AS INTEGER) > 0 THEN '1:1' END,
+          CASE WHEN CAST(m.room_id AS INTEGER) < 0 THEN NULLIF(m.room_title, '1:1') END,
+          m.room_title,
+          'unknown_group'
+        )`;
+    const fileSourceExpr = hasRooms
+      ? `COALESCE(
+          CASE WHEN CAST(f.room_id AS INTEGER) > 0 THEN '1:1' END,
+          CASE WHEN CAST(f.room_id AS INTEGER) < 0 THEN COALESCE(r.room_title, NULLIF(f.room_title, '1:1'), 'unknown_group') END,
+          r.room_title,
+          f.room_title,
+          'unknown_group'
+        )`
+      : `COALESCE(
+          CASE WHEN CAST(f.room_id AS INTEGER) > 0 THEN '1:1' END,
+          CASE WHEN CAST(f.room_id AS INTEGER) < 0 THEN NULLIF(f.room_title, '1:1') END,
+          f.room_title,
+          'unknown_group'
+        )`;
     const messages = await env.DB.prepare(`
-      SELECT 'message' AS type, room_title AS source, sender_name AS actor, content AS text, created_at, NULL AS file_name, NULL AS title
-      FROM messages
-      WHERE datetime(created_at) >= datetime('now', ?)
-      ORDER BY created_at DESC
+      SELECT
+        'message' AS type,
+        m.room_id,
+        m.source_type,
+        ${messageSourceExpr} AS source,
+        m.sender_name AS actor,
+        m.content AS text,
+        m.created_at,
+        NULL AS file_name,
+        NULL AS title
+      FROM messages m
+      ${roomJoin}
+      WHERE datetime(m.created_at) >= datetime('now', ?)
+      ORDER BY m.created_at DESC
       LIMIT ?
     `).bind(`-${days} days`, messageLimit).all();
     const files = (await tableExists(env, "files")) ? await env.DB.prepare(`
-      SELECT 'file' AS type, COALESCE(room_title, '') AS source, COALESCE(uploader_name, sender_name) AS actor,
-             COALESCE(summary, extracted_text, file_name) AS text, created_at, file_name, NULL AS title
-      FROM files
-      WHERE datetime(created_at) >= datetime('now', ?)
-      ORDER BY created_at DESC
+      SELECT
+        'file' AS type,
+        f.room_id,
+        'telegram_file' AS source_type,
+        ${fileSourceExpr} AS source,
+        COALESCE(f.uploader_name, f.sender_name, 'unknown') AS actor,
+        COALESCE(f.summary, f.extracted_text, f.file_name) AS text,
+        f.created_at,
+        f.file_name,
+        NULL AS title
+      FROM files f
+      ${fileRoomJoin}
+      WHERE datetime(f.created_at) >= datetime('now', ?)
+      ORDER BY f.created_at DESC
       LIMIT ?
-    `).bind(`-${days} days`, fileLimit).all() : { results: [] };
+    `).bind(`-${fileDays} days`, fileLimit).all() : { results: [] };
     let rows = [
       ...(messages.results || []),
       ...(files.results || []),
     ];
-    if (!rows.length && days < 7) return await fetchDigestRows(env, 7, limit);
+    if (!rows.length && days < 14) return await fetchDigestRows(env, 14, limit);
     if (!rows.length) {
       const recentMessages = await env.DB.prepare(`
-        SELECT 'message' AS type, room_title AS source, sender_name AS actor, content AS text, created_at, NULL AS file_name, NULL AS title
-        FROM messages
-        ORDER BY created_at DESC
+        SELECT
+          'message' AS type,
+          m.room_id,
+          m.source_type,
+          ${messageSourceExpr} AS source,
+          m.sender_name AS actor,
+          m.content AS text,
+          m.created_at,
+          NULL AS file_name,
+          NULL AS title
+        FROM messages m
+        ${roomJoin}
+        ORDER BY m.created_at DESC
         LIMIT ?
       `).bind(messageLimit).all();
       const recentFiles = (await tableExists(env, "files")) ? await env.DB.prepare(`
-        SELECT 'file' AS type, COALESCE(room_title, '') AS source, COALESCE(uploader_name, sender_name) AS actor,
-               COALESCE(summary, extracted_text, file_name) AS text, created_at, file_name, NULL AS title
-        FROM files
-        ORDER BY created_at DESC
+        SELECT
+          'file' AS type,
+          f.room_id,
+          'telegram_file' AS source_type,
+          ${fileSourceExpr} AS source,
+          COALESCE(f.uploader_name, f.sender_name, 'unknown') AS actor,
+          COALESCE(f.summary, f.extracted_text, f.file_name) AS text,
+          f.created_at,
+          f.file_name,
+          NULL AS title
+        FROM files f
+        ${fileRoomJoin}
+        ORDER BY f.created_at DESC
         LIMIT ?
       `).bind(fileLimit).all() : { results: [] };
       rows = [...(recentMessages.results || []), ...(recentFiles.results || [])];
@@ -1946,6 +2042,8 @@ function buildDigestCorpus(rows) {
       r.type === "memory" ? "축적 기억" : "자료";
     const extra = r.file_name ? ` / 파일명: ${r.file_name}` : r.title ? ` / 제목: ${r.title}` : "";
     return `[${idx + 1}] ${typeLabel}
+room_id: ${r.room_id || ""}
+source_type: ${r.source_type || ""}
 출처: [${r.source || "출처 미상"}] ${r.actor || "작성자 미상"} (${r.created_at || "시간 미상"})${extra}
 내용:
 ${String(r.text || "").slice(0, 700)}`;
@@ -1963,6 +2061,7 @@ async function answerDigest(env, userText, userId) {
     `[요청]\n${userText}\n\n` +
     `[요약 범위]\n${range.label}\n\n` +
     `[내부 기록]\n${buildDigestCorpus(rows)}\n\n` +
+    `아래는 사용자가 포함된 Telegram 방과 1:1에서 수집된 최근 업무 기록이다. 프로젝트/안건 단위로 묶어 요약하라. 단순 나열하지 말고 유사 주제를 병합하라. 각 안건마다 출처 방, 공유자, 일자를 표시하라. 없는 내용은 추정하지 말라.\n\n` +
     `[작성 지침]\n` +
     `너는 ${BOT_OWNER_NAME}의 개인 업무 비서 AI OS입니다.\n` +
     `아래 기록은 이 봇이 직접 들어가 있는 텔레그램 방, 1:1 대화, 파일, 회의록에서 수집한 내용입니다.\n` +
@@ -2419,13 +2518,13 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
   }
 
   // 봇이 들어간 방 목록
-  if (isRoomListQuery(text)) {
+  if (isRoomListQuery(text) && !isDigestQuery(text)) {
     const rooms = await dbGetAllRooms(env);
     if (rooms.length === 0) {
       await sendMessage(
         env,
         chatId,
-        "현재 등록된 단체방이 없습니다.\n봇을 단체방에 추가하면 자동으로 등록됩니다."
+        "등록된 방 없음."
       );
       return;
     }
