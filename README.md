@@ -75,3 +75,8 @@ Telegram에서 확인:
 ```text
 1:1 또는 단체방에 PDF 업로드 후 /db_status, /files 실행
 ```
+
+deploy trigger: 2026-06-07
+
+Commit changes
+→ Commit directly to claude/ecstatic-carson-CVsrs
