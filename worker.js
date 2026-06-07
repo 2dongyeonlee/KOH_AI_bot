@@ -23,9 +23,6 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const OWNER_ALIASES = ["권오혁", "오혁", "권 담당", "권오혁 담당", "권오혁 담당님", "권 담당님"];
-const OWNER_AUTO_CONFIRM_SCORE = 90;
-const OWNER_REVIEW_SCORE = 60;
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -55,6 +52,24 @@ function getMessageTextForStorage(message) {
   const rawText = message?.text || message?.caption || "";
   const forwardLabel = getForwardLabel(message || {});
   return forwardLabel && rawText ? `[${forwardLabel}]\n${rawText}` : rawText;
+}
+
+function isPrivateChat(chat) {
+  return chat?.type === "private";
+}
+
+function isGroupChat(chat) {
+  return chat?.type === "group" || chat?.type === "supergroup";
+}
+
+function getRoomTitleForMessage(message) {
+  return isPrivateChat(message?.chat)
+    ? "1:1"
+    : (message?.chat?.title || message?.chat?.username || String(message?.chat?.id || ""));
+}
+
+function getSourceTypeForMessage(message) {
+  return isPrivateChat(message?.chat) ? "telegram_private" : "telegram_group";
 }
 
 function getBotUsernames(env) {
@@ -118,331 +133,19 @@ async function maybeUpdateUserDisplayNameFromBareName(env, message) {
 }
 
 function isRegisterCommand(text) {
-  return /^\/등록\b/.test(String(text || "").trim());
-}
-
-async function handleRegisterCommand(env, chatId, from) {
-  await upsertUser(env, from, chatId, "manual_register");
-  await sendMessage(env, chatId, `${getSenderName(from)}님으로 자동 등록되어 있습니다.\n텔레그램 ID: ${from.id}`);
-}
-
-function parseOwnerConfirmCommand(text) {
-  const m = String(text || "").trim().match(/^\/owner_confirm\s+(\d+)/);
-  return m ? m[1] : null;
-}
-
-function parseOwnerRejectCommand(text) {
-  const m = String(text || "").trim().match(/^\/owner_reject\s+(\d+)/);
-  return m ? m[1] : null;
-}
-
-function isOwnerStatusQuery(text) {
-  return /(주인|owner).{0,10}(상태|등록|확인|누구|뭐야|알려)|누구\s*봇|누구의\s*비서|담당자.{0,10}(누구|뭐야|알려)/i.test(text || "");
-}
-
-async function handleLongSharedContent(env, chatId, message) {
-  await maybeLearnFromMessage(env, message);
-  await sendMessage(
-    env,
-    chatId,
-    "공유해주신 내용을 주요 업무 참고자료로 저장해두겠습니다.\n나중에 관련 안건을 물어보시면 출처와 함께 다시 정리해드릴 수 있습니다."
-  );
-}
-
-function normalizeKoreanText(text) {
-  return String(text || "")
-    .replace(/\s+/g, "")
-    .replace(/[()\/\-_. ,:;~!@#$%^&*+=?]/g, "")
-    .toLowerCase();
-}
-
-function includesOwnerAlias(text) {
-  const normalized = normalizeKoreanText(text);
-  return OWNER_ALIASES.some((alias) => normalized.includes(normalizeKoreanText(alias)));
-}
-
-async function getStoredOwnerTelegramId(env) {
-  if (!env.DB) return "";
-  try {
-    const row = await env.DB.prepare(`
-      SELECT profile_value
-      FROM memory_profile
-      WHERE profile_key = 'bot_owner_telegram_id'
-      LIMIT 1
-    `).first();
-    return row?.profile_value ? String(row.profile_value) : "";
-  } catch (e) {
-    console.error("getStoredOwnerTelegramId:", e);
-    return "";
-  }
-}
-
-async function getOwnerTelegramId(env) {
-  const fromEnv = String(env.BOT_OWNER_TELEGRAM_ID || "").trim();
-  if (fromEnv) return fromEnv;
-  return await getStoredOwnerTelegramId(env);
-}
-
-async function isBotOwner(env, from) {
-  if (!from?.id) return false;
-  const ownerId = await getOwnerTelegramId(env);
-  return !!ownerId && String(from.id) === String(ownerId);
-}
-
-async function ensureOwnerProfile(env) {
-  if (!env.DB) return;
-  try {
-    await env.DB.prepare(`
-      INSERT INTO memory_profile (profile_key, profile_value, evidence, confidence)
-      VALUES ('bot_owner_name', ?, ?, 5)
-      ON CONFLICT(profile_key) DO UPDATE SET
-        profile_value = excluded.profile_value,
-        evidence = excluded.evidence,
-        confidence = 5,
-        updated_at = CURRENT_TIMESTAMP
-    `).bind(BOT_OWNER_NAME, "코드 상수 BOT_OWNER_NAME").run();
-    await env.DB.prepare(`
-      INSERT INTO memory_profile (profile_key, profile_value, evidence, confidence)
-      VALUES ('bot_owner_role', ?, ?, 5)
-      ON CONFLICT(profile_key) DO UPDATE SET
-        profile_value = excluded.profile_value,
-        evidence = excluded.evidence,
-        confidence = 5,
-        updated_at = CURRENT_TIMESTAMP
-    `).bind(BOT_OWNER_ROLE, "코드 상수 BOT_OWNER_ROLE").run();
-  } catch (e) {
-    console.error("ensureOwnerProfile:", e);
-  }
-}
-
-function getOwnerCandidateScore(message) {
-  const from = message?.from || {};
-  const text = message?.text || message?.caption || "";
-  const firstName = from.first_name || "";
-  const lastName = from.last_name || "";
-  const username = from.username || "";
-  const fullName = [firstName, lastName].filter(Boolean).join("");
-  const displayName = [firstName, lastName].filter(Boolean).join(" ").trim();
-  let score = 0;
-  const evidence = [];
-
-  if (normalizeKoreanText(fullName) === normalizeKoreanText(BOT_OWNER_NAME)) {
-    score += 60;
-    evidence.push("telegram_name_exact_owner");
-  } else if (includesOwnerAlias(fullName) || includesOwnerAlias(displayName)) {
-    score += 45;
-    evidence.push("telegram_name_contains_owner_alias");
-  }
-  if (includesOwnerAlias(username)) {
-    score += 20;
-    evidence.push("username_contains_owner_alias");
-  }
-  if (includesOwnerAlias(text)) {
-    score += 25;
-    evidence.push("message_contains_owner_alias");
-  }
-  if (/(6R전략담당|6R전략|담당\s*\/\s*권오혁|권오혁\s*담당)/.test(text)) {
-    score += 35;
-    evidence.push("message_contains_owner_role");
-  }
-  if (message?.chat?.type === "private") {
-    score += 20;
-    evidence.push("private_dm_to_bot");
-  }
-  return {
-    score,
-    evidence,
-    displayName: displayName || username || String(from.id || ""),
-    username,
-  };
-}
-
-async function upsertOwnerCandidate(env, message) {
-  if (!env.DB || !message?.from?.id) return null;
-  if (await getOwnerTelegramId(env)) return null;
-  const { score, evidence, displayName, username } = getOwnerCandidateScore(message);
-  if (score <= 0) return null;
-  const telegramId = String(message.from.id);
-  const prev = await env.DB.prepare(`
-    SELECT score, evidence_json, status
-    FROM owner_candidates
-    WHERE telegram_id = ?
-  `).bind(telegramId).first();
-  let prevEvidence = [];
-  try {
-    prevEvidence = prev?.evidence_json ? JSON.parse(prev.evidence_json) : [];
-  } catch (_) {
-    prevEvidence = [];
-  }
-  const mergedEvidence = Array.from(new Set([...prevEvidence, ...evidence]));
-  const newScore = Math.min(100, Math.max(score, Number(prev?.score || 0) + Math.min(score, 30)));
-  const status =
-    newScore >= OWNER_AUTO_CONFIRM_SCORE ? "confirmed" :
-    newScore >= OWNER_REVIEW_SCORE ? "needs_review" : "candidate";
-
-  await env.DB.prepare(`
-    INSERT INTO owner_candidates
-      (telegram_id, name, username, score, evidence_json, status, updated_at)
-    VALUES
-      (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(telegram_id) DO UPDATE SET
-      name = excluded.name,
-      username = excluded.username,
-      score = excluded.score,
-      evidence_json = excluded.evidence_json,
-      status = excluded.status,
-      updated_at = CURRENT_TIMESTAMP
-  `).bind(
-    telegramId,
-    displayName,
-    username || "",
-    newScore,
-    JSON.stringify(mergedEvidence),
-    status
-  ).run();
-  return { telegramId, name: displayName, username, score: newScore, evidence: mergedEvidence, status };
-}
-
-async function confirmOwner(env, candidate, reason = "auto_confirm") {
-  if (!env.DB || !candidate?.telegramId) return;
-  if (await getOwnerTelegramId(env)) return;
-  await env.DB.prepare(`
-    INSERT INTO memory_profile (profile_key, profile_value, evidence, confidence)
-    VALUES ('bot_owner_telegram_id', ?, ?, 5)
-    ON CONFLICT(profile_key) DO UPDATE SET
-      profile_value = excluded.profile_value,
-      evidence = excluded.evidence,
-      confidence = 5,
-      updated_at = CURRENT_TIMESTAMP
-  `).bind(
-    String(candidate.telegramId),
-    `${reason}: ${candidate.name || ""} / evidence=${JSON.stringify(candidate.evidence || [])}`
-  ).run();
-  await env.DB.prepare(`
-    UPDATE owner_candidates
-    SET status = 'confirmed', updated_at = CURRENT_TIMESTAMP
-    WHERE telegram_id = ?
-  `).bind(String(candidate.telegramId)).run();
-  await ensureOwnerProfile(env);
-}
-
-async function notifyOwnerCandidateForReview(env, candidate) {
-  if (!env.DB || !env.ADMIN_TELEGRAM_ID || !candidate || candidate.status !== "needs_review") return;
-  const key = `owner_review_notified_${candidate.telegramId}`;
-  const already = await env.DB.prepare(`
-    SELECT profile_value
-    FROM memory_profile
-    WHERE profile_key = ?
-  `).bind(key).first();
-  if (already) return;
-  const msg =
-    `주인 후보 확인이 필요합니다.\n\n` +
-    `봇: ${BOT_OWNER_NAME}봇\n` +
-    `후보: ${candidate.name || "이름 없음"}\n` +
-    `Telegram ID: ${candidate.telegramId}\n` +
-    `점수: ${candidate.score}\n` +
-    `근거: ${(candidate.evidence || []).join(", ")}\n\n` +
-    `맞으면 다음 명령을 보내세요.\n` +
-    `/owner_confirm ${candidate.telegramId}\n\n` +
-    `아니면 다음 명령을 보내세요.\n` +
-    `/owner_reject ${candidate.telegramId}`;
-  await sendMessage(env, env.ADMIN_TELEGRAM_ID, msg);
-  await env.DB.prepare(`
-    INSERT INTO memory_profile (profile_key, profile_value, evidence, confidence)
-    VALUES (?, '1', ?, 5)
-  `).bind(key, "owner candidate review notification sent").run();
-}
-
-async function maybeDetectBotOwner(env, message) {
-  try {
-    if (await getOwnerTelegramId(env)) return;
-    const candidate = await upsertOwnerCandidate(env, message);
-    if (!candidate) return;
-    if (candidate.status === "confirmed") {
-      await confirmOwner(env, candidate, "auto_high_confidence");
-      return;
-    }
-    if (candidate.status === "needs_review") {
-      await notifyOwnerCandidateForReview(env, candidate);
-    }
-  } catch (e) {
-    console.error("maybeDetectBotOwner:", e);
-  }
-}
-
-async function handleOwnerConfirmReject(env, chatId, from, text) {
-  if (!env.DB) return false;
-  const isAdmin = String(from?.id || "") === String(env.ADMIN_TELEGRAM_ID || "");
-  if (!isAdmin) return false;
-
-  const confirmId = parseOwnerConfirmCommand(text);
-  if (confirmId) {
-    const candidate = await env.DB.prepare(`
-      SELECT telegram_id, name, username, score, evidence_json
-      FROM owner_candidates
-      WHERE telegram_id = ?
-    `).bind(confirmId).first();
-    if (!candidate) {
-      await sendMessage(env, chatId, "해당 owner 후보를 찾지 못했습니다.");
-      return true;
-    }
-    let evidence = [];
-    try {
-      evidence = candidate.evidence_json ? JSON.parse(candidate.evidence_json) : [];
-    } catch (_) {}
-    await confirmOwner(env, {
-      telegramId: candidate.telegram_id,
-      name: candidate.name,
-      username: candidate.username,
-      score: candidate.score,
-      evidence,
-    }, "manual_admin_confirm");
-    await sendMessage(env, chatId, `${BOT_OWNER_NAME}봇 주인을 확정했습니다.\nTelegram ID: ${confirmId}`);
-    return true;
-  }
-
-  const rejectId = parseOwnerRejectCommand(text);
-  if (rejectId) {
-    await env.DB.prepare(`
-      UPDATE owner_candidates
-      SET status = 'rejected', updated_at = CURRENT_TIMESTAMP
-      WHERE telegram_id = ?
-    `).bind(rejectId).run();
-    await sendMessage(env, chatId, `owner 후보를 제외했습니다.\nTelegram ID: ${rejectId}`);
-    return true;
-  }
   return false;
 }
 
-async function handleOwnerStatus(env, chatId) {
-  const ownerId = await getOwnerTelegramId(env);
-  if (ownerId) {
-    await sendMessage(
-      env,
-      chatId,
-      `이 봇은 ${BOT_OWNER_NAME}님의 개인 업무 비서입니다.\n역할 기준: ${BOT_OWNER_ROLE}\nOwner Telegram ID: ${ownerId}\n사용 DB: ${BOT_DB_NAME}`
-    );
-    return;
-  }
-  const candidates = await env.DB.prepare(`
-    SELECT telegram_id, name, username, score, status, evidence_json
-    FROM owner_candidates
-    ORDER BY score DESC, updated_at DESC
-    LIMIT 5
-  `).all();
-  const rows = candidates.results || [];
-  if (!rows.length) {
-    await sendMessage(
-      env,
-      chatId,
-      `아직 ${BOT_OWNER_NAME}님으로 확정된 owner가 없습니다.\n후보도 없습니다.\n권오혁님이 이 봇에 1:1 메시지를 보내거나 단체방에서 발화하면 자동 후보로 잡힙니다.`
-    );
-    return;
-  }
-  const lines = rows.map((c, idx) =>
-    `${idx + 1}. ${c.name || "이름 없음"} / ID: ${c.telegram_id} / 점수: ${c.score} / 상태: ${c.status}`
+async function handleRegisterCommand(env, chatId, from) {
+  await sendMessage(env, chatId, "등록 절차 없음. 메시지는 자동 저장됨.");
+}
+
+async function handleLongSharedContent(env, chatId, message) {
+  await sendMessage(
+    env,
+    chatId,
+    "핵심: 공유 내용 저장됨.\n확인: 필요 시 요약 요청 가능."
   );
-  await sendMessage(env, chatId, `아직 owner가 확정되지 않았습니다.\n\nowner 후보:\n${lines.join("\n")}`);
 }
 
 async function upsertUser(env, from, chatId, source = "auto_message") {
@@ -477,9 +180,9 @@ async function upsertUser(env, from, chatId, source = "auto_message") {
 }
 
 async function upsertRoom(env, chat) {
-  if (!env.DB || !chat?.id || chat.type === "private") return;
+  if (!env.DB || !chat?.id || !isGroupChat(chat)) return;
   try {
-    await dbRegisterRoom(env, chat.id, chat.title || chat.username || String(chat.id), BOT_KEY);
+    await dbRegisterRoom(env, chat.id, chat.title || chat.username || String(chat.id), BOT_KEY, chat.type);
   } catch (e) {
     console.error("upsertRoom:", e);
   }
@@ -517,39 +220,6 @@ async function handleNewChatMembers(env, message) {
     if (member.is_bot) continue;
     await upsertUser(env, member, member.id, "new_chat_member");
     await upsertRoomMember(env, message.chat, member, "new_chat_member");
-  }
-}
-
-function isImportantMemoryCandidate(text) {
-  return /(기억해|저장해|앞으로|선호|싫어|좋아|반복|원칙|성향|담당|결정|액션|마감|중요)/.test(text || "");
-}
-
-function detectMemorySubject(text, from) {
-  if (/(나|내|저는|나는|제)/.test(text || "")) return BOT_OWNER_NAME;
-  return getSenderName(from);
-}
-
-async function maybeLearnFromMessage(env, message) {
-  if (!env.DB || !message?.from || message.from.is_bot) return;
-  const text = message.text || message.caption || "";
-  if (!isImportantMemoryCandidate(text)) return;
-  try {
-    const chat = message.chat || {};
-    await env.DB.prepare(`
-      INSERT INTO learned_facts
-        (fact_type, subject, content, confidence, source_type, source_room, source_actor, source_time)
-      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    `).bind(
-      "message_signal",
-      detectMemorySubject(text, message.from),
-      text.slice(0, 1000),
-      /기억해|저장해/.test(text) ? 5 : 2,
-      chat.type === "private" ? "private" : "telegram_group",
-      chat.title || chat.username || String(chat.id || ""),
-      getSenderName(message.from)
-    ).run();
-  } catch (e) {
-    console.error("maybeLearnFromMessage:", e);
   }
 }
 
@@ -654,7 +324,7 @@ async function getAllRooms(env) {
 // ── D1 (Cloudflare SQLite) ────────────────────────────────────
 // 방 대화 저장 (권오혁봇이 방에 있으면 담당)
 async function dbInsert(env, { roomId, roomTitle, senderId, senderName, content, savedBy, telegramMessageId = "", sourceType = "" }) {
-  if (!env.DB || !content?.trim()) return;
+  if (!env.DB || !content?.trim()) return false;
   try {
     await env.DB.prepare(
       `INSERT INTO messages
@@ -672,8 +342,10 @@ async function dbInsert(env, { roomId, roomTitle, senderId, senderName, content,
         sourceType || "telegram_group"
       )
       .run();
+    return true;
   } catch (e) {
     console.error("dbInsert:", e);
+    return false;
   }
 }
 
@@ -716,13 +388,20 @@ async function dbRegisterKohInRoom(env, roomId) {
   }
 }
 
-async function dbRegisterRoom(env, roomId, roomTitle, botName) {
+async function dbRegisterRoom(env, roomId, roomTitle, botName, roomType = "group") {
   if (!env.DB) return;
   try {
     await env.DB.prepare(
-      `INSERT OR REPLACE INTO rooms (room_id, room_title, bot_name) VALUES (?, ?, ?)`
+      `INSERT INTO rooms (room_id, room_title, room_type, bot_name, source, last_seen_at)
+       VALUES (?, ?, ?, ?, 'telegram', CURRENT_TIMESTAMP)
+       ON CONFLICT(room_id) DO UPDATE SET
+         room_title = excluded.room_title,
+         room_type = excluded.room_type,
+         bot_name = excluded.bot_name,
+         source = excluded.source,
+         last_seen_at = CURRENT_TIMESTAMP`
     )
-      .bind(String(roomId), roomTitle || "", botName || "koh")
+      .bind(String(roomId), roomTitle || "", roomType || "group", botName || "koh")
       .run();
   } catch (e) {
     console.error("dbRegisterRoom:", e);
@@ -763,7 +442,7 @@ async function dbSearch(env, { roomTitle, keyword, days = 7 }) {
 }
 
 function isExternalSearchEnabled(env) {
-  return String(env.EXTERNAL_SEARCH_ENABLED || "").toLowerCase() === "true";
+  return String(env.EXTERNAL_SEARCH_ENABLED || "").trim().toLowerCase() === "true";
 }
 
 function hasTavilyConfig(env) {
@@ -992,9 +671,9 @@ async function answerExternalSearchNotConfigured(env, text) {
   const internalRows = await searchMemory(env, internalKeyword, 20);
   const internalCorpus = buildSourceCorpus(internalRows);
   if (internalRows.length) {
-    return `외부검색 미설정 상태라 내부 기록 기준으로만 확인했습니다.\n\n${internalCorpus.slice(0, 2500)}\n\n외부검색을 사용하려면 Cloudflare에 EXTERNAL_SEARCH_ENABLED=true와 TAVILY_API_KEY를 설정해야 합니다.`;
+    return `외부검색 미설정.\n\n핵심: 내부 D1 기록 기준으로만 확인함.\n확인: TAVILY_API_KEY, EXTERNAL_SEARCH_ENABLED 필요.\n\n${internalCorpus.slice(0, 1800)}`;
   }
-  return "외부검색 미설정 상태입니다.\n\n필요 설정:\n1. Cloudflare Secret TAVILY_API_KEY 등록\n2. EXTERNAL_SEARCH_ENABLED=true 설정\n\n현재는 내부 D1 기록만 검색할 수 있습니다.";
+  return "외부검색 미설정.\n핵심: 내부 D1 기록도 없음.\n확인: TAVILY_API_KEY, EXTERNAL_SEARCH_ENABLED 필요.";
 }
 
 async function answerWithExternalSearch(env, text, userId) {
@@ -1024,11 +703,7 @@ async function answerWithExternalSearch(env, text, userId) {
     ).join("\n\n");
     return sourceLines ? `${answer}\n\n참고자료\n${sourceLines}` : answer;
   } catch (error) {
-    return `뉴스검색 실패함\n\n` +
-      `- 검색어: ${searchQuery}\n` +
-      `- 원인 후보: Tavily API Key 미설정 또는 Worker Secret 미반영 가능성 있음\n` +
-      `- 확인 필요: /search_status, /web_test ${searchQuery} 실행 필요\n` +
-      `- 오류: ${String(error?.message || error)}`;
+    return `외부검색 실패.\n핵심: ${searchQuery} 검색 실패함.\n확인: /search_status, /web_test ${searchQuery} 필요.`;
   }
 }
 
@@ -1043,11 +718,11 @@ async function handleWebSearchTest(env, chatId, text) {
     return;
   }
   if (!isExternalSearchEnabled(env)) {
-    await sendMessage(env, chatId, "EXTERNAL_SEARCH_ENABLED가 true가 아닙니다.");
+    await sendMessage(env, chatId, `웹검색 비활성.\nEXTERNAL_SEARCH_ENABLED raw: ${String(env.EXTERNAL_SEARCH_ENABLED || "")}\nTAVILY_API_KEY: ${hasTavilyConfig(env) ? "있음" : "없음"}`);
     return;
   }
   if (!hasTavilyConfig(env)) {
-    await sendMessage(env, chatId, "TAVILY_API_KEY가 Worker Secret에 없습니다.");
+    await sendMessage(env, chatId, `웹검색 설정 누락.\nEXTERNAL_SEARCH_ENABLED raw: ${String(env.EXTERNAL_SEARCH_ENABLED || "")}\nTAVILY_API_KEY: 없음`);
     return;
   }
   try {
@@ -1063,15 +738,7 @@ async function handleWebSearchTest(env, chatId, text) {
     await sendMessage(env, chatId, `외부검색 테스트 결과\n검색어: ${query}\n\n${lines.join("\n\n")}`);
   } catch (error) {
     await sendMessage(env, chatId,
-      `Tavily 검색 오류\n\n` +
-      `검색어: ${query}\n` +
-      `오류: ${String(error?.message || error)}\n\n` +
-      `확인 필요\n` +
-      `- /search_status 실행\n` +
-      `- TAVILY_API_KEY 값 확인\n` +
-      `- Authorization: Bearer 형식 확인\n` +
-      `- Tavily credit 잔여량 확인\n` +
-      `- Worker 최신 배포 여부 확인`
+      `Tavily 검색 실패.\nEXTERNAL_SEARCH_ENABLED raw: ${String(env.EXTERNAL_SEARCH_ENABLED || "")}\nTAVILY_API_KEY: ${hasTavilyConfig(env) ? "있음" : "없음"}\nTavily 오류: ${String(error?.message || error).slice(0, 160)}`
     );
   }
 }
@@ -1086,14 +753,12 @@ async function handleSearchStatus(env, chatId) {
   const keyPrefix = hasKey ? String(env.TAVILY_API_KEY).slice(0, 8) + "..." : "없음";
   let msg =
     `외부검색 설정 상태\n\n` +
+    `EXTERNAL_SEARCH_ENABLED raw: ${String(env.EXTERNAL_SEARCH_ENABLED || "")}\n` +
     `EXTERNAL_SEARCH_ENABLED: ${enabled ? "true" : "false"}\n` +
-    `TAVILY_API_KEY: ${keyPrefix}\n`;
+    `TAVILY_API_KEY: ${hasKey ? "있음" : "없음"}\n`;
   if (!enabled || !hasKey) {
     msg +=
-      `\n조치 필요\n` +
-      `- Cloudflare Worker Variables에 EXTERNAL_SEARCH_ENABLED=true 설정\n` +
-      `- Secret으로 TAVILY_API_KEY 등록\n` +
-      `- 배포 후 /web_test 하이닉스 HBM 실행`;
+      `\n확인: Cloudflare Secret/Variable 설정 필요.`;
   }
   await sendMessage(env, chatId, msg);
 }
@@ -1185,12 +850,7 @@ async function handleDbStatusLegacy(env, chatId) {
     );
   } catch (error) {
     await sendMessage(env, chatId,
-      `D1 상태 확인 실패\n\n` +
-      `오류: ${String(error?.message || error)}\n\n` +
-      `확인 필요\n` +
-      `- wrangler.toml D1 binding이 DB인지 확인\n` +
-      `- migration 적용 여부 확인\n` +
-      `- 현재 Worker가 올바른 D1 database_id를 보는지 확인`
+      `D1 상태 확인 실패.\n핵심: ${String(error?.message || error)}`
     );
   }
 }
@@ -1201,7 +861,7 @@ async function handleDbStatus(env, chatId) {
     return;
   }
   try {
-    const tables = ["users", "rooms", "room_members", "messages", "files", "meetings", "memory_profile", "external_sources"];
+    const tables = ["users", "rooms", "room_members", "messages", "files", "external_sources"];
     const statuses = [];
     for (const tableName of tables) {
       const status = await safeCountTable(env, tableName);
@@ -1237,33 +897,18 @@ async function handleDbStatus(env, chatId) {
     );
   } catch (error) {
     await sendMessage(env, chatId,
-      `D1 상태 확인 실패\n\n` +
-      `오류: ${String(error?.message || error)}\n\n` +
-      `확인 필요\n` +
-      `- wrangler.toml D1 binding이 DB인지 확인\n` +
-      `- migration 적용 여부 확인\n` +
-      `- 현재 Worker가 올바른 D1 database_id를 보는지 확인\n` +
-      `- /db_status가 SQL executor로 흘러가지 않도록 routeSlashCommand 우선 처리 확인`
+      `D1 상태 확인 실패.\n핵심: ${String(error?.message || error)}\n확인: D1 binding/migration 필요.`
     );
   }
 }
 
 function isImageStatusCommand(text) {
-  return /^\/image_status\b/.test(String(text || "").trim());
+  return false;
 }
 
 async function handleImageStatus(env, chatId) {
   await sendMessage(env, chatId,
-    `이미지 분석 설정 상태\n\n` +
-    `TELEGRAM_BOT_TOKEN: ${env.TELEGRAM_BOT_TOKEN ? "있음" : "없음"}\n` +
-    `DIFY_API_KEY: ${env.DIFY_API_KEY ? "있음" : "없음"}\n` +
-    `GEMINI_API_KEY: ${env.GEMINI_API_KEY ? "있음" : "없음"}\n` +
-    `VISION_PROVIDER: ${env.VISION_PROVIDER || "미설정"}\n` +
-    `OPENAI_API_KEY: ${env.OPENAI_API_KEY ? "있음" : "없음"}\n\n` +
-    `확인 필요\n` +
-    `- Telegram getFile로 이미지 다운로드 가능한지 확인\n` +
-    `- Gemini 또는 VISION_PROVIDER=openai + OPENAI_API_KEY 설정 여부 확인\n` +
-    `- 이미지 분석 실패 시 구체 오류 메시지 확인`
+    `이미지 분석 비활성화됨.\n핵심: 파일 저장만 수행함.\n확인: 텍스트/문서 요약은 Dify 사용.`
   );
 }
 
@@ -1290,13 +935,13 @@ async function handleRoomList(env, chatId) {
     const result = await env.DB.prepare(roomSql).all();
     const rows = result.results || [];
     if (!rows.length) {
+      let note = "";
+      if (await tableExists(env, "messages")) {
+        const groupCount = await env.DB.prepare(`SELECT COUNT(*) AS count FROM messages WHERE source_type = 'telegram_group'`).first();
+        if (Number(groupCount?.count || 0) > 0) note = "\n확인: rooms 저장 실패 가능성.";
+      }
       await sendMessage(env, chatId,
-        `등록된 방 없음.\n\n` +
-        `가능한 원인\n` +
-        `- migration 미적용 (npx wrangler d1 execute 6r-ai-db --file=migrations/0004_personal_ai_os.sql --remote)\n` +
-        `- 봇이 방에 추가됐지만 my_chat_member update 미처리\n` +
-        `- messages에 단체방 기록 있으면 backfill SQL 실행 필요\n` +
-        `  INSERT OR IGNORE INTO rooms(room_id,room_title) SELECT DISTINCT room_id,room_title FROM messages WHERE room_id!=''`
+        `등록된 방 없음.\n핵심: rooms 저장 기록 없음.${note}`
       );
       return;
     }
@@ -1309,32 +954,12 @@ async function handleRoomList(env, chatId) {
   }
 }
 
-function isSqlCommand(text) {
-  return /^\/sql\s+/i.test(String(text || "").trim());
-}
-
 function isAdminUser(env, from) {
   return String(from?.id || "") === String(env.ADMIN_TELEGRAM_ID || "");
 }
 
 async function handleSqlCommand(env, message, text, chatId) {
-  if (!isSqlCommand(text)) return false;
-  if (!isAdminUser(env, message.from)) {
-    await sendMessage(env, chatId, "관리자만 SQL 진단 명령을 실행할 수 있음.");
-    return true;
-  }
-  const sql = String(text || "").replace(/^\/sql\s+/i, "").trim();
-  if (!/^(select|pragma)\b/i.test(sql)) {
-    await sendMessage(env, chatId, "안전상 SELECT/PRAGMA만 허용함.");
-    return true;
-  }
-  try {
-    const result = await env.DB.prepare(sql).all();
-    await sendMessage(env, chatId, JSON.stringify(result.results || [], null, 2).slice(0, 3000));
-  } catch (error) {
-    await sendMessage(env, chatId, `SQL 실행 실패함\n오류: ${String(error?.message || error)}`);
-  }
-  return true;
+  return false;
 }
 
 function getHelpText() {
@@ -1342,24 +967,30 @@ function getHelpText() {
     "사용 가능 명령",
     "/db_status - D1 저장 상태 확인",
     "/rooms - 등록된 방 목록 확인",
+    "/files - 최근 저장 파일 확인",
     "/users - 등록 사용자 목록 확인",
     "/search_status - 외부검색 설정 확인",
     "/web_test 검색어 - Tavily 검색 테스트",
-    "/image_status - 이미지 분석 설정 확인",
-    "/sql SELECT ... - 관리자 전용 SQL 진단",
   ].join("\n");
 }
 
 async function routeSlashCommand(env, message, text, chatId) {
   const t = String(text || "").trim();
   if (!t.startsWith("/")) return false;
-  if (await handleSqlCommand(env, message, t, chatId)) return true;
+  if (/^\/등록\b/.test(t)) {
+    await handleRegisterCommand(env, chatId, message.from);
+    return true;
+  }
   if (isDbStatusCommand(t)) {
     await handleDbStatus(env, chatId);
     return true;
   }
   if (/^\/rooms\b/.test(t) || isRoomListQuery(t)) {
     await handleRoomList(env, chatId);
+    return true;
+  }
+  if (/^\/files\b/.test(t)) {
+    await handleFilesCommand(env, chatId);
     return true;
   }
   if (/^\/users\b/.test(t) || isUserListQuery(t)) {
@@ -1372,10 +1003,6 @@ async function routeSlashCommand(env, message, text, chatId) {
   }
   if (isWebSearchTestCommand(t)) {
     await handleWebSearchTest(env, chatId, t);
-    return true;
-  }
-  if (isImageStatusCommand(t)) {
-    await handleImageStatus(env, chatId);
     return true;
   }
   if (/^\/help\b/.test(t)) {
@@ -1462,13 +1089,29 @@ async function dbSaveFile(env, data) {
       file_name: data.file_name || data.fileName || "",
       file_type: data.file_type || data.fileType || data.mimeType || "",
       mime_type: data.mime_type || data.mimeType || data.file_type || data.fileType || "",
-      extracted_text: String(data.extracted_text || data.content || "").slice(0, 50000),
+      file_size: Number(data.file_size || data.fileSize || 0) || 0,
+      extracted_text: String(data.extracted_text || "").slice(0, 50000),
       summary: String(data.summary || "").slice(0, 3000),
       tags_json: JSON.stringify(data.tags || []),
       saved_by: data.saved_by || data.savedBy || BOT_KEY,
     };
     const columns = Object.keys(values).filter((name) => existing.has(name));
     if (!columns.length) return;
+    const uniqueId = values.telegram_file_unique_id;
+    if (uniqueId && existing.has("telegram_file_unique_id")) {
+      const prev = await env.DB.prepare(`SELECT id FROM files WHERE telegram_file_unique_id = ? ORDER BY id DESC LIMIT 1`)
+        .bind(uniqueId)
+        .first();
+      if (prev?.id) {
+        const updateColumns = columns.filter((name) => name !== "telegram_file_unique_id" && name !== "telegram_file_id");
+        if (updateColumns.length) {
+          await env.DB.prepare(`UPDATE files SET ${updateColumns.map((name) => `${name} = ?`).join(", ")} WHERE id = ?`)
+            .bind(...updateColumns.map((name) => values[name]), prev.id)
+            .run();
+        }
+        return;
+      }
+    }
     const placeholders = columns.map(() => "?").join(", ");
     await env.DB.prepare(`INSERT INTO files (${columns.join(", ")}) VALUES (${placeholders})`)
       .bind(...columns.map((name) => values[name]))
@@ -1501,15 +1144,106 @@ async function dbSearchFiles(env, { roomTitle, keyword, days = 7 }) {
 
 async function fetchNewsRaw(env, keyword) {
   try {
-    const q = encodeURIComponent(keyword || "AI 산업");
-    const res = await fetch(`https://news.google.com/rss/search?q=${q}&hl=ko&gl=KR&ceid=KR:ko`);
-    const xml = await res.text();
-    const items = [...xml.matchAll(/<title>(.*?)<\/title>/g)]
-      .slice(1, 6)
-      .map((m) => m[1].replace(/<!\[CDATA\[|\]\]>/g, "").trim());
-    return items.length ? items.join("\n") : "(뉴스 없음)";
+    if (!isExternalSearchEnabled(env) || !hasTavilyConfig(env)) return "(외부검색 미설정)";
+    const results = await searchTavily(env, `${keyword || "AI 산업"} 뉴스`, { maxResults: 5, searchDepth: "basic" });
+    await saveExternalSearchResults(env, keyword || "AI 산업", results);
+    return results.length ? buildExternalCorpus(results) : "(뉴스 없음)";
   } catch (e) {
     return "(뉴스 조회 실패)";
+  }
+}
+
+function formatShortDate(value) {
+  const text = String(value || "");
+  const m = text.match(/^\d{4}-(\d{2})-(\d{2})/);
+  return m ? `${m[1]}/${m[2]}` : "";
+}
+
+function hasGeneratedSummary(summary) {
+  const s = String(summary || "").trim();
+  return !!s && !/요약 미생성/.test(s);
+}
+
+async function handleFilesCommand(env, chatId) {
+  if (!env.DB || !(await tableExists(env, "files"))) {
+    await sendMessage(env, chatId, "최근 저장 파일 0건임.");
+    return;
+  }
+  try {
+    const result = await env.DB.prepare(`
+      SELECT file_name, created_at, uploader_name, sender_name, room_title, summary
+      FROM files
+      ORDER BY created_at DESC
+      LIMIT 10
+    `).all();
+    const rows = result.results || [];
+    if (!rows.length) {
+      await sendMessage(env, chatId, "최근 저장 파일 0건임.");
+      return;
+    }
+    const lines = rows.map((f, idx) =>
+      `${idx + 1}. ${f.file_name || "파일명 없음"}\n` +
+      `* 일자: ${formatShortDate(f.created_at)}\n` +
+      `* 공유자: ${f.uploader_name || f.sender_name || "미상"}\n` +
+      `* 방: ${f.room_title || "미상"}\n` +
+      `* 상태: ${hasGeneratedSummary(f.summary) ? "요약 있음" : "요약 미생성"}`
+    );
+    await sendMessage(env, chatId, `최근 저장 파일 ${rows.length}건임.\n\n${lines.join("\n\n")}`);
+  } catch (e) {
+    console.error("handleFilesCommand:", e);
+    await sendMessage(env, chatId, "파일 목록 조회 실패함.");
+  }
+}
+
+function isFileSearchQuery(text) {
+  return /(자료|파일).{0,20}(어디|찾아|요약|정리|있지|있어)|지난번.{0,20}(자료|파일)|단체방.{0,20}(자료|파일).{0,20}(정리|요약)|그\s*자료\s*어디/i.test(String(text || ""));
+}
+
+async function answerFileSearch(env, text) {
+  if (!env.DB) return "찾은 자료 0건임.";
+  const keyword = extractSearchKeyword(text);
+  const like = `%${keyword}%`;
+  try {
+    const files = (await env.DB.prepare(`
+      SELECT 'file' AS type, file_name AS title, summary AS summary, room_title, COALESCE(uploader_name, sender_name) AS actor, created_at, file_name AS location
+      FROM files
+      WHERE file_name LIKE ? OR summary LIKE ?
+      ORDER BY created_at DESC
+      LIMIT 10
+    `).bind(like, like).all()).results || [];
+    const messages = (await env.DB.prepare(`
+      SELECT 'message' AS type, content AS title, content AS summary, room_title, sender_name AS actor, created_at, '' AS location
+      FROM messages
+      WHERE content LIKE ?
+      ORDER BY created_at DESC
+      LIMIT 10
+    `).bind(like).all()).results || [];
+    let external = [];
+    if (await tableExists(env, "external_sources")) {
+      external = (await env.DB.prepare(`
+        SELECT 'url' AS type, title, snippet AS summary, '' AS room_title, provider AS actor, fetched_at AS created_at, url AS location
+        FROM external_sources
+        WHERE title LIKE ? OR snippet LIKE ?
+        ORDER BY fetched_at DESC
+        LIMIT 10
+      `).bind(like, like).all()).results || [];
+    }
+    const rows = [...files, ...messages, ...external]
+      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+      .slice(0, 5);
+    if (!rows.length) return "찾은 자료 0건임.\n직접 매칭된 기록은 없음. 최근 7일 기록 기준으로 다시 확인함.";
+    const lines = rows.map((r, idx) =>
+      `${idx + 1}. ${String(r.title || "자료").slice(0, 60)}\n` +
+      `* 일자: ${formatShortDate(r.created_at)}\n` +
+      `* 공유자: ${r.actor || "미상"}\n` +
+      `* 방: ${r.room_title || "외부자료"}\n` +
+      `* 요약: ${String(r.summary || "요약 미생성임.").slice(0, 120)}\n` +
+      `* 위치: ${r.location || r.title || "messages"}`
+    );
+    return `찾은 자료 ${rows.length}건임.\n\n${lines.join("\n\n")}`;
+  } catch (e) {
+    console.error("answerFileSearch:", e);
+    return "자료 검색 실패함.";
   }
 }
 
@@ -1727,19 +1461,10 @@ async function searchMemory(env, keyword, limit = 30) {
       ORDER BY created_at DESC
       LIMIT ?
     `).bind(like, like, like, like, like, limit).all();
-    const facts = await env.DB.prepare(`
-      SELECT 'memory' AS type, COALESCE(source_room, subject, '') AS source, source_actor AS actor,
-             content AS text, created_at, NULL AS file_name, subject AS title
-      FROM learned_facts
-      WHERE subject LIKE ? OR content LIKE ?
-      ORDER BY created_at DESC
-      LIMIT ?
-    `).bind(like, like, limit).all();
     return [
       ...(messages.results || []),
       ...(files.results || []),
       ...(meetings.results || []),
-      ...(facts.results || []),
     ].sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, limit);
   } catch (e) {
     console.error("searchMemory:", e);
@@ -1796,34 +1521,7 @@ async function getRecentContext(env, chatId, limit = 12) {
 }
 
 async function getBotMemory(env, limit = 20) {
-  if (!env.DB) return "";
-  try {
-    const facts = await env.DB.prepare(`
-      SELECT fact_type, subject, content, confidence, source_room, source_actor, source_time
-      FROM learned_facts
-      ORDER BY created_at DESC
-      LIMIT ?
-    `).bind(limit).all();
-    const profiles = await env.DB.prepare(`
-      SELECT profile_key, profile_value, evidence, confidence
-      FROM memory_profile
-      ORDER BY updated_at DESC
-      LIMIT ?
-    `).bind(10).all();
-    const factText = (facts.results || []).map((f, idx) =>
-      `[기억 ${idx + 1}] 유형: ${f.fact_type} / 대상: ${f.subject || "미상"} / 신뢰도: ${f.confidence}
-내용: ${f.content}
-출처: ${f.source_room || "출처 미상"} / ${f.source_actor || "작성자 미상"} / ${f.source_time || "시간 미상"}`
-    ).join("\n\n");
-    const profileText = (profiles.results || []).map((p, idx) =>
-      `[프로필 ${idx + 1}] ${p.profile_key}: ${p.profile_value}
-근거: ${p.evidence || "근거 미상"} / 신뢰도: ${p.confidence}`
-    ).join("\n\n");
-    return [profileText, factText].filter(Boolean).join("\n\n");
-  } catch (e) {
-    console.error("getBotMemory:", e);
-    return "";
-  }
+  return "";
 }
 
 async function buildSmartQuery(env, text, message) {
@@ -1872,8 +1570,10 @@ function isRoomSearchQuery(text) {
 function isDigestQuery(text) {
   const t = String(text || "").replace(/\s+/g, " ").trim();
   const hasDigestVerb = /(요약|정리|브리핑|공유|알려줘|뽑아줘|추려줘|보고|리캡|recap|digest)/i.test(t);
-  const hasDigestObject = /(확인해야\s*할\s*안건|확인해야할\s*안건|봐야\s*할\s*것|주요\s*안건|주요\s*내용|보고내용|올라온\s*내용|단체방|단톡방|각종\s*방|각\s*방|방들|대화\s*내용|공유된\s*내용|오늘\s*내용|이번주\s*내용|최근\s*내용)/.test(t);
+  const hasDigestObject = /(확인해야\s*할\s*안건|확인해야할\s*안건|봐야\s*할\s*것|주요\s*안건|주요\s*내용|보고내용|올라온\s*내용|단체방|단톡방|각종\s*방|각\s*방|방들|대화\s*내용|공유된\s*내용|오늘\s*내용|이번주\s*내용|최근\s*내용|회의체\s*이슈|자료\s*요약)/.test(t);
   const directPatterns =
+    /^(내용|자료)\s*(요약|정리)해줘?$/.test(t) ||
+    /회의체\s*이슈.{0,20}(알려줘|정리|요약)/.test(t) ||
     /(오늘|어제오늘|이번주|최근).{0,20}(요약|정리|브리핑|공유|알려줘|뽑아줘|추려줘)/.test(t) ||
     /(확인해야\s*할\s*안건|확인해야할\s*안건).{0,20}(공유|알려줘|정리|요약)/.test(t) ||
     /(단체방|단톡방|각종\s*방|방들).{0,30}(올라온|나온|공유된).{0,20}(내용|안건|자료|보고)/.test(t);
@@ -1885,8 +1585,8 @@ function parseDigestRange(text) {
   if (/어제오늘|어제\s*오늘/.test(t)) return { label: "어제오늘", days: 2 };
   if (/오늘|금일/.test(t)) return { label: "오늘", days: 1 };
   if (/이번\s*주|이번주|주간/.test(t)) return { label: "이번주", days: 7 };
-  if (/최근|요즘/.test(t)) return { label: "최근 3일", days: 3 };
-  return { label: "최근 2일", days: 2 };
+  if (/최근|요즘/.test(t)) return { label: "최근 7일", days: 7 };
+  return { label: "최근 7일", days: 7 };
 }
 
 async function getKnownRoomsText(env) {
@@ -1911,42 +1611,46 @@ async function getKnownRoomsText(env) {
 async function fetchDigestRows(env, days = 2, limit = 120) {
   if (!env.DB) return [];
   try {
+    const messageLimit = Math.min(limit, 80);
+    const fileLimit = 30;
     const messages = await env.DB.prepare(`
       SELECT 'message' AS type, room_title AS source, sender_name AS actor, content AS text, created_at, NULL AS file_name, NULL AS title
       FROM messages
       WHERE datetime(created_at) >= datetime('now', ?)
       ORDER BY created_at DESC
       LIMIT ?
-    `).bind(`-${days} days`, limit).all();
-    const files = await env.DB.prepare(`
+    `).bind(`-${days} days`, messageLimit).all();
+    const files = (await tableExists(env, "files")) ? await env.DB.prepare(`
       SELECT 'file' AS type, COALESCE(room_title, '') AS source, COALESCE(uploader_name, sender_name) AS actor,
              COALESCE(summary, extracted_text, file_name) AS text, created_at, file_name, NULL AS title
       FROM files
       WHERE datetime(created_at) >= datetime('now', ?)
       ORDER BY created_at DESC
       LIMIT ?
-    `).bind(`-${days} days`, Math.min(limit, 50)).all();
-    const meetings = await env.DB.prepare(`
-      SELECT 'meeting' AS type, COALESCE(source, title, '') AS source, created_by AS actor,
-             COALESCE(summary, decisions, action_items, raw_text) AS text, created_at, NULL AS file_name, title
-      FROM meetings
-      WHERE datetime(created_at) >= datetime('now', ?)
-      ORDER BY created_at DESC
-      LIMIT ?
-    `).bind(`-${days} days`, Math.min(limit, 50)).all();
-    const facts = await env.DB.prepare(`
-      SELECT 'memory' AS type, COALESCE(source_room, subject, '') AS source, source_actor AS actor,
-             content AS text, created_at, NULL AS file_name, subject AS title
-      FROM learned_facts
-      WHERE datetime(created_at) >= datetime('now', ?)
-      ORDER BY created_at DESC
-      LIMIT ?
-    `).bind(`-${days} days`, Math.min(limit, 80)).all();
-    return [
+    `).bind(`-${days} days`, fileLimit).all() : { results: [] };
+    let rows = [
       ...(messages.results || []),
       ...(files.results || []),
-      ...(meetings.results || []),
-      ...(facts.results || []),
+    ];
+    if (!rows.length && days < 7) return await fetchDigestRows(env, 7, limit);
+    if (!rows.length) {
+      const recentMessages = await env.DB.prepare(`
+        SELECT 'message' AS type, room_title AS source, sender_name AS actor, content AS text, created_at, NULL AS file_name, NULL AS title
+        FROM messages
+        ORDER BY created_at DESC
+        LIMIT ?
+      `).bind(messageLimit).all();
+      const recentFiles = (await tableExists(env, "files")) ? await env.DB.prepare(`
+        SELECT 'file' AS type, COALESCE(room_title, '') AS source, COALESCE(uploader_name, sender_name) AS actor,
+               COALESCE(summary, extracted_text, file_name) AS text, created_at, file_name, NULL AS title
+        FROM files
+        ORDER BY created_at DESC
+        LIMIT ?
+      `).bind(fileLimit).all() : { results: [] };
+      rows = [...(recentMessages.results || []), ...(recentFiles.results || [])];
+    }
+    return [
+      ...rows,
     ].sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
   } catch (e) {
     console.error("fetchDigestRows:", e);
@@ -1966,7 +1670,7 @@ function buildDigestCorpus(rows) {
     return `[${idx + 1}] ${typeLabel}
 출처: [${r.source || "출처 미상"}] ${r.actor || "작성자 미상"} (${r.created_at || "시간 미상"})${extra}
 내용:
-${String(r.text || "").slice(0, 1000)}`;
+${String(r.text || "").slice(0, 700)}`;
   }).join("\n\n");
 }
 
@@ -1974,23 +1678,7 @@ async function answerDigest(env, userText, userId) {
   const range = parseDigestRange(userText);
   const rows = await fetchDigestRows(env, range.days, 140);
   if (!rows.length) {
-    const knownRooms = await getKnownRoomsText(env);
-    return `${range.label} 기준으로 저장된 대화 기록이 아직 없습니다.
-
-가능한 원인:
-1. 해당 기간에 봇이 받은 메시지가 없었습니다.
-2. BotFather Privacy Mode가 켜져 있어 그룹 일반 메시지를 받지 못하고 있습니다.
-3. D1 저장 로직이 아직 배포되지 않았거나 migration이 적용되지 않았습니다.
-4. 봇이 해당 단체방에 없었습니다.
-
-현재 이 봇에 등록된 방:
-${knownRooms || "등록된 방이 없습니다."}
-
-확인 필요:
-- BotFather에서 /setprivacy -> Disable 설정
-- 봇을 단체방에서 제거 후 다시 추가
-- wrangler.toml의 D1 binding 확인
-- messages 테이블에 최근 데이터가 쌓이는지 확인`;
+    return `최근 기록 기준 주요 안건 0건임.\n확인: /db_status 필요.`;
   }
   const query =
     SUMMARY_TONE_RULE +
@@ -2002,13 +1690,14 @@ ${knownRooms || "등록된 방이 없습니다."}
     `아래 기록은 이 봇이 직접 들어가 있는 텔레그램 방, 1:1 대화, 파일, 회의록에서 수집한 내용입니다.\n` +
     `단순 나열하지 말고, 사용자가 오늘 확인해야 할 안건 중심으로 압축해 주세요.\n\n` +
     `[출력 형식]\n` +
-    `${range.label} 기준으로 이 봇이 저장한 기록을 확인했습니다.\n\n` +
-    `확인할 주요 안건 N건입니다.\n\n` +
+    `주요 안건 N건임.\n\n` +
     `1. 안건명\n` +
-    `   핵심: 한 문장으로 요약\n` +
-    `   봐야 할 점: 사용자가 확인해야 할 포인트\n` +
-    `   출처: [방이름] 공유자명 (시간)\n\n` +
-    `우선 확인할 것\n- 항목 1\n- 항목 2\n- 항목 3\n\n` +
+    `* 일자: MM/DD\n` +
+    `* 공유자: 이름\n` +
+    `* 방: 방이름\n` +
+    `* 핵심: 1~2줄임.\n` +
+    `* 확인: 필요사항임.\n` +
+    `* 자료: 파일명 또는 링크\n\n` +
     `[품질 기준]\n` +
     `1. 최대 5개 안건까지만 선정합니다.\n` +
     `2. 각 안건은 현상, 의미, 확인할 일 중심으로 짧게 씁니다.\n` +
@@ -2031,7 +1720,7 @@ async function answerScheduleDigest(env, userText, userId) {
   const range = { label: "최근 기록 기준", days: 7 };
   const rows = await fetchDigestRows(env, range.days, 200);
   if (!rows.length) {
-    return `최근 기록 기준 저장된 대화 기록이 없음.\n\n- /db_status로 messages 적재 여부 확인 필요\n- 단체방 및 1:1 메시지 저장 로직 확인 필요`;
+    return `최근 기록 기준 주요 일정 0건임.\n확인: /db_status 필요.`;
   }
   const filtered = rows.filter((r) =>
     /(참석|일정|회의|미팅|세션|포럼|행사|방문|콜|call|meeting|다음주|내주|이번주|날짜|오전|오후|\d{1,2}\/\d{1,2}|\d{1,2}월\s*\d{1,2}일)/i.test(String(r.text || ""))
@@ -2085,35 +1774,17 @@ function parseSearch(text) {
 
 async function handleNewsQuery(chatId, env) {
   try {
-    const res = await fetch("https://news.google.com/rss?hl=ko&gl=KR&ceid=KR:ko", {
-      headers: { "User-Agent": "Mozilla/5.0" },
-    });
-    if (!res.ok) throw new Error(`RSS ${res.status}`);
-    const xml = await res.text();
-
-    const headlines = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)]
-      .slice(0, 5)
-      .map((m) => {
-        const raw =
-          m[1].match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/)?.[1] ||
-          m[1].match(/<title>(.*?)<\/title>/)?.[1] ||
-          "";
-        return raw.replace(/<[^>]+>/g, "").replace(/\s+-\s+[^-]+$/, "").trim();
-      })
-      .filter(Boolean);
-
-    if (headlines.length === 0) {
-      await sendMessage(env, chatId, "뉴스를 불러오지 못했습니다.");
+    if (!isExternalSearchEnabled(env) || !hasTavilyConfig(env)) {
+      await sendMessage(env, chatId, "외부검색 미설정.\n핵심: 뉴스 조회는 Tavily 설정 필요.\n확인: /search_status 필요.");
       return;
     }
-
-    const kst = new Date(Date.now() + 9 * 3600000);
-    const dateStr = kst.toISOString().slice(0, 10);
-    const msg = `📰 ${dateStr} 주요 뉴스\n\n${headlines.map((h, i) => `${i + 1}. ${h}`).join("\n")}`;
-    await sendMessage(env, chatId, msg);
+    const results = await searchTavily(env, "주요 뉴스", { maxResults: 5, searchDepth: "basic" });
+    await saveExternalSearchResults(env, "주요 뉴스", results);
+    const lines = results.map((r, i) => `${i + 1}. 제목: ${r.title || "제목 없음"}\n요약: ${r.snippet || "요약 없음"}\nURL: ${r.url || ""}`);
+    await sendMessage(env, chatId, lines.length ? lines.join("\n\n") : "뉴스 결과 없음.");
   } catch (e) {
     console.error("handleNewsQuery error:", e);
-    await sendMessage(env, chatId, "뉴스를 불러오지 못했습니다.");
+    await sendMessage(env, chatId, "뉴스 조회 실패.\n확인: /search_status 필요.");
   }
 }
 
@@ -2263,20 +1934,57 @@ async function persistIncomingMessage(env, message) {
     if (message.from) await upsertRoomMember(env, message.chat, message.from, "message");
   }
   if (!text.trim()) return;
-  await dbInsert(env, {
+  const saved = await dbInsert(env, {
     roomId: message.chat.id,
-    roomTitle: message.chat.type === "private"
-      ? "1:1"
-      : (message.chat.title || message.chat.username || String(message.chat.id)),
+    roomTitle: getRoomTitleForMessage(message),
     senderId: message.from?.id || "",
     senderName: getSenderName(message.from),
     content: getMessageTextForStorage(message),
     savedBy: BOT_KEY,
     telegramMessageId: message.message_id || "",
-    sourceType: message.chat.type === "private" ? "telegram_private" : "telegram_group",
+    sourceType: getSourceTypeForMessage(message),
   });
-  await maybeLearnFromMessage(env, message);
-  message._persisted = true;
+  message._persisted = saved;
+}
+
+function getDocumentFileType(fileName, mimeType) {
+  const lower = String(fileName || "").toLowerCase();
+  if (lower.endsWith(".txt") || String(mimeType).includes("text/plain")) return "txt";
+  if (lower.endsWith(".html") || lower.endsWith(".htm") || String(mimeType).includes("text/html")) return "html";
+  if (lower.endsWith(".pdf") || String(mimeType).includes("pdf")) return "pdf";
+  if (lower.endsWith(".docx")) return "docx";
+  if (lower.endsWith(".pptx")) return "pptx";
+  return String(mimeType || "document");
+}
+
+function isSupportedDocument(message) {
+  if (!message?.document) return false;
+  const type = getDocumentFileType(message.document.file_name || "", message.document.mime_type || "");
+  return ["txt", "html", "pdf", "docx", "pptx"].includes(type);
+}
+
+async function persistIncomingFile(env, message) {
+  if (!env.DB || !message?.document || message.from?.is_bot || message._filePersisted) return;
+  if (!isSupportedDocument(message)) return;
+  try {
+    await dbSaveFile(env, {
+      telegram_file_id: message.document.file_id || "",
+      telegram_file_unique_id: message.document.file_unique_id || "",
+      roomId: message.chat.id,
+      roomTitle: getRoomTitleForMessage(message),
+      senderId: message.from?.id || "",
+      senderName: getSenderName(message.from),
+      fileName: message.document.file_name || "document",
+      fileType: getDocumentFileType(message.document.file_name || "", message.document.mime_type || ""),
+      mimeType: message.document.mime_type || "",
+      fileSize: message.document.file_size || 0,
+      summary: "요약 미생성 / 파일 저장 완료",
+      tags: ["document"],
+    });
+    message._filePersisted = true;
+  } catch (e) {
+    console.error("persistIncomingFile:", e);
+  }
 }
 
 async function handleUpdate(update, env, isRelay = false) {
@@ -2294,22 +2002,22 @@ async function handleUpdate(update, env, isRelay = false) {
   const text = message.text || message.caption || "";
   const hasFile = !!(message.document || message.photo);
 
-  await ensureOwnerProfile(env);
   await handleNewChatMembers(env, message);
   await persistIncomingMessage(env, message);
+  await persistIncomingFile(env, message);
   if (!message._persisted) {
     await upsertUser(env, message.from, chatType === "private" ? chatId : message.from.id, chatType === "private" ? "private_dm" : "group_message");
   }
   if (!message._persisted && (chatType === "private" || hasFile) && text.trim()) {
     await dbInsert(env, {
       roomId: chatId,
-      roomTitle: chatType === "private" ? "private_dm" : (message.chat.title || String(chatId)),
+      roomTitle: getRoomTitleForMessage(message),
       senderId: userId,
       senderName: getSenderName(message.from),
       content: getMessageTextForStorage(message),
       savedBy: BOT_KEY,
       telegramMessageId: message.message_id || "",
-      sourceType: chatType === "private" ? "telegram_private" : "telegram_group",
+      sourceType: getSourceTypeForMessage(message),
     });
   }
   if (!message._persisted && chatType !== "private") {
@@ -2317,13 +2025,7 @@ async function handleUpdate(update, env, isRelay = false) {
     await upsertRoomMember(env, message.chat, message.from, "message");
     await maybeUpdateUserDisplayNameFromBareName(env, message);
   }
-  await maybeDetectBotOwner(env, message);
-
   if (await routeSlashCommand(env, message, text, chatId)) {
-    return;
-  }
-
-  if (await handleOwnerConfirmReject(env, chatId, message.from, text)) {
     return;
   }
 
@@ -2331,11 +2033,6 @@ async function handleUpdate(update, env, isRelay = false) {
     await saveRoom(chatId, message.chat.title, env);
     await dbRegisterRoom(env, chatId, message.chat.title, "koh");
     await upsertRoom(env, message.chat);
-    return;
-  }
-
-  if (isRegisterCommand(text)) {
-    await handleRegisterCommand(env, chatId, message.from);
     return;
   }
 
@@ -2364,10 +2061,6 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
-  if (user?.step === "waiting_name_auto") {
-    return;
-  }
-
   // 첫 접촉: 텔레그램 이름·ID 자동 저장 (릴레이는 임시 사용자로 처리)
   if (!user) {
     if (isRelay) {
@@ -2384,11 +2077,6 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
   // 기능 소개
   if (isIntroQuery(text)) {
     await handleIntro(chatId, env);
-    return;
-  }
-
-  if (isOwnerStatusQuery(text)) {
-    await handleOwnerStatus(env, chatId);
     return;
   }
 
@@ -2452,6 +2140,12 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
 
   if (isUrlSummaryQuery(text)) {
     const answer = await answerUrlSummary(env, text, userId);
+    await sendMessage(env, chatId, answer);
+    return;
+  }
+
+  if (isFileSearchQuery(text)) {
+    const answer = await answerFileSearch(env, text);
     await sendMessage(env, chatId, answer);
     return;
   }
@@ -2537,8 +2231,7 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     const q = parseSearch(text);
     const rows = await dbSearch(env, q);
     if (rows.length === 0) {
-      const knownRooms = await getKnownRoomsText(env);
-      await sendMessage(env, chatId, `현재 이 봇의 D1 DB에는 해당 조건의 기록이 없습니다.\n\n현재 이 봇에 등록된 방:\n${knownRooms || "등록된 방이 없습니다."}\n\n확인 필요:\n- BotFather Privacy Mode 설정\n- 봇이 해당 방에 들어가 있는지\n- messages 테이블에 최근 데이터가 쌓이는지`);
+      await sendMessage(env, chatId, `해당 조건 기록 없음.\n핵심: D1 messages 검색 결과 없음.\n확인: /db_status 필요.`);
       return;
     }
     const corpus = rows
@@ -2727,7 +2420,6 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
       telegramMessageId: message.message_id || "",
       sourceType: "telegram_group",
     });
-    await maybeLearnFromMessage(env, message);
   }
   console.log(`[KOH DB저장] room=${message.chat.title} user=${user?.name} text=${text.slice(0, 30)}`);
 
@@ -2775,8 +2467,9 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     return;
   }
 
-  if (isOwnerStatusQuery(cleanText)) {
-    await handleOwnerStatus(env, chatId);
+  if (isFileSearchQuery(cleanText)) {
+    const answer = await answerFileSearch(env, cleanText);
+    await sendMessage(env, chatId, answer);
     return;
   }
 
@@ -2849,8 +2542,7 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     const q = parseSearch(cleanText);
     const rows = await dbSearch(env, q);
     if (rows.length === 0) {
-      const knownRooms = await getKnownRoomsText(env);
-      await sendMessage(env, chatId, `현재 이 봇의 D1 DB에는 해당 조건의 기록이 없습니다.\n\n현재 이 봇에 등록된 방:\n${knownRooms || "등록된 방이 없습니다."}\n\n확인 필요:\n- BotFather Privacy Mode 설정\n- 봇이 해당 방에 들어가 있는지\n- messages 테이블에 최근 데이터가 쌓이는지`);
+      await sendMessage(env, chatId, `해당 조건 기록 없음.\n핵심: D1 messages 검색 결과 없음.\n확인: /db_status 필요.`);
       return;
     }
     const corpus = rows
@@ -2888,15 +2580,15 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
     }
 
     const roomId = message.chat.id;
-    const roomTitle = message.chat.title || String(chatId);
+    const roomTitle = getRoomTitleForMessage(message);
     const senderUser = await getUser(userId, env);
-    const senderName = senderUser?.name || message.from?.first_name || "";
+    const senderName = senderUser?.name || getSenderName(message.from);
 
     const fileInfo = await tgGetFile(env, fileId);
     const fileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
 
     // 이미지는 Gemini로, 문서는 Dify로 처리
-    if (mimeType.startsWith("image/") && (env.GEMINI_API_KEY || (env.VISION_PROVIDER === "openai" && env.OPENAI_API_KEY))) {
+    if (false && mimeType.startsWith("image/")) {
       const buffer = await fetch(fileUrl).then((r) => r.arrayBuffer());
       const answer = await analyzeImageWithClaude(env, buffer, mimeType, message.caption || "");
       await dbSaveFile(env, {
@@ -2907,7 +2599,9 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
         senderId: userId,
         senderName,
         fileName,
+        fileType: getDocumentFileType(fileName, mimeType),
         mimeType,
+        fileSize: message.document?.file_size || 0,
         summary: answer,
         tags: ["image", "analysis"],
       });
@@ -2916,6 +2610,12 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
     }
 
     const fileBlob = await fetch(fileUrl).then((r) => r.blob());
+    let extractedText = "";
+    if (getDocumentFileType(fileName, mimeType) === "txt") {
+      extractedText = (await fileBlob.text()).slice(0, 4000);
+    } else if (getDocumentFileType(fileName, mimeType) === "html") {
+      extractedText = htmlToPlainText(await fileBlob.text()).slice(0, 4000);
+    }
     const uploaded = await difyUploadFile(env, fileBlob, fileName, mimeType, userId);
     if (!uploaded.id) throw new Error("Dify 파일 업로드 실패: " + JSON.stringify(uploaded));
 
@@ -2945,7 +2645,7 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
       await env.CONVERSATIONS.put(`conv_${userId}`, result.conversation_id);
     }
 
-    const summary = result.answer || "";
+    const summary = result.answer || extractedText || "요약 미생성 / 파일 저장 완료";
     await dbSaveFile(env, {
       telegram_file_id: fileId,
       telegram_file_unique_id: message.document?.file_unique_id || "",
@@ -2954,14 +2654,17 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
       senderId: userId,
       senderName,
       fileName,
+      fileType: getDocumentFileType(fileName, mimeType),
       mimeType,
+      fileSize: message.document?.file_size || 0,
+      extracted_text: extractedText,
       summary,
       tags: ["document"],
     });
-    await sendMessage(env, chatId, summary || "요약 중 오류가 발생했어요.");
+    await sendMessage(env, chatId, summary || "파일은 저장됐으나 요약은 아직 미생성임.");
   } catch (e) {
     console.error("handleFile error:", e);
-    await sendMessage(env, chatId, `파일 처리 오류\n\n오류: ${e.message}\n\n확인 필요\n- /db_status 실행\n- /image_status 실행\n- Telegram getFile 다운로드 가능 여부\n- Dify 또는 Vision provider 설정 여부`);
+    await sendMessage(env, chatId, `파일 처리 오류.\n핵심: ${e.message}\n확인: /db_status 필요.`);
   }
 }
 
@@ -3007,41 +2710,7 @@ async function analyzeImageWithOpenAI(env, imageBuffer, contentType, userPrompt 
 }
 
 async function analyzeImageWithClaude(env, buffer, mimeType, userPrompt = "") {
-  if (env.VISION_PROVIDER === "openai") {
-    return await analyzeImageWithOpenAI(env, buffer, mimeType, userPrompt);
-  }
-  if (!env.GEMINI_API_KEY) {
-    throw new Error("GEMINI_API_KEY is missing. Set GEMINI_API_KEY or VISION_PROVIDER=openai with OPENAI_API_KEY.");
-  }
-  const validMimes = ["image/jpeg", "image/png", "image/gif", "image/webp"];
-  const imgMime = validMimes.includes(mimeType) ? mimeType : "image/jpeg";
-
-  const uint8 = new Uint8Array(buffer);
-  const chunks = [];
-  for (let i = 0; i < uint8.length; i += 8192) {
-    chunks.push(String.fromCharCode(...uint8.subarray(i, i + 8192)));
-  }
-  const base64 = btoa(chunks.join(""));
-
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${env.GEMINI_API_KEY}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{
-          parts: [
-            { inline_data: { mime_type: imgMime, data: base64 } },
-            { text: TONE_RULE + "이 이미지를 설명하고 핵심 내용을 한국어로 요약해줘." },
-          ],
-        }],
-      }),
-    }
-  );
-
-  if (!res.ok) throw new Error(`Gemini API ${res.status}: ${await res.text()}`);
-  const data = await res.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || "분석 결과를 받지 못했습니다.";
+  return "";
 }
 
 async function sendDailyBriefing(env) {
