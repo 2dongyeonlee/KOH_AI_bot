@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-room-debug-20260608-0035";
+const BUILD_VERSION = "koh-morning-briefing-cron-20260608-0200";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -454,8 +454,22 @@ export default {
     return new Response("OK");
   },
 
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(sendDailyBriefing(env));
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil((async () => {
+      try {
+        await sendDailyBriefing(env, { mock: false });
+      } catch (error) {
+        console.error("scheduled daily briefing failed:", error);
+        const target = env.DAILY_BRIEFING_CHAT_ID || env.ADMIN_CHAT_ID || env.ADMIN_TELEGRAM_ID || "";
+        if (target) {
+          try {
+            await sendMessage(env, target, "아침 브리핑 발송 실패함.");
+          } catch (notifyError) {
+            console.error("scheduled daily briefing notify failed:", notifyError);
+          }
+        }
+      }
+    })());
   },
 };
 
@@ -1256,7 +1270,15 @@ async function handleSqlCommand(env, message, text, chatId) {
 }
 
 async function handleDebugEnv(env, chatId) {
-  await sendMessage(env, chatId, `BUILD_VERSION: ${BUILD_VERSION}\nDB binding: ${env.DB ? "있음" : "없음"}`);
+  await sendMessage(
+    env,
+    chatId,
+    `BUILD_VERSION: ${BUILD_VERSION}\n` +
+    `DB binding: ${env.DB ? "있음" : "없음"}\n` +
+    `DAILY_BRIEFING_CHAT_ID: ${env.DAILY_BRIEFING_CHAT_ID ? "있음" : "없음"}\n` +
+    `ADMIN_CHAT_ID: ${env.ADMIN_CHAT_ID ? "있음" : "없음"}\n` +
+    `cron config: KST 08:00 = UTC 23:00`
+  );
 }
 
 async function handleDebugSave(env, message, chatId) {
@@ -1340,8 +1362,9 @@ async function routeSlashCommand(env, message, text, chatId) {
     await handleWebSearchTest(env, chatId, t);
     return true;
   }
-  if (/^\/briefing_mock\b/.test(t)) {
+  if (/^\/(briefing_mock|briefing_test|morning_briefing_test)\b/.test(t)) {
     await sendDailyBriefing(env, { targetChatId: chatId, mock: true });
+    await sendMessage(env, chatId, "브리핑 테스트 발송 완료");
     return true;
   }
   if (/^\/help\b/.test(t)) {
@@ -2428,6 +2451,189 @@ ${String(r.text || "").slice(0, 700)}`;
   }).join("\n\n");
 }
 
+function isPriorityIntent(text) {
+  const t = String(text || "").replace(/\s+/g, " ").trim();
+  return /(이번주|오늘|보고\s*전|임원|사장님|우선순위|제일\s*먼저|먼저\s*(볼|확인|챙)|챙겨야\s*할|확인해야\s*할|보고해야\s*할|제일\s*급한|주요\s*리스크|확인\s*필요\s*과제)/i.test(t)
+    && /(안건|일|것|과제|리스크|우선순위|보고|확인|챙)/i.test(t);
+}
+
+function priorityProjectName(text) {
+  const t = String(text || "");
+  if (/New Vision|비전선포식|선포식|서울랜드|이든|앨리스/i.test(t)) return "SK하이닉스 New Vision 선포식";
+  if (/M15|화재|고객사\s*Letter|대외\s*커뮤니케이션|Letter/i.test(t)) return "M15 화재 대응 커뮤니케이션";
+  if (/AI Agent|1인\s*1\s*AI|Comm\.?\s*총괄|6R/i.test(t)) return "Comm. 총괄 AI Agent 도입";
+  if (/솔리다임|Solidigm|EPIC\s*Semi|MOU|낸드/i.test(t)) return "솔리다임/EPIC Semi MOU 커뮤니케이션";
+  const first = t.replace(/\s+/g, " ").slice(0, 28).trim();
+  return first ? `${first} 관련 안건` : "최근 업무 안건";
+}
+
+function priorityScore(record) {
+  const t = `${record.title || ""} ${record.text || ""} ${record.file_name || ""}`;
+  let score = 0;
+  if (/(오늘|내일|이번주|금주|일정|마감)/i.test(t)) score += 30;
+  if (/(보고|사장님|임원|CEO|컴총괄|PMO|회의|발표)/i.test(t)) score += 25;
+  if (/(확인\s*필요|챙겨야|검토|회신|완료|마감|일정\s*확정|block)/i.test(t)) score += 20;
+  if (record.type === "file") score += 15;
+  const created = Date.parse(String(record.created_at || "").replace(" ", "T"));
+  if (Number.isFinite(created) && Date.now() - created < 3 * 86400000) score += 15;
+  if (/(리스크|화재|고객사|대외|IR|PR|CR|Letter|언론)/i.test(t)) score += 10;
+  if (/(뉴스|기사|동향)/i.test(t)) score -= 10;
+  return score;
+}
+
+async function fetchPriorityContext(env, text) {
+  if (!env.DB) return [];
+  const since = new Date(Date.now() - 14 * 86400000).toISOString().replace("T", " ").slice(0, 19);
+  const fileSince = new Date(Date.now() - 30 * 86400000).toISOString().replace("T", " ").slice(0, 19);
+  const records = [];
+  const hasRooms = await tableExists(env, "rooms");
+  const roomJoinM = hasRooms ? "LEFT JOIN rooms r ON r.room_id = m.room_id" : "";
+  const roomJoinF = hasRooms ? "LEFT JOIN rooms r ON r.room_id = f.room_id" : "";
+  const roomExprM = hasRooms
+    ? "COALESCE(CASE WHEN CAST(m.room_id AS INTEGER) > 0 THEN '1:1' END, CASE WHEN CAST(m.room_id AS INTEGER) < 0 THEN COALESCE(r.room_title, NULLIF(m.room_title, '1:1'), '알 수 없는 방') END, m.room_title, '알 수 없는 방')"
+    : "COALESCE(m.room_title, '알 수 없는 방')";
+  const roomExprF = hasRooms
+    ? "COALESCE(CASE WHEN CAST(f.room_id AS INTEGER) > 0 THEN '1:1' END, CASE WHEN CAST(f.room_id AS INTEGER) < 0 THEN COALESCE(r.room_title, NULLIF(f.room_title, '1:1'), '알 수 없는 방') END, f.room_title, '알 수 없는 방')"
+    : "COALESCE(f.room_title, '알 수 없는 방')";
+  try {
+    const messages = await env.DB.prepare(`
+      SELECT 'message' AS type, m.id, m.room_id, ${roomExprM} AS room_title,
+             m.sender_id AS actor_id, m.sender_name AS actor, m.content AS text,
+             m.created_at, NULL AS file_name
+      FROM messages m
+      ${roomJoinM}
+      WHERE datetime(m.created_at) >= datetime(?)
+      ORDER BY m.created_at DESC
+      LIMIT 200
+    `).bind(since).all();
+    records.push(...(messages.results || []));
+  } catch (error) {
+    console.error("fetchPriorityContext messages:", error);
+  }
+  if (await tableExists(env, "files")) {
+    try {
+      const files = await env.DB.prepare(`
+        SELECT 'file' AS type, f.id, f.room_id, ${roomExprF} AS room_title,
+               f.uploader_id AS actor_id, COALESCE(f.uploader_name, f.sender_name) AS actor,
+               COALESCE(f.summary, f.extracted_text, f.file_name) AS text,
+               f.created_at, f.file_name
+        FROM files f
+        ${roomJoinF}
+        WHERE datetime(f.created_at) >= datetime(?)
+        ORDER BY f.created_at DESC
+        LIMIT 80
+      `).bind(fileSince).all();
+      records.push(...(files.results || []));
+    } catch (error) {
+      console.error("fetchPriorityContext files:", error);
+    }
+  }
+  if (await tableExists(env, "meetings")) {
+    try {
+      const meetings = await env.DB.prepare(`
+        SELECT 'meeting' AS type, id, '' AS room_id, COALESCE(source, title, '회의록') AS room_title,
+               '' AS actor_id, created_by AS actor,
+               COALESCE(summary, raw_text, decisions, action_items, title) AS text,
+               created_at, title AS file_name
+        FROM meetings
+        WHERE datetime(created_at) >= datetime(?)
+        ORDER BY created_at DESC
+        LIMIT 50
+      `).bind(since).all();
+      records.push(...(meetings.results || []));
+    } catch (error) {
+      console.error("fetchPriorityContext meetings:", error);
+    }
+  }
+  return records;
+}
+
+function rankIssueCandidates(records) {
+  const grouped = new Map();
+  for (const record of records || []) {
+    const text = `${record.text || ""} ${record.file_name || ""}`;
+    const name = priorityProjectName(text);
+    const item = grouped.get(name) || { name, score: 0, records: [], rooms: new Set(), actors: new Set(), files: new Set(), latest: "" };
+    item.score += priorityScore(record);
+    item.records.push(record);
+    if (record.room_title) item.rooms.add(record.room_title);
+    if (record.actor) item.actors.add(record.actor);
+    if (record.file_name) item.files.add(record.file_name);
+    if (String(record.created_at || "") > item.latest) item.latest = String(record.created_at || "");
+    grouped.set(name, item);
+  }
+  for (const item of grouped.values()) {
+    if (item.records.length > 1) item.score += Math.min(15, item.records.length * 5);
+    if (item.rooms.size > 1) item.score += 15;
+  }
+  return [...grouped.values()].sort((a, b) => b.score - a.score).slice(0, 3);
+}
+
+function summarizePriorityText(item) {
+  const text = item.records.map((r) => `${r.text || ""} ${r.file_name || ""}`).join(" ").replace(/\s+/g, " ");
+  if (/New Vision|비전선포식|선포식|서울랜드|이든|앨리스/i.test(text)) {
+    return {
+      judgment: "행사 일정·대행사·PMO·보고 준비가 함께 언급되어 실행 관리 이슈가 가장 큼.",
+      action: "행사일 확정 여부와 서울랜드 일정 block 협의 상태부터 확인 필요.",
+    };
+  }
+  if (/M15|화재|고객사|Letter|대외/i.test(text)) {
+    return {
+      judgment: "고객사 Letter와 대외 커뮤니케이션 리스크가 연결되어 우선 확인 필요성이 큼.",
+      action: "Letter 검토 현황과 유관부서 협의 상태를 먼저 확인 필요.",
+    };
+  }
+  if (/AI Agent|1인\s*1\s*AI|Comm\.?\s*총괄|6R/i.test(text)) {
+    return {
+      judgment: "AI Agent 도입과 보고 준비 맥락이 반복되어 추진 현황 정리가 필요함.",
+      action: "보고용 진행 현황과 다음 의사결정 포인트를 정리 필요.",
+    };
+  }
+  if (/솔리다임|Solidigm|EPIC|MOU|낸드/i.test(text)) {
+    return {
+      judgment: "MOU와 커뮤니케이션 관련 자료가 연결되어 대외 메시지 점검 필요성이 있음.",
+      action: "공유 자료와 메시지 기준으로 커뮤니케이션 쟁점을 먼저 확인 필요.",
+    };
+  }
+  return {
+    judgment: "최근 기록에서 반복 확인되어 이번주 우선 확인 후보로 보임.",
+    action: "담당자·마감·보고 필요 여부를 먼저 확인 필요.",
+  };
+}
+
+function formatPriorityAnswer(candidates) {
+  if (!candidates.length) return "최근 저장된 업무 기록이 없어 우선순위를 판단할 수 없음.";
+  const top = candidates[0];
+  const summary = summarizePriorityText(top);
+  const date = formatShortDate(top.latest);
+  const room = [...top.rooms][0] || "알 수 없는 방";
+  const actor = [...top.actors][0] || "공유자 미상";
+  const file = [...top.files][0] || "없음";
+  const next = candidates.slice(1).map((item, idx) => {
+    const s = summarizePriorityText(item);
+    return `${idx + 2}. ${escapeHtml(item.name)}\n• ${escapeHtml(s.action)}`;
+  }).join("\n\n");
+  return `<b>이번주 1순위로 챙길 안건은 ${escapeHtml(top.name)}으로 보입니다.</b>\n\n` +
+    `• <b>판단</b>: ${escapeHtml(summary.judgment)}\n` +
+    `• <b>먼저 할 일</b>: ${escapeHtml(summary.action)}\n` +
+    `• <b>근거</b>: 저장된 메시지/자료 ${top.records.length}건 기준으로 반복 확인됨.\n\n` +
+    `🗓 관련 일자: ${escapeHtml(date)}\n` +
+    `📍 관련 방: ${escapeHtml(room)}\n` +
+    `👤 공유자: ${escapeHtml(actor)}\n` +
+    `📎 관련 자료: ${escapeHtml(file)}\n\n` +
+    (next ? `<b>다음 순위</b>\n${next}` : `<b>다음 순위</b>\n추가 후보는 명확하지 않음.`);
+}
+
+async function handlePriorityQuestion(env, chatId, text) {
+  const records = await fetchPriorityContext(env, text);
+  if (!records.length) {
+    await sendMessage(env, chatId, "최근 저장된 업무 기록이 없어 우선순위를 판단할 수 없음.");
+    return;
+  }
+  const candidates = rankIssueCandidates(records);
+  await sendMessage(env, chatId, formatPriorityAnswer(candidates), { parseMode: "HTML" });
+}
+
 async function answerDigest(env, userText, userId) {
   const range = parseDigestRange(userText);
   const rows = await fetchDigestRows(env, range.days, 140);
@@ -2966,6 +3172,11 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
+  if (isPriorityIntent(text)) {
+    await handlePriorityQuestion(env, chatId, text);
+    return;
+  }
+
   if (isFileSearchQuery(text)) {
     const answer = await answerFileSearch(env, text);
     await sendMessage(env, chatId, answer);
@@ -3298,6 +3509,11 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     return;
   }
 
+  if (isPriorityIntent(cleanText)) {
+    await handlePriorityQuestion(env, chatId, cleanText);
+    return;
+  }
+
   if (isFileSearchQuery(cleanText)) {
     const answer = await answerFileSearch(env, cleanText);
     await sendMessage(env, chatId, answer);
@@ -3605,7 +3821,28 @@ async function sendDailyBriefingOld_DISABLED(env) {
   }
 }
 
-async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) {
+async function resolveDailyBriefingTargetChatId(env, targetChatId = "") {
+  if (targetChatId) return String(targetChatId);
+  if (env.DAILY_BRIEFING_CHAT_ID) return String(env.DAILY_BRIEFING_CHAT_ID);
+  if (env.ADMIN_CHAT_ID) return String(env.ADMIN_CHAT_ID);
+  if (env.ADMIN_TELEGRAM_ID) return String(env.ADMIN_TELEGRAM_ID);
+  if (!env.DB || !(await tableExists(env, "users"))) return "";
+  try {
+    const row = await env.DB.prepare(`
+      SELECT chat_id, telegram_id
+      FROM users
+      WHERE COALESCE(chat_id, '') != ''
+      ORDER BY last_seen_at DESC
+      LIMIT 1
+    `).first();
+    return String(row?.chat_id || row?.telegram_id || "");
+  } catch (error) {
+    console.error("resolveDailyBriefingTargetChatId:", error);
+    return "";
+  }
+}
+
+async function sendDailyBriefingCurrent_DISABLED(env, { targetChatId = "", mock = false } = {}) {
   const today = getTodayKST();
   const day = getKstDayOfWeek();
   const isMonday = day === 1;
@@ -3662,9 +3899,69 @@ async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) 
   if (!msg) {
     msg = `${title}\n\n1) ${section1}\n- 최근 자료를 찾지 못했습니다.\n\n2) ${section2}\n${scheduleLines}\n\n3) ${section3}\n- 확인 과제 데이터가 없습니다.`;
   }
-  const adminUser = await findAdminUser(env);
-  const target = targetChatId || env.BOT_OWNER_TELEGRAM_ID || env.ADMIN_TELEGRAM_ID || adminUser?.chat_id;
-  if (target) await sendMessage(env, target, msg);
+  const target = await resolveDailyBriefingTargetChatId(env, targetChatId);
+  if (target) {
+    await sendMessage(env, target, msg, { parseMode: "HTML" });
+  } else {
+    console.error("daily briefing target chat id missing");
+  }
+}
+
+async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) {
+  const today = getTodayKST();
+  const isMonday = getKstDayOfWeek() === 1;
+  const title = isMonday ? "<b>지난주 주요 안건 공유드립니다.</b>" : "<b>전일 주요 안건 및 오늘 일정 공유드립니다.</b>";
+  const section1 = isMonday ? "주요 안건" : "전일 주요 안건";
+  const section2 = isMonday ? "이번주 일정" : "오늘 일정";
+  const section3 = isMonday ? "이번주 확인 과제" : "오늘 확인 과제";
+  const schedules = isMonday ? await getSchedulesForRange(env, today, 7) : await getSchedulesForDate(env, today);
+  const scheduleLines = schedules.length
+    ? schedules
+        .sort((a, b) => `${a.date || ""} ${a.time || ""}`.localeCompare(`${b.date || ""} ${b.time || ""}`))
+        .slice(0, 8)
+        .map((s) => `- ${formatShortDate(s.date || today)} ${s.time || ""} ${s.title || s.text || "일정"}`.replace(/\s+/g, " ").trim())
+        .join("\n")
+    : "- 오늘 일정 데이터가 없습니다.";
+  const rows = await fetchDigestRows(env, isMonday ? 7 : 1, 140);
+  if (!rows.length && !schedules.length) {
+    if (mock && targetChatId) await sendMessage(env, targetChatId, "최근 자료를 찾지 못했습니다.");
+    return;
+  }
+  let msg = "";
+  try {
+    const adminUser = await findAdminUser(env);
+    const query =
+      TONE_RULE +
+      `[브리핑 제목]\n${title}\n\n` +
+      `[수집 기록]\n${buildDigestCorpus(rows)}\n\n` +
+      `[일정]\n${scheduleLines}\n\n` +
+      `[출력 형식]\n` +
+      `${title}\n\n` +
+      `1) ${section1}\n` +
+      `<b>[프로젝트] 프로젝트/안건명</b>\n` +
+      `• <b>핵심</b>: 1~2줄 요약임.\n` +
+      `• <b>확인</b>: 확인 필요사항 1줄임.\n\n` +
+      `2) ${section2}\n- MM/DD HH:MM 일정명\n\n` +
+      `3) ${section3}\n- 확인할 일\n\n` +
+      `[규칙]\n` +
+      `- 프로젝트별로 병합하고 시간순 나열은 금지.\n` +
+      `- source_type은 출력하지 말 것.\n` +
+      `- HTML 태그는 <b>만 사용.\n` +
+      `- 전체 1200자 이내. 짧고 보고형.\n`;
+    const result = await difyChat(env, { query, user: String(adminUser?.id || "admin"), conversationId: "" });
+    msg = result.answer || "";
+  } catch (error) {
+    console.error("sendDailyBriefing:", error);
+  }
+  if (!msg) {
+    msg = `${title}\n\n1) ${section1}\n- 최근 자료를 찾지 못했습니다.\n\n2) ${section2}\n${scheduleLines}\n\n3) ${section3}\n- 확인 과제 데이터가 없습니다.`;
+  }
+  const target = await resolveDailyBriefingTargetChatId(env, targetChatId);
+  if (target) {
+    await sendMessage(env, target, msg, { parseMode: "HTML" });
+  } else {
+    console.error("daily briefing target chat id missing");
+  }
 }
 
 async function difyChat(env, { query, user, conversationId = "", files = [] }) {
