@@ -80,3 +80,18 @@ deploy trigger: 2026-06-07
 
 Commit changes
 → Commit directly to claude/ecstatic-carson-CVsrs
+
+## room/file canonical cleanup
+
+테스트방 삭제와 `private_dm`/`telegram_group` 오류 정리는 아래 migration으로 적용합니다.
+
+```bash
+npx wrangler d1 execute 6r-ai-db --remote --file migrations/0009_room_file_canonical_cleanup.sql
+```
+
+`files.source_type` 컬럼이 있을 때만 아래 SQL을 별도로 실행합니다.
+
+```bash
+npx wrangler d1 execute 6r-ai-db --remote --command "UPDATE files SET source_type = 'telegram_private' WHERE CAST(room_id AS INTEGER) > 0;"
+npx wrangler d1 execute 6r-ai-db --remote --command "UPDATE files SET source_type = 'telegram_group' WHERE CAST(room_id AS INTEGER) < 0;"
+```

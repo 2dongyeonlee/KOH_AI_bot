@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-file-room-user-20260608-0900";
+const BUILD_VERSION = "koh-room-debug-20260608-0035";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -1041,6 +1041,91 @@ async function handleRoomList(env, chatId) {
   }
 }
 
+async function handleDebugRooms(env, chatId) {
+  try {
+    if (!env.DB) {
+      await sendMessage(env, chatId, "debug rooms 실패함. 오류: DB binding 없음");
+      return;
+    }
+    const roomsCount = await tableExists(env, "rooms")
+      ? await env.DB.prepare(`SELECT COUNT(*) AS count FROM rooms`).first()
+      : { count: 0 };
+    const hasRoomExtra = await columnExists(env, "rooms", "last_seen_at");
+    const roomSql = hasRoomExtra
+      ? `SELECT room_id, room_title, room_type, last_seen_at FROM rooms ORDER BY last_seen_at DESC LIMIT 20`
+      : `SELECT room_id, room_title FROM rooms LIMIT 20`;
+    const rooms = await tableExists(env, "rooms")
+      ? await env.DB.prepare(roomSql).all()
+      : { results: [] };
+
+    const hasSourceType = await columnExists(env, "messages", "source_type");
+    const msgAggSql = hasSourceType
+      ? `SELECT room_id, room_title, source_type, COUNT(*) AS count, MAX(created_at) AS last_at
+         FROM messages
+         GROUP BY room_id, room_title, source_type
+         ORDER BY last_at DESC
+         LIMIT 20`
+      : `SELECT room_id, room_title, '' AS source_type, COUNT(*) AS count, MAX(created_at) AS last_at
+         FROM messages
+         GROUP BY room_id, room_title
+         ORDER BY last_at DESC
+         LIMIT 20`;
+    const msgAgg = await tableExists(env, "messages")
+      ? await env.DB.prepare(msgAggSql).all()
+      : { results: [] };
+
+    const positiveGroup = hasSourceType
+      ? await env.DB.prepare(`SELECT COUNT(*) AS count FROM messages WHERE CAST(room_id AS INTEGER) > 0 AND source_type = 'telegram_group'`).first()
+      : { count: 0 };
+    const negativePrivate = hasSourceType
+      ? await env.DB.prepare(`SELECT COUNT(*) AS count FROM messages WHERE CAST(room_id AS INTEGER) < 0 AND source_type = 'telegram_private'`).first()
+      : { count: 0 };
+    const multiTitle = await tableExists(env, "messages")
+      ? await env.DB.prepare(`
+          SELECT room_id, COUNT(DISTINCT room_title) AS title_count, GROUP_CONCAT(DISTINCT room_title) AS titles
+          FROM messages
+          GROUP BY room_id
+          HAVING COUNT(DISTINCT room_title) >= 2
+          LIMIT 20
+        `).all()
+      : { results: [] };
+    const testRooms = await tableExists(env, "messages")
+      ? await env.DB.prepare(`
+          SELECT room_id, room_title, COUNT(*) AS count
+          FROM messages
+          WHERE room_id IN ('-5265055977', '-5156923133')
+             OR room_title IN ('다시왔지롱', '장난치지마라')
+          GROUP BY room_id, room_title
+        `).all()
+      : { results: [] };
+
+    const roomLines = (rooms.results || []).map((r, idx) =>
+      `${idx + 1}. ${r.room_title || "이름없음"} / ${r.room_id || ""}${hasRoomExtra ? ` / ${r.room_type || "?"} / ${(r.last_seen_at || "").slice(0, 16)}` : ""}`
+    ).join("\n") || "없음";
+    const msgLines = (msgAgg.results || []).map((r, idx) =>
+      `${idx + 1}. ${r.room_id || ""} / ${r.room_title || ""} / ${r.source_type || ""} / ${r.count}`
+    ).join("\n") || "없음";
+    const multiLines = (multiTitle.results || []).map((r) =>
+      `${r.room_id}: ${r.title_count}개 / ${r.titles || ""}`
+    ).join("\n") || "없음";
+    const testLines = (testRooms.results || []).map((r) =>
+      `${r.room_id} / ${r.room_title} / ${r.count}`
+    ).join("\n") || "없음";
+
+    const output =
+      `rooms count: ${roomsCount?.count || 0}\n\n` +
+      `rooms 최근 20개\n${roomLines}\n\n` +
+      `messages room 집계\n${msgLines}\n\n` +
+      `양수 room_id + telegram_group: ${positiveGroup?.count || 0}\n` +
+      `음수 room_id + telegram_private: ${negativePrivate?.count || 0}\n\n` +
+      `room_title 2개 이상\n${multiLines}\n\n` +
+      `테스트방 잔존\n${testLines}`;
+    await sendMessage(env, chatId, output.slice(0, 3500));
+  } catch (e) {
+    await sendMessage(env, chatId, `debug rooms 실패함. 오류: ${String(e?.message || e).slice(0, 800)}`);
+  }
+}
+
 function isAdminUser(env, from) {
   return String(from?.id || "") === String(env.ADMIN_TELEGRAM_ID || "");
 }
@@ -1076,6 +1161,7 @@ function getHelpText() {
     "사용 가능 명령",
     "/db_status - D1 저장 상태 확인",
     "/rooms - 등록된 방 목록 확인",
+    "/debug_rooms - 방 저장 상태 확인",
     "/files - 최근 저장 파일 확인",
     "/debug_file - 파일 저장 상태 확인",
     "/debug_save - messages 직접 저장 테스트",
@@ -1107,6 +1193,10 @@ async function routeSlashCommand(env, message, text, chatId) {
   }
   if (/^\/rooms\b/.test(t) || isRoomListQuery(t)) {
     await handleRoomList(env, chatId);
+    return true;
+  }
+  if (/^\/debug_rooms\b/.test(t)) {
+    await handleDebugRooms(env, chatId);
     return true;
   }
   if (/^\/files\b/.test(t)) {
@@ -1335,14 +1425,20 @@ async function handleFilesCommand(env, chatId) {
       await sendMessage(env, chatId, "최근 저장 파일 0건임.");
       return;
     }
-    const lines = rows.map((f, idx) =>
-      `${idx + 1}. ${f.file_name || "파일명 없음"}\n` +
-      `* 일자: ${formatShortDate(f.created_at)}\n` +
-      `* 공유자: ${f.uploader_name || f.sender_name || "미상"}\n` +
-      `* 방: ${f.room_title || "미상"}\n` +
-      `* 상태: ${hasGeneratedSummary(f.summary) ? "요약 있음" : "요약 미생성"}`
-    );
-    await sendMessage(env, chatId, `최근 저장 파일 ${rows.length}건임.\n\n${lines.join("\n\n")}`);
+    const lines = rows.map((f, idx) => {
+      const fileName = f.file_name || "파일명 없음";
+      const roomTitle = f.room_title || "미상";
+      const summary = hasGeneratedSummary(f.summary)
+        ? String(f.summary || "").replace(/\s+/g, " ").slice(0, 140)
+        : "미생성임.";
+      return `${idx + 1}. ${fileName}\n` +
+        `* 일자: ${formatShortDate(f.created_at)}\n` +
+        `* 공유자: ${f.uploader_name || f.sender_name || "미상"}\n` +
+        `* 방: ${roomTitle}\n` +
+        `* 위치: [${roomTitle}] / ${fileName}\n` +
+        `* 요약: ${summary}`;
+    });
+    await sendMessage(env, chatId, `최근 저장 자료 ${rows.length}건임.\n\n${lines.join("\n\n")}`);
   } catch (e) {
     console.error("handleFilesCommand:", e);
     await sendMessage(env, chatId, `파일 목록 조회 실패함.\n${String(e?.message || e).slice(0, 500)}`);
