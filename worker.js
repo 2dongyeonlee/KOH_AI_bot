@@ -3317,7 +3317,7 @@ async function analyzeImageWithClaude(env, buffer, mimeType, userPrompt = "") {
   return "";
 }
 
-async function sendDailyBriefing(env) {
+async function sendDailyBriefingOld_DISABLED(env) {
   const schedules = await getTodaySchedules(env);
   let msg = "";
 
