@@ -1563,7 +1563,7 @@ function preferFileRow(next, prev) {
   return String(next.created_at || "").localeCompare(String(prev.created_at || "")) >= 0 ? next : prev;
 }
 
-async function handleFilesCommand(env, chatId) {
+async function handleFilesCommandOld_DISABLED(env, chatId) {
   if (!env.DB || !(await tableExists(env, "files"))) {
     await sendMessage(env, chatId, "최근 저장 파일 0건임.");
     return;
