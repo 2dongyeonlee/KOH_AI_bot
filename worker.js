@@ -38,7 +38,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-summary-rule-html-rooms-20260609-0600";
+const BUILD_VERSION = "koh-file-auto-structure-20260609-0700";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -1137,7 +1137,19 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
   }
 
   function fileSummaryText(f) {
-    return f.summary || f.extracted_text || f.content || null;
+    if (f.action_plan || f.deadline || f.background) {
+      const parts = [];
+      if (f.summary && !f.summary.startsWith("요약 미생성") && !f.summary.startsWith("분석 중")) {
+        parts.push(f.summary);
+      }
+      if (f.deadline) parts.push(`⚡ 마감: ${f.deadline}`);
+      if (f.action_plan) parts.push(`📋 액션: ${f.action_plan}`);
+      if (f.key_persons) parts.push(`👤 담당자: ${f.key_persons}`);
+      if (parts.length) return parts.join("\n");
+    }
+    const s = String(f.summary || f.extracted_text || f.content || "").trim();
+    if (s && !s.startsWith("요약 미생성") && !s.startsWith("분석 중")) return s.slice(0, 300);
+    return "";
   }
 
   function exportFileNote(f) {
@@ -4471,6 +4483,37 @@ async function persistIncomingMessage(env, message) {
       message_id: message.message_id || "",
     });
   }
+
+  // 보고성 메시지(긴 텍스트)는 구조화 분석
+  const msgContent = message.caption || message.text || "";
+  const isReportLike = msgContent.length >= 100 &&
+    /(보고|검토|확인|담당님|사장님|마감|일정|액션|방안|대응|협의|결정|진행)/i.test(msgContent);
+
+  if (isReportLike) {
+    const savedMsg = await env.DB.prepare(`
+      SELECT id FROM messages
+      WHERE sender_id = ? AND created_at >= datetime('now', '-5 seconds')
+      ORDER BY id DESC LIMIT 1
+    `).bind(String(message.from?.id || "")).first().catch(() => null);
+
+    if (savedMsg?.id) {
+      analyzeAndStructureFile(env, null, msgContent).then(async (structured) => {
+        if (!structured) return;
+        const structuredSummary =
+          `[요약] ${structured.summary}\n` +
+          (structured.actionPlan ? `[액션] ${structured.actionPlan}\n` : "") +
+          (structured.deadline ? `[마감] ${structured.deadline}` : "");
+        if (structuredSummary.trim().length > 10) {
+          await env.DB.prepare(`
+            UPDATE messages SET content = ? WHERE id = ?
+          `).bind(
+            msgContent + "\n\n---\n" + structuredSummary,
+            savedMsg.id
+          ).run().catch(() => {});
+        }
+      }).catch(() => {});
+    }
+  }
 }
 
 function getDocumentFileType(fileName, mimeType) {
@@ -4489,6 +4532,74 @@ function isSupportedDocument(message) {
   return ["txt", "html", "pdf", "docx", "pptx"].includes(type);
 }
 
+async function analyzeAndStructureFile(env, fileId, content) {
+  if (!content || content.length < 50) return null;
+  if (!env.DIFY_API_KEY) return null;
+
+  const query = TONE_RULE +
+    `다음 문서를 분석해서 아래 항목을 추출해줘. 없으면 "없음"으로.\n\n` +
+    `[추출 항목]\n` +
+    `요약: (3줄 이내 핵심 요약)\n` +
+    `주요배경: (왜 이 자료가 필요한지, 이슈 배경)\n` +
+    `액션플랜: (해야 할 일, 다음 단계)\n` +
+    `마감일자: (날짜·기한·일정 언급된 것, 없으면 "없음")\n` +
+    `주요담당자: (이름 언급된 사람들)\n\n` +
+    `문서 내용:\n${content.slice(0, 6000)}`;
+
+  try {
+    const result = await difyChat(env, { query, user: "file_analysis", conversationId: "" });
+    const answer = result.answer || "";
+
+    const extract = (label) => {
+      const m = answer.match(new RegExp(`${label}[:\\s]+([\\s\\S]*?)(?=\\n[가-힣]+:|$)`, "i"));
+      return m ? m[1].trim().replace(/^없음$/, "") : "";
+    };
+
+    return {
+      summary: extract("요약"),
+      background: extract("주요배경"),
+      actionPlan: extract("액션플랜"),
+      deadline: extract("마감일자"),
+      keyPersons: extract("주요담당자"),
+    };
+  } catch (e) {
+    console.error("analyzeAndStructureFile:", e);
+    return null;
+  }
+}
+
+async function updateFileStructure(env, fileId, structured) {
+  if (!env.DB || !fileId || !structured) return;
+  try {
+    const summaryText =
+      `[요약] ${structured.summary}\n` +
+      (structured.background ? `[배경] ${structured.background}\n` : "") +
+      (structured.actionPlan ? `[액션플랜] ${structured.actionPlan}\n` : "") +
+      (structured.deadline ? `[마감] ${structured.deadline}\n` : "") +
+      (structured.keyPersons ? `[담당자] ${structured.keyPersons}` : "");
+
+    await env.DB.prepare(`
+      UPDATE files SET
+        summary = ?,
+        action_plan = ?,
+        deadline = ?,
+        background = ?,
+        key_persons = ?,
+        structured_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).bind(
+      summaryText.trim(),
+      structured.actionPlan || "",
+      structured.deadline || "",
+      structured.background || "",
+      structured.keyPersons || "",
+      fileId
+    ).run();
+  } catch (e) {
+    console.error("updateFileStructure:", e);
+  }
+}
+
 async function persistIncomingFile(env, message) {
   if (!env.DB || !message?.document || message.from?.is_bot || message._filePersisted) return;
   if (!isSupportedDocument(message)) return;
@@ -4498,6 +4609,7 @@ async function persistIncomingFile(env, message) {
       await dbRegisterRoom(env, room.roomId, room.roomTitle, BOT_KEY, room.roomType);
     }
     const canonicalName = await getCanonicalUserName(env, message.from);
+
     await dbSaveFile(env, {
       telegram_file_id: message.document.file_id || "",
       telegram_file_unique_id: message.document.file_unique_id || "",
@@ -4513,13 +4625,30 @@ async function persistIncomingFile(env, message) {
       fileSize: message.document.file_size || 0,
       sourceType: room.sourceType,
       extracted_text: "",
-      summary: room.tags.includes("원본방 확인 불가 / 1:1 전달본")
-        ? "요약 미생성 / 파일 저장 완료 / 원본방 확인 불가 / 1:1 전달본"
-        : "요약 미생성 / 파일 저장 완료",
+      summary: "분석 중...",
       tags: ["document", ...room.tags],
     }, { throwOnError: true });
     message._filePersisted = true;
-    if (env.CONVERSATIONS) await env.CONVERSATIONS.put("debug_files_last", "파일 메타 저장 성공", { expirationTtl: 86400 });
+
+    // 캡션이 있으면 비동기로 내용 분석
+    const caption = message.caption || "";
+    if (caption.length >= 20) {
+      const saved = await env.DB.prepare(`
+        SELECT id FROM files
+        WHERE telegram_file_unique_id = ?
+        ORDER BY id DESC LIMIT 1
+      `).bind(message.document.file_unique_id || "").first();
+
+      if (saved?.id) {
+        analyzeAndStructureFile(env, saved.id, caption).then((structured) => {
+          if (structured) updateFileStructure(env, saved.id, structured);
+        }).catch((e) => console.error("async file analysis:", e));
+      }
+    }
+
+    if (env.CONVERSATIONS) {
+      await env.CONVERSATIONS.put("debug_files_last", "파일 메타 저장 성공", { expirationTtl: 86400 });
+    }
   } catch (e) {
     console.error("persistIncomingFile:", e);
     if (env.CONVERSATIONS) {
