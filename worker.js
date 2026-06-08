@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-file-dedup-uploader-normalize-20260609-0100";
+const BUILD_VERSION = "koh-db-schema-fix-20260609-0200";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -763,20 +763,20 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
         f.room_title,
         '알 수 없는 방'
       ) AS room_title,
-      COALESCE(NULLIF(f.uploader_name, ''), NULLIF(f.sender_name, ''), '') AS uploader_name,
+      COALESCE(NULLIF(f.uploader_name, ''), '') AS uploader_name,
       f.uploader_id,
-      f.sender_id,
+      '' AS sender_id,
       f.file_name,
-      f.file_size,
-      f.telegram_file_id,
-      f.telegram_file_unique_id,
+      0 AS file_size,
+      '' AS telegram_file_id,
+      '' AS telegram_file_unique_id,
       f.summary,
-      f.extracted_text,
+      f.content AS extracted_text,
       f.content,
-      f.tags_json,
-      f.source_type,
+      '' AS tags_json,
+      '' AS source_type,
       f.saved_by,
-      f.r2_key,
+      '' AS r2_key,
       f.created_at
     FROM files f
     LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(f.room_id AS TEXT)
@@ -800,7 +800,7 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
       ) AS room_title,
       m.sender_name,
       m.sender_id,
-      m.source_type,
+      '' AS source_type,
       m.saved_by,
       m.content,
       m.created_at
@@ -3255,13 +3255,13 @@ async function searchFilesForResend(env, text) {
     ? `COALESCE(CASE WHEN CAST(f.room_id AS INTEGER) > 0 THEN '1:1' END, CASE WHEN CAST(f.room_id AS INTEGER) < 0 THEN COALESCE(r.room_title, NULLIF(f.room_title, '1:1'), '알 수 없는 방') END, f.room_title, '알 수 없는 방')`
     : `COALESCE(CASE WHEN CAST(f.room_id AS INTEGER) > 0 THEN '1:1' END, NULLIF(f.room_title, ''), '알 수 없는 방')`;
   const actorExpr = hasUsers
-    ? (hasCanonical ? "COALESCE(NULLIF(u.canonical_name, ''), NULLIF(u.name, ''), f.uploader_name, f.sender_name, '공유자 미상')" : "COALESCE(NULLIF(u.name, ''), f.uploader_name, f.sender_name, '공유자 미상')")
-    : "COALESCE(f.uploader_name, f.sender_name, '공유자 미상')";
+    ? (hasCanonical ? "COALESCE(NULLIF(u.canonical_name, ''), NULLIF(u.name, ''), f.uploader_name, '공유자 미상')" : "COALESCE(NULLIF(u.name, ''), f.uploader_name, '공유자 미상')")
+    : "COALESCE(f.uploader_name, '공유자 미상')";
   const baseSelect = `
     SELECT f.*, ${sourceExpr} AS joined_room_title, ${actorExpr} AS actor
     FROM files f
     ${joins}
-    WHERE (f.file_name LIKE ? OR f.summary LIKE ? OR f.extracted_text LIKE ? OR f.room_title LIKE ?)
+    WHERE (f.file_name LIKE ? OR f.summary LIKE ? OR f.content LIKE ? OR f.room_title LIKE ?)
   `;
   const params = [like, like, like, like];
   let files = [];
@@ -3391,7 +3391,7 @@ async function answerFileSearch(env, text) {
       : `COALESCE(f.room_title, '알 수 없는 방')`;
     const files = (await env.DB.prepare(`
       SELECT 'file' AS type, f.file_name AS title, f.summary AS summary, ${fRoomTitle} AS room_title,
-        COALESCE(f.uploader_name, f.sender_name) AS actor, f.created_at, f.file_name AS location
+        COALESCE(f.uploader_name, '') AS actor, f.created_at, f.file_name AS location
       FROM files f ${fRoomJoin}
       WHERE f.file_name LIKE ? OR f.summary LIKE ?
       ORDER BY f.created_at DESC
@@ -3847,8 +3847,8 @@ async function fetchDigestRows(env, days = 2, limit = 120) {
       ? (hasCanonical ? "COALESCE(NULLIF(u.canonical_name, ''), NULLIF(u.name, ''), m.sender_name, 'unknown')" : "COALESCE(NULLIF(u.name, ''), m.sender_name, 'unknown')")
       : "COALESCE(m.sender_name, 'unknown')";
     const fileActorExpr = hasUsers
-      ? (hasCanonical ? "COALESCE(NULLIF(u.canonical_name, ''), NULLIF(u.name, ''), f.uploader_name, f.sender_name, 'unknown')" : "COALESCE(NULLIF(u.name, ''), f.uploader_name, f.sender_name, 'unknown')")
-      : "COALESCE(f.uploader_name, f.sender_name, 'unknown')";
+      ? (hasCanonical ? "COALESCE(NULLIF(u.canonical_name, ''), NULLIF(u.name, ''), f.uploader_name, 'unknown')" : "COALESCE(NULLIF(u.name, ''), f.uploader_name, 'unknown')")
+      : "COALESCE(f.uploader_name, 'unknown')";
     const messageSourceExpr = hasRooms
       ? `COALESCE(
           CASE WHEN CAST(m.room_id AS INTEGER) > 0 THEN '1:1' END,
@@ -3881,7 +3881,7 @@ async function fetchDigestRows(env, days = 2, limit = 120) {
       SELECT
         'message' AS type,
         m.room_id,
-        m.source_type,
+        '' AS source_type,
         ${messageSourceExpr} AS source,
         ${actorExpr} AS actor,
         m.content AS text,
@@ -3902,7 +3902,7 @@ async function fetchDigestRows(env, days = 2, limit = 120) {
         'telegram_file' AS source_type,
         ${fileSourceExpr} AS source,
         ${fileActorExpr} AS actor,
-        COALESCE(f.summary, f.extracted_text, f.file_name) AS text,
+        COALESCE(f.summary, f.content, f.file_name) AS text,
         f.created_at,
         f.file_name,
         NULL AS title
@@ -3923,7 +3923,7 @@ async function fetchDigestRows(env, days = 2, limit = 120) {
         SELECT
           'message' AS type,
           m.room_id,
-          m.source_type,
+          '' AS source_type,
           ${messageSourceExpr} AS source,
           ${actorExpr} AS actor,
           m.content AS text,
@@ -3943,7 +3943,7 @@ async function fetchDigestRows(env, days = 2, limit = 120) {
           'telegram_file' AS source_type,
           ${fileSourceExpr} AS source,
           ${fileActorExpr} AS actor,
-          COALESCE(f.summary, f.extracted_text, f.file_name) AS text,
+          COALESCE(f.summary, f.content, f.file_name) AS text,
           f.created_at,
           f.file_name,
           NULL AS title
@@ -4045,8 +4045,8 @@ async function fetchPriorityContext(env, text) {
     try {
       const files = await env.DB.prepare(`
         SELECT 'file' AS type, f.id, f.room_id, ${roomExprF} AS room_title,
-               f.uploader_id AS actor_id, COALESCE(f.uploader_name, f.sender_name) AS actor,
-               COALESCE(f.summary, f.extracted_text, f.file_name) AS text,
+               f.uploader_id AS actor_id, COALESCE(f.uploader_name, '') AS actor,
+               COALESCE(f.summary, f.content, f.file_name) AS text,
                f.created_at, f.file_name
         FROM files f
         ${roomJoinF}
@@ -5467,61 +5467,79 @@ async function sendDailyBriefingCurrent_DISABLED(env, { targetChatId = "", mock 
 }
 
 async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) {
-  const today = getTodayKST();
-  const isMonday = getKstDayOfWeek() === 1;
-  const title = isMonday ? "<b>지난주 주요 안건 공유드립니다.</b>" : "<b>전일 주요 안건 및 오늘 일정 공유드립니다.</b>";
-  const section1 = isMonday ? "주요 안건" : "전일 주요 안건";
-  const section2 = isMonday ? "이번주 일정" : "오늘 일정";
-  const section3 = isMonday ? "이번주 확인 과제" : "오늘 확인 과제";
-  const schedules = isMonday ? await getSchedulesForRange(env, today, 7) : await getSchedulesForDate(env, today);
-  const scheduleLines = schedules.length
-    ? schedules
-        .sort((a, b) => `${a.date || ""} ${a.time || ""}`.localeCompare(`${b.date || ""} ${b.time || ""}`))
-        .slice(0, 8)
-        .map((s) => `- ${formatShortDate(s.date || today)} ${s.time || ""} ${s.title || s.text || "일정"}`.replace(/\s+/g, " ").trim())
-        .join("\n")
-    : "- 오늘 일정 데이터가 없습니다.";
-  const briefingData = await kohBuildBriefingCandidates(env, isMonday ? 7 : 1);
-  const briefingCorpus = kohBuildBriefingCorpusFromCandidates(briefingData);
-  if (!briefingCorpus && !schedules.length) {
-    if (mock && targetChatId) await sendMessage(env, targetChatId, "최근 자료를 찾지 못했습니다.");
-    return;
-  }
-  let msg = "";
+  const today = new Date().toLocaleDateString("ko-KR", {
+    timeZone: "Asia/Seoul",
+    year: "numeric", month: "long", day: "numeric", weekday: "long",
+  });
+
+  let calText = "(캘린더 미연결)";
   try {
-    const adminUser = await findAdminUser(env);
-    const query =
-      TONE_RULE +
-      `[브리핑 제목]\n${title}\n\n` +
-      `[수집 기록]\n${briefingCorpus}\n\n` +
-      `[일정]\n${scheduleLines}\n\n` +
-      `[출력 형식]\n` +
-      `${title}\n\n` +
-      `1) ${section1}\n` +
-      `<b>[안건명]</b>\n` +
-      ` 🧩 <b>내용</b>: 1~2줄 요약\n` +
-      ` 📎 <b>자료 위치</b>: 방 이름 &gt; 파일명 또는 메시지\n` +
-      ` 👤 <b>공유자</b>: 공유자이름 / MM/DD\n\n` +
-      `2) ${section2}\n- MM/DD HH:MM 일정명\n\n` +
-      `3) ${section3}\n- 확인할 일\n\n` +
-      `[규칙]\n` +
-      `- 안건별로 병합. 핵심/확인/위치: 같은 표현은 절대 쓰지 마라.\n` +
-      `- source_type은 출력하지 말 것.\n` +
-      `- HTML 태그는 <b>만 사용.\n` +
-      `- 전체 1200자 이내. 짧고 보고형.\n`;
-    const result = await difyChat(env, { query, user: String(adminUser?.id || "admin"), conversationId: "" });
-    msg = result.answer || "";
-  } catch (error) {
-    console.error("sendDailyBriefing:", error);
+    const events = await getCalendarEvents(env, 1);
+    if (events && events.length > 0) {
+      calText = events.map((e) => {
+        const dt = e.start
+          ? new Date(e.start).toLocaleString("ko-KR", { timeZone: "Asia/Seoul", hour: "2-digit", minute: "2-digit" })
+          : "";
+        return `${dt} ${e.title}${e.location ? " (" + e.location + ")" : ""}`;
+      }).join("\n");
+    } else {
+      calText = "(오늘 등록된 일정 없음)";
+    }
+  } catch (e) { calText = "(캘린더 연동 확인 필요)"; }
+
+  let digestText = "(어제 자료 없음)";
+  let msgCount = 0;
+  let fileCount = 0;
+  try {
+    const { files, messages } = await kohFetchRecentFilesAndMessages(env, "", false, 1);
+    msgCount = messages.length;
+    fileCount = files.length;
+    let corpus = "";
+    if (messages.length > 0) {
+      corpus += "[대화]\n" + messages.slice(0, 50)
+        .map((m) => `[${m.room_title}] ${m.sender_name} (${(m.created_at||"").slice(0,16)}): ${(m.content||"").slice(0,100)}`)
+        .join("\n") + "\n\n";
+    }
+    if (files.length > 0) {
+      corpus += "[파일]\n" + files.slice(0, 20)
+        .map((f) => `[${f.room_title}] ${f.uploader_name} - ${f.file_name}: ${(f.summary||f.content||"").slice(0,150)}`)
+        .join("\n");
+    }
+    if (corpus.trim()) digestText = corpus.slice(0, 6000);
+  } catch (e) { console.error("브리핑 자료 오류:", e.message); }
+
+  const query = TONE_RULE +
+    `당신은 권오혁 담당의 개인 비서입니다. ${today} 아침 업무 브리핑을 작성하세요.\n\n` +
+    `[오늘 참석할 회의]\n${calText}\n\n` +
+    `[어제 공유된 자료·대화 (대화 ${msgCount}건, 파일 ${fileCount}건)]\n${digestText}\n\n` +
+    `[작성 규칙]\n` +
+    `섹션1: 오늘 회의 (없으면 생략)\n` +
+    `섹션2: 어제 공유 안건 요약 - 불릿 포인트 ·, 각 항목 아래 출처: [방이름] 발신자 (시간)\n` +
+    `섹션3: 파일 속 안건·마감일 (있을 때만)\n` +
+    `마크다운 기호(* # **) 절대 사용 금지. 이모티콘으로 섹션 구분. 700자 이내.`;
+
+  let briefing = "브리핑 생성 오류";
+  try {
+    const result = await difyChat(env, { query, user: "briefing", conversationId: "" });
+    briefing = result.answer || briefing;
+  } catch (e) { console.error("브리핑 Dify 오류:", e.message); }
+
+  const sendTarget = targetChatId || env.ADMIN_TELEGRAM_ID;
+  if (sendTarget) {
+    await sendMessage(env, sendTarget, briefing);
   }
-  if (!msg) {
-    msg = `${title}\n\n1) ${section1}\n- 최근 자료를 찾지 못했습니다.\n\n2) ${section2}\n${scheduleLines}\n\n3) ${section3}\n- 확인 과제 데이터가 없습니다.`;
-  }
-  const target = await resolveDailyBriefingTargetChatId(env, targetChatId);
-  if (target) {
-    await sendMessage(env, target, msg, { parseMode: "HTML" });
-  } else {
-    console.error("daily briefing target chat id missing");
+
+  if (!targetChatId) {
+    try {
+      const rooms = await env.DB.prepare(
+        `SELECT room_id FROM rooms WHERE bot_name = 'koh' ORDER BY joined_at DESC LIMIT 5`
+      ).all();
+      for (const room of (rooms.results || [])) {
+        if (String(room.room_id).startsWith("-")) {
+          await sendMessage(env, room.room_id, `[아침 브리핑]\n\n${briefing}`);
+        }
+      }
+    } catch (e) { console.error("단체방 발송 오류:", e.message); }
   }
 }
 
