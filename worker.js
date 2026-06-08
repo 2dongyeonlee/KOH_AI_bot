@@ -499,12 +499,16 @@ function kohExtractSearchTerms(text = "") {
     "목록", "리스트", "정리해", "알려줘야", "해라", "해줘라", "해줘야"
   ]);
 
+  // Also filter tokens that end with common Korean request/action suffixes
+  const stopSuffix = /^(요약|정리|알려|보여|보내|전달|공유|찾아|확인|첨부|올려)(해줘|해라|해야|해|줘|야)$|^(있어|있지|뭐야|뭐가|뭐있어|뭐있었|올라온|공유됐|공유된|됐어|됐지|됩니다)$/;
+
   return [...new Set(
     kohNormalizeText(text)
       .split(" ")
       .map(t => t.trim())
       .filter(t => t.length >= 2)
       .filter(t => !stopWords.has(t))
+      .filter(t => !stopSuffix.test(t))
       .slice(0, 10)
   )];
 }
