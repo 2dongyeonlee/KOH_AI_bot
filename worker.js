@@ -1742,6 +1742,18 @@ async function routeSlashCommand(env, message, text, chatId) {
     await sendMessage(env, chatId, "브리핑 테스트 발송 완료");
     return true;
   }
+  if (/^\/set_user_name\b/.test(t)) {
+    await handleSetUserName(env, chatId, t);
+    return true;
+  }
+  if (/^\/debug_users\b/.test(t)) {
+    await handleDebugUsers(env, chatId);
+    return true;
+  }
+  if (/^\/debug_search\b/.test(t)) {
+    await handleDebugSearch(env, chatId, t);
+    return true;
+  }
   if (/^\/help\b/.test(t)) {
     await sendMessage(env, chatId, getHelpText());
     return true;
