@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-export-search-briefing-fix-20260609-0500";
+const BUILD_VERSION = "koh-user-memory-push-fix-20260609-0900";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -339,13 +339,12 @@ async function upsertUser(env, from, chatId, source = "auto_message") {
     `).bind(telegramId).first();
     const displayName = getSenderName(from);
     const candidates = uniqueNames(parseNameCandidates(prev?.name_candidates), prev?.name, prev?.canonical_name, displayName);
-    const finalName = String(prev?.canonical_name || "").trim()
-      || (isBetterUserName(displayName, prev?.name) ? displayName : (prev?.name || displayName));
+    const canonicalForInsert = String(prev?.canonical_name || "").trim() || displayName;
     const columns = ["telegram_id", "chat_id", "name", "username", "first_name", "last_name", "source", "last_seen_at"];
-    const values = [telegramId, String(chatId || from.id), finalName, from.username || "", from.first_name || "", from.last_name || "", source, "CURRENT_TIMESTAMP"];
+    const values = [telegramId, String(chatId || from.id), displayName, from.username || "", from.first_name || "", from.last_name || "", source, "CURRENT_TIMESTAMP"];
     if (hasCanonical) {
       columns.push("canonical_name");
-      values.push(finalName);
+      values.push(canonicalForInsert);
     }
     if (hasCandidates) {
       columns.push("name_candidates");
@@ -370,6 +369,8 @@ async function upsertUser(env, from, chatId, source = "auto_message") {
       ON CONFLICT(telegram_id) DO UPDATE SET
         ${updateSets.join(",\n        ")}
     `).bind(...bindValues).run();
+    await saveUserAlias(env, telegramId, displayName, { source, sourceTable: "users", sourceId: telegramId });
+    if (prev?.name) await saveUserAlias(env, telegramId, prev.name, { source: "previous_user_name", sourceTable: "users", sourceId: telegramId });
     await maybeAskCanonicalNameConflict(env, telegramId, String(chatId || from.id), candidates);
   } catch (e) {
     console.error("upsertUser:", e);
@@ -406,6 +407,16 @@ async function upsertRoomMember(env, chat, from, source = "message") {
       from.username || "",
       BOT_KEY
     ).run();
+    await upsertRoomPerson(env, {
+      roomId: String(chat.id),
+      roomTitle: chat.title || chat.username || String(chat.id),
+      telegramId: String(from.id),
+      personName: canonicalName,
+      canonicalName,
+      username: from.username || "",
+      source: source === "message" ? "telegram_message" : source,
+      confidence: "confirmed",
+    });
   } catch (e) {
     console.error(`upsertRoomMember:${source}`, e);
   }
@@ -434,8 +445,8 @@ async function resolveUserName(env, userId, fallbackName = "") {
     if (!(await tableExists(env, "users"))) return fallback;
     const { hasCanonical } = await getUserNameColumnInfo(env);
     const nameExpr = hasCanonical
-      ? "COALESCE(NULLIF(canonical_name,''), NULLIF(name,''))"
-      : "NULLIF(name,'')";
+      ? "COALESCE(NULLIF(canonical_name,''), NULLIF(name,''), NULLIF(TRIM(COALESCE(first_name,'') || ' ' || COALESCE(last_name,'')), ''), NULLIF(username,''))"
+      : "COALESCE(NULLIF(name,''), NULLIF(TRIM(COALESCE(first_name,'') || ' ' || COALESCE(last_name,'')), ''), NULLIF(username,''))";
     const row = await env.DB.prepare(
       `SELECT ${nameExpr} AS name FROM users WHERE CAST(telegram_id AS TEXT) = ? LIMIT 1`
     ).bind(String(userId)).first();
@@ -2205,6 +2216,26 @@ async function routeSlashCommand(env, message, text, chatId) {
     await handleDebugUsers(env, chatId);
     return true;
   }
+  if (/^\/debug_aliases\b/.test(t)) {
+    await handleDebugAliases(env, chatId);
+    return true;
+  }
+  if (/^\/debug_people\b/.test(t)) {
+    await handleDebugPeople(env, chatId);
+    return true;
+  }
+  if (/^\/room_people\b/.test(t)) {
+    await handleRoomPeople(env, message, chatId);
+    return true;
+  }
+  if (/^\/register_person\b/.test(t)) {
+    await handleRegisterPerson(env, message, chatId, t);
+    return true;
+  }
+  if (/^\/link_person\b/.test(t)) {
+    await handleLinkPerson(env, message, chatId, t);
+    return true;
+  }
   if (/^\/debug_search\b/.test(t)) {
     await handleDebugSearch(env, chatId, t);
     return true;
@@ -2531,6 +2562,7 @@ async function handleSetUserName(env, chatId, text) {
     } catch (_) {}
   }
   try {
+    const prev = await env.DB.prepare(`SELECT name, canonical_name FROM users WHERE telegram_id = ? LIMIT 1`).bind(userId).first().catch(() => null);
     await env.DB.prepare(`
       INSERT INTO users (telegram_id, canonical_name, name, last_seen_at)
       VALUES (?, ?, ?, CURRENT_TIMESTAMP)
@@ -2539,6 +2571,8 @@ async function handleSetUserName(env, chatId, text) {
         name = COALESCE(NULLIF(name, ''), excluded.name),
         last_seen_at = CURRENT_TIMESTAMP
     `).bind(userId, name, name).run();
+    await saveUserAlias(env, userId, prev?.name || name, { source: "set_user_name", sourceTable: "users", sourceId: userId });
+    await saveUserAlias(env, userId, prev?.canonical_name || name, { source: "set_user_name", sourceTable: "users", sourceId: userId });
     await sendMessage(env, chatId, `사용자명 정규화 완료: ${userId} → ${name}`);
   } catch (e) {
     await sendMessage(env, chatId, `set_user_name 실패: ${String(e?.message || e).slice(0, 300)}`);
@@ -2555,13 +2589,139 @@ async function handleDebugUsers(env, chatId) {
     const { hasCanonical } = await getUserNameColumnInfo(env);
     const cols = `telegram_id, name, ${hasCanonical ? "canonical_name," : ""} username, last_seen_at`;
     const recent = await env.DB.prepare(`SELECT ${cols} FROM users ORDER BY last_seen_at DESC LIMIT 10`).all();
-    const lines = (recent.results || []).map(u =>
-      `id: ${u.telegram_id}\n  name: ${u.name || ""}\n  canonical: ${u.canonical_name || "없음"}\n  username: @${u.username || ""}\n  seen: ${String(u.last_seen_at || "").slice(0, 10)}`
-    ).join("\n\n");
+    const lines = (await Promise.all((recent.results || []).map(async u =>
+      `id: ${u.telegram_id}\n  name: ${u.name || ""}\n  canonical: ${u.canonical_name || "없음"}\n  username: @${u.username || ""}\n  seen: ${String(u.last_seen_at || "").slice(0, 10)}\n  aliases: ${await aliasesForUser(env, u.telegram_id) || "없음"}`
+    ))).join("\n\n");
     await sendMessage(env, chatId, `users count: ${count?.count || 0}\n\n${lines || "없음"}`);
   } catch (e) {
     await sendMessage(env, chatId, `debug_users 실패: ${String(e?.message || e).slice(0, 300)}`);
   }
+}
+
+async function aliasesForUser(env, telegramId) {
+  if (!env.DB || !telegramId || !(await tableExists(env, "user_aliases"))) return "";
+  const rows = await env.DB.prepare(`
+    SELECT alias_name FROM user_aliases
+    WHERE telegram_id = ?
+    ORDER BY count DESC, last_seen_at DESC
+    LIMIT 8
+  `).bind(String(telegramId)).all();
+  return (rows.results || []).map(r => r.alias_name).filter(Boolean).join(", ");
+}
+
+async function handleDebugAliases(env, chatId) {
+  if (!env.DB || !(await tableExists(env, "user_aliases"))) {
+    await sendMessage(env, chatId, "user_aliases 테이블 없음.");
+    return;
+  }
+  try {
+    const rows = await env.DB.prepare(`
+      SELECT a.telegram_id, COALESCE(NULLIF(u.canonical_name,''), NULLIF(u.name,''), '') AS canonical_name,
+             a.alias_name, a.source, a.source_room_title, a.count, a.last_seen_at
+      FROM user_aliases a
+      LEFT JOIN users u ON CAST(u.telegram_id AS TEXT) = CAST(a.telegram_id AS TEXT)
+      ORDER BY a.last_seen_at DESC
+      LIMIT 50
+    `).all();
+    const lines = (rows.results || []).map(a =>
+      `${a.telegram_id} / canonical=${a.canonical_name || "없음"}\n  alias=${a.alias_name} / source=${a.source || ""} / room=${a.source_room_title || ""} / count=${a.count || 0} / seen=${String(a.last_seen_at || "").slice(0, 10)}`
+    ).join("\n\n");
+    await sendMessage(env, chatId, `최근 aliases ${(rows.results || []).length}개\n\n${lines || "없음"}`);
+  } catch (e) {
+    await sendMessage(env, chatId, `debug_aliases 실패: ${String(e?.message || e).slice(0, 300)}`);
+  }
+}
+
+async function handleDebugPeople(env, chatId) {
+  if (!env.DB || !(await tableExists(env, "room_people"))) {
+    await sendMessage(env, chatId, "room_people 테이블 없음.");
+    return;
+  }
+  try {
+    const count = await env.DB.prepare(`SELECT COUNT(*) AS count FROM room_people`).first();
+    const rows = await env.DB.prepare(`
+      SELECT room_title, telegram_id, person_name, canonical_name, team, role, source, confidence, owner_name, last_seen_at
+      FROM room_people
+      ORDER BY last_seen_at DESC
+      LIMIT 30
+    `).all();
+    const lines = (rows.results || []).map(p =>
+      `${p.room_title || "알 수 없는 방"}\n  id=${p.telegram_id || "없음"} / ${p.canonical_name || p.person_name} / raw=${p.person_name}\n  team=${p.team || ""} / role=${p.role || ""} / ${p.source || ""}/${p.confidence || ""} / owner=${p.owner_name || ""} / seen=${String(p.last_seen_at || "").slice(0, 10)}`
+    ).join("\n\n");
+    await sendMessage(env, chatId, `room_people count: ${count?.count || 0}\n\n${lines || "없음"}`);
+  } catch (e) {
+    await sendMessage(env, chatId, `debug_people 실패: ${String(e?.message || e).slice(0, 300)}`);
+  }
+}
+
+async function handleRoomPeople(env, message, chatId) {
+  if (!env.DB || !(await tableExists(env, "room_people"))) {
+    await sendMessage(env, chatId, "현재 저장된 인물 기록이 없습니다.");
+    return;
+  }
+  try {
+    const rows = await env.DB.prepare(`
+      SELECT telegram_id, person_name, canonical_name, team, role, source, confidence, last_seen_at
+      FROM room_people
+      WHERE CAST(room_id AS TEXT) = ?
+      ORDER BY confidence ASC, last_seen_at DESC
+      LIMIT 50
+    `).bind(String(message.chat.id)).all();
+    const lines = await Promise.all((rows.results || []).map(async p => {
+      const name = p.telegram_id ? await resolveUserName(env, p.telegram_id, p.canonical_name || p.person_name) : (p.canonical_name || p.person_name);
+      const status = p.confidence === "confirmed" ? "확정" : "추정";
+      const teamRole = [p.team, p.role].filter(Boolean).join(" / ");
+      return `- ${name}${teamRole ? ` / ${teamRole}` : ""} / ${status}`;
+    }));
+    await sendMessage(env, chatId,
+      `현재 저장 기록 기준으로 확인된 인물입니다.\n\n${lines.join("\n") || "저장된 인물 기록이 없습니다."}\n\nTelegram 전체 멤버 목록을 직접 조회한 것은 아니며, 저장 자료/export/수동 등록 기준입니다.`
+    );
+  } catch (e) {
+    await sendMessage(env, chatId, `room_people 실패: ${String(e?.message || e).slice(0, 300)}`);
+  }
+}
+
+async function handleRegisterPerson(env, message, chatId, text) {
+  const raw = String(text || "").replace(/^\/register_person\s*/i, "").trim();
+  const match = raw.match(/^(.+?)\s*\/\s*(.+)$/);
+  if (!match) {
+    await sendMessage(env, chatId, "사용법: /register_person <이름> / <소속 또는 역할>");
+    return;
+  }
+  const personName = compactPersonName(match[1]);
+  const teamRole = compactPersonName(match[2]);
+  const ownerName = await resolveUserName(env, message.from?.id, getSenderName(message.from));
+  await upsertRoomPerson(env, {
+    roomId: String(message.chat.id),
+    roomTitle: getRoomTitleForMessage(message),
+    personName,
+    canonicalName: personName,
+    team: teamRole,
+    source: "manual_register",
+    confidence: "inferred",
+    ownerUserId: String(message.from?.id || ""),
+    ownerName,
+  });
+  await sendMessage(env, chatId, `인물 등록 완료: ${personName} / ${teamRole}`);
+}
+
+async function handleLinkPerson(env, message, chatId, text) {
+  const raw = String(text || "").replace(/^\/link_person\s*/i, "").trim();
+  const match = raw.match(/^(.+?)\s+(\S+)$/);
+  if (!match) {
+    await sendMessage(env, chatId, "사용법: /link_person <이름> <telegram_id>");
+    return;
+  }
+  const personName = compactPersonName(match[1]);
+  const telegramId = match[2].trim();
+  const resolved = await resolveUserName(env, telegramId, personName);
+  await env.DB.prepare(`
+    UPDATE room_people
+    SET telegram_id = ?, canonical_name = ?, confidence = 'confirmed', updated_at = CURRENT_TIMESTAMP, last_seen_at = CURRENT_TIMESTAMP
+    WHERE room_id = ? AND person_name = ?
+  `).bind(telegramId, resolved, String(message.chat.id), personName).run();
+  await saveUserAlias(env, telegramId, personName, { source: "link_person", roomId: String(message.chat.id), roomTitle: getRoomTitleForMessage(message), sourceTable: "room_people" });
+  await sendMessage(env, chatId, `인물 연결 완료: ${personName} -> ${telegramId}`);
 }
 
 async function handleDebugIntent(env, chatId, text) {
@@ -2681,6 +2841,117 @@ async function handleDebugFiles(env, chatId) {
   } catch (e) {
     await sendMessage(env, chatId, `debug_files 실패\n${String(e?.stack || e?.message || e).slice(0, 1200)}`);
   }
+}
+
+function compactPersonName(value = "") {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeAliasName(value = "") {
+  return compactPersonName(value).replace(/^@+/, "").trim();
+}
+
+async function saveUserAlias(env, telegramId, aliasName, meta = {}) {
+  const alias = normalizeAliasName(aliasName);
+  if (!env.DB || !telegramId || !alias || !(await tableExists(env, "user_aliases"))) return;
+  try {
+    await env.DB.prepare(`
+      INSERT INTO user_aliases (
+        telegram_id, alias_name, source, source_room_id, source_room_title, source_table, source_id,
+        first_seen_at, last_seen_at, count
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
+      ON CONFLICT(telegram_id, alias_name) DO UPDATE SET
+        source = COALESCE(NULLIF(excluded.source, ''), source),
+        source_room_id = COALESCE(NULLIF(excluded.source_room_id, ''), source_room_id),
+        source_room_title = COALESCE(NULLIF(excluded.source_room_title, ''), source_room_title),
+        source_table = COALESCE(NULLIF(excluded.source_table, ''), source_table),
+        source_id = COALESCE(NULLIF(excluded.source_id, ''), source_id),
+        last_seen_at = CURRENT_TIMESTAMP,
+        count = COALESCE(count, 0) + 1
+    `).bind(
+      String(telegramId),
+      alias,
+      meta.source || "",
+      meta.roomId || "",
+      meta.roomTitle || "",
+      meta.sourceTable || "",
+      meta.sourceId || ""
+    ).run();
+  } catch (e) {
+    console.error("saveUserAlias:", e);
+  }
+}
+
+async function upsertRoomPerson(env, data = {}) {
+  if (!env.DB || !data.roomId || !data.personName || !(await tableExists(env, "room_people"))) return;
+  try {
+    await env.DB.prepare(`
+      INSERT INTO room_people (
+        room_id, room_title, telegram_id, person_name, canonical_name, username, team, role,
+        source, confidence, owner_user_id, owner_name, first_seen_at, last_seen_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      ON CONFLICT DO UPDATE SET
+        room_title = excluded.room_title,
+        canonical_name = COALESCE(NULLIF(excluded.canonical_name, ''), canonical_name),
+        username = COALESCE(NULLIF(excluded.username, ''), username),
+        team = COALESCE(NULLIF(excluded.team, ''), team),
+        role = COALESCE(NULLIF(excluded.role, ''), role),
+        source = excluded.source,
+        confidence = excluded.confidence,
+        owner_user_id = COALESCE(NULLIF(excluded.owner_user_id, ''), owner_user_id),
+        owner_name = COALESCE(NULLIF(excluded.owner_name, ''), owner_name),
+        last_seen_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+    `).bind(
+      String(data.roomId),
+      data.roomTitle || "",
+      data.telegramId ? String(data.telegramId) : "",
+      data.personName,
+      data.canonicalName || data.personName,
+      data.username || "",
+      data.team || "",
+      data.role || "",
+      data.source || "auto",
+      data.confidence || "confirmed",
+      data.ownerUserId || "",
+      data.ownerName || ""
+    ).run();
+  } catch (e) {
+    console.error("upsertRoomPerson:", e);
+  }
+}
+
+function extractMentionedPeople(text = "") {
+  const source = String(text || "").replace(/\s+/g, " ");
+  const found = [];
+  const patterns = [
+    /([A-Za-z0-9가-힣 .&]+?(?:팀|담당|구성원|기획|전략|Comm\.?|커뮤니케이션)[A-Za-z0-9가-힣 .&]*)\s*\/\s*([가-힣]{2,5})/g,
+    /([가-힣]{2,5})\s*(?:님)?\s*\(([^)]*?)\s*\/\s*([가-힣]{2,5})\)/g,
+  ];
+  for (const re of patterns) {
+    let m;
+    while ((m = re.exec(source))) {
+      if (m.length === 3) {
+        found.push({ team: compactPersonName(m[1]), personName: compactPersonName(m[2]) });
+      } else if (m.length === 4) {
+        found.push({ personName: compactPersonName(m[1]), team: compactPersonName(m[2]), role: compactPersonName(m[3]) });
+      }
+    }
+  }
+  const seen = new Set();
+  return found.filter(p => {
+    if (!p.personName || p.personName.length < 2) return false;
+    const key = `${p.personName}|${p.team || ""}|${p.role || ""}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, 10);
+}
+
+function isPeopleMemoryQuery(text = "") {
+  return /(누가|누구|사람|인물|구성원|멤버|이름|등록).*(등록|기억|확인|알려|보여|있어)|방\s*구성원|저장된\s*(사람|인물|이름)|다른\s*사람.*등록/i.test(String(text || ""));
 }
 
 async function kohBuildBriefingCandidates(env, days = 1) {
@@ -4040,6 +4311,21 @@ async function persistIncomingMessage(env, message) {
   }
   if (!text.trim()) return;
   const senderName = await getCanonicalUserName(env, message.from);
+  for (const person of extractMentionedPeople(text)) {
+    await upsertRoomPerson(env, {
+      roomId: String(message.chat.id),
+      roomTitle: getRoomTitleForMessage(message),
+      telegramId: "",
+      personName: person.personName,
+      canonicalName: person.personName,
+      team: person.team || "",
+      role: person.role || "",
+      source: "mentioned_in_message",
+      confidence: "inferred",
+      ownerUserId: String(message.from?.id || ""),
+      ownerName: senderName,
+    });
+  }
   const saved = await dbInsert(env, {
     roomId: message.chat.id,
     roomTitle: getRoomTitleForMessage(message),
@@ -4282,6 +4568,11 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
   if (isUrlSummaryQuery(text)) {
     const answer = await answerUrlSummary(env, text, userId);
     await sendMessage(env, chatId, answer);
+    return;
+  }
+
+  if (isPeopleMemoryQuery(text)) {
+    await handleRoomPeople(env, message, chatId);
     return;
   }
 
@@ -4635,6 +4926,11 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
   if (isUrlSummaryQuery(cleanText)) {
     const answer = await answerUrlSummary(env, cleanText, userId);
     await sendMessage(env, chatId, answer);
+    return;
+  }
+
+  if (isPeopleMemoryQuery(cleanText)) {
+    await handleRoomPeople(env, message, chatId);
     return;
   }
 

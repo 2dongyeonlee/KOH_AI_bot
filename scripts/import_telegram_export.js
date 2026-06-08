@@ -154,7 +154,8 @@ function userFromMessage(message) {
   const id = message.from_id || message.actor_id || "";
   const name = message.from || message.actor || "";
   if (!id && !name) return null;
-  return { id: String(id || `export_user_${hashText(name)}`), name: String(name || id) };
+  const normalizedName = String(name || "").toLowerCase().replace(/\s+/g, "_").replace(/[^\w가-힣]/g, "");
+  return { id: String(id || `export:${normalizedName || hashText(name)}`), name: String(name || id) };
 }
 
 function contextMessages(messages, index, radius = 3) {
@@ -210,6 +211,8 @@ function main() {
 
   const roomCols = columnsFor(dbName, "rooms");
   const userCols = columnsFor(dbName, "users");
+  const aliasCols = columnsFor(dbName, "user_aliases");
+  const roomPeopleCols = columnsFor(dbName, "room_people");
   const messageCols = columnsFor(dbName, "messages");
   const fileCols = columnsFor(dbName, "files");
 
@@ -245,13 +248,44 @@ function main() {
     if (user) {
       statements.push(insertSelect("users", {
         telegram_id: user.id,
-        user_id: user.id,
         chat_id: user.id,
         name: user.name,
         canonical_name: user.name,
         source: "telegram_export",
         last_seen_at: message.date || new Date().toISOString(),
       }, userCols, `SELECT 1 FROM users WHERE telegram_id = ${sql(user.id)}`));
+      statements.push(updateWhere("users", {
+        name: user.name,
+        source: "telegram_export",
+        last_seen_at: message.date || new Date().toISOString(),
+        canonical_name: user.name,
+      }, userCols, `telegram_id = ${sql(user.id)} AND (canonical_name IS NULL OR canonical_name = '')`));
+      statements.push(updateWhere("users", {
+        name: user.name,
+        source: "telegram_export",
+        last_seen_at: message.date || new Date().toISOString(),
+      }, userCols, `telegram_id = ${sql(user.id)}`));
+      statements.push(insertSelect("user_aliases", {
+        telegram_id: user.id,
+        alias_name: user.name,
+        source: "telegram_export",
+        source_room_id: roomId,
+        source_room_title: roomTitle,
+        source_table: "messages",
+        source_id: String(message.id || ""),
+        last_seen_at: message.date || new Date().toISOString(),
+        count: 1,
+      }, aliasCols, `SELECT 1 FROM user_aliases WHERE telegram_id = ${sql(user.id)} AND alias_name = ${sql(user.name)}`));
+      statements.push(insertSelect("room_people", {
+        room_id: roomId,
+        room_title: roomTitle,
+        telegram_id: user.id,
+        person_name: user.name,
+        canonical_name: user.name,
+        source: "telegram_export",
+        confidence: "confirmed",
+        last_seen_at: message.date || new Date().toISOString(),
+      }, roomPeopleCols, `SELECT 1 FROM room_people WHERE room_id = ${sql(roomId)} AND telegram_id = ${sql(user.id)}`));
     }
 
     const exportMessageId = message.id ? String(message.id) : hashText(`${message.date}|${user?.id || ""}|${contentForMessage}`);

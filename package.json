@@ -1,6 +1,7 @@
 {
   "scripts": {
-    "import:telegram": "node scripts/import_telegram_export.js"
+    "import:telegram": "node scripts/import_telegram_export.js",
+    "backfill:users": "node scripts/backfill_users.js"
   },
   "dependencies": {
     "@cloudflare/workers-types": "latest",
