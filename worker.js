@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-user-memory-push-fix-20260609-0900";
+const BUILD_VERSION = "koh-file-dedup-uploader-normalize-20260609-0100";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -690,6 +690,19 @@ function kohFormatThreeLineItem({ title = "", content = "", location = "", perso
  👤 <b>공유자</b>: ${safePerson} / ${safeDate}`;
 }
 
+function kohFormatThreeLineItem({ title = "", content = "", location = "", person = "", date = "" }) {
+  const safeTitle = kohEscapeHtml(title || "확인된 자료");
+  const safeContent = kohEscapeHtml(kohShortText(content || "요약 없음", 220));
+  const safeLocation = kohEscapeHtml(location || "위치 확인 필요");
+  const safePerson = kohEscapeHtml(person || "공유자 확인 필요");
+  const safeDate = kohEscapeHtml(date || "일자 확인 필요");
+
+  return `<b>[${safeTitle}]</b>
+- 🧩 <b>내용</b>: ${safeContent}
+- 📎 <b>자료 위치</b>: ${safeLocation}
+- 👤 <b>공유자/일자</b>: ${safePerson} / ${safeDate}`;
+}
+
 async function kohSendHtml(env, chatId, text) {
   const token = env.TELEGRAM_BOT_TOKEN;
   if (!token) return;
@@ -710,7 +723,7 @@ async function kohSendDocument(env, chatId, file, caption = "") {
   const token = env.TELEGRAM_BOT_TOKEN;
   if (!token) return false;
 
-  const documentId = file.telegram_file_id;
+  const documentId = file._sendTelegramFileId || file.telegram_file_id;
   if (!documentId) return false;
 
   const res = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
@@ -914,7 +927,7 @@ async function kohHandlePendingSelection(env, chatId, userId, text) {
   const location = `${resolvedRoom} > ${item.file_name || "파일명 없음"}`;
 
   if (state.intent === KOH_INTENT.FILE_RESEND) {
-    const tgFileId = item.telegram_file_id || "";
+    const tgFileId = item._sendTelegramFileId || item.telegram_file_id || "";
     if (tgFileId) {
       const caption = kohFormatThreeLineItem({
         title: inferTitle(item),
@@ -1006,6 +1019,58 @@ function kohDedupFiles(files) {
       if (best) rep.extracted_text = best;
     }
 
+    return rep;
+  });
+}
+
+function kohDedupFiles(files) {
+  const groups = new Map();
+
+  for (const f of files || []) {
+    const baseName = String(f.file_name || "").toLowerCase().replace(/\s+/g, " ").trim();
+    const day = String(f.created_at || "").slice(0, 10);
+    const size = Number(f.file_size || 0) || 0;
+    const key = f.telegram_file_unique_id
+      ? `uniq:${f.telegram_file_unique_id}`
+      : f.telegram_file_id
+      ? `tg:${f.telegram_file_id}`
+      : baseName && size
+      ? `name_size_room:${baseName}:${size}:${f.room_id || ""}`
+      : baseName && day
+      ? `name_day:${baseName}:${day}`
+      : baseName
+      ? `name_room:${baseName}:${f.room_id || ""}`
+      : `id:${f.id}`;
+
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(f);
+  }
+
+  return [...groups.entries()].map(([key, rows]) => {
+    const ranked = rows.slice().sort((a, b) => {
+      const score = r =>
+        (r.telegram_file_id ? 10000 : 0) +
+        (r.summary ? 2000 : 0) +
+        (r.extracted_text ? 1000 : 0) +
+        (r.content ? 500 : 0) +
+        Number(r.file_size || 0) +
+        ((Date.parse(r.created_at || "") || 0) / 100000000000);
+      return score(b) - score(a);
+    });
+
+    const rep = { ...ranked[0] };
+    const sendable = ranked.find(r => r.telegram_file_id);
+    if (sendable) {
+      rep._sendTelegramFileId = sendable.telegram_file_id;
+      rep._sendFileRowId = sendable.id;
+    }
+    rep._dedupKey = key;
+    rep._representativeId = rep.id;
+    rep._duplicateIds = rows.map(r => r.id);
+    rep._isDuplicate = rows.length > 1;
+    if (!rep.summary) rep.summary = rows.map(r => r.summary || "").sort((a, b) => b.length - a.length)[0] || rep.summary;
+    if (!rep.extracted_text) rep.extracted_text = rows.map(r => r.extracted_text || "").sort((a, b) => b.length - a.length)[0] || rep.extracted_text;
+    if (!rep.content) rep.content = rows.map(r => r.content || "").sort((a, b) => b.length - a.length)[0] || rep.content;
     return rep;
   });
 }
@@ -1131,7 +1196,7 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
     }
     const top = scoredFiles[0], second = scoredFiles[1];
     const ambiguous = second && (top._score - second._score) <= 8;
-    if (ambiguous) {
+    if (false && ambiguous) {
       const candidates = await kohResolveItems(env, scoredFiles.slice(0, 3), "uploader_id", "uploader_name");
       await kohSavePending(env, chatId, KOH_INTENT.FILE_SUMMARY, candidates);
       const body = candidates.map((f, i) => kohFormatThreeLineItem({
@@ -2417,7 +2482,10 @@ function normalizeRoomTitle(row, titleKey = "room_title", joinedKey = "joined_ro
   const roomId = Number(row?.room_id);
   const joined = String(row?.[joinedKey] || "").trim();
   const own = String(row?.[titleKey] || "").trim();
-  if (Number.isFinite(roomId) && roomId > 0) return "1:1";
+  if (Number.isFinite(roomId) && roomId > 0) {
+    const name = String(row?.actor || row?._resolvedName || row?.uploader_name || row?.sender_name || "").trim();
+    return name ? `1:1(${name})` : "1:1";
+  }
   if (Number.isFinite(roomId) && roomId < 0) {
     return joined || (own && own !== "1:1" ? own : "unknown_group");
   }
@@ -2785,9 +2853,9 @@ async function handleDebugSearch(env, chatId, text) {
     out += `excluded_room_count: ${debug?.excludedRoomCount || 0}\n\n`;
     out += `files (deduped, top 5 by score):\n`;
     for (const f of scoredFiles) {
-      out += `  score=${f._score} id=${f.id}${f._isDuplicate ? ` dups=[${f._duplicateIds.join(",")}]` : ""}\n`;
-      out += `    room=${f._resolvedRoom} file=${f.file_name || ""}\n`;
-      out += `    raw_uploader=${f.uploader_name || "?"} resolved=${f._resolvedName} tg=${f.telegram_file_id ? "Y" : "N"} export=${exportFiles.some(x => x.id === f.id) ? "Y" : "N"} ${String(f.created_at || "").slice(0, 10)}\n`;
+      out += `  score=${f._score} selected_representative_id=${f._representativeId || f.id} duplicate_ids=[${(f._duplicateIds || []).join(",") || "없음"}]\n`;
+      out += `    resolved_room_title=${f._resolvedRoom} file=${f.file_name || ""}\n`;
+      out += `    raw_uploader=${f.uploader_name || "?"} resolved_uploader=${f._resolvedName} telegram_file_id=${f.telegram_file_id ? "있음" : "없음"} send_row=${f._sendFileRowId || f.id} export=${exportFiles.some(x => x.id === f.id) ? "Y" : "N"} ${String(f.created_at || "").slice(0, 10)}\n`;
     }
     out += `\nmessages (total ${messages.length}건, top 5 before filter):\n`;
     for (const m of scoredMsgs) {
@@ -2838,6 +2906,44 @@ async function handleDebugFiles(env, chatId) {
     await sendMessage(env, chatId,
       `files total: ${total}건  raw_fetched: ${rawSlice.length}건  deduped: ${deduped.length}건\n\n${lines}`
     );
+  } catch (e) {
+    await sendMessage(env, chatId, `debug_files 실패\n${String(e?.stack || e?.message || e).slice(0, 1200)}`);
+  }
+}
+
+async function handleDebugFiles(env, chatId) {
+  try {
+    if (!env.DB || !(await tableExists(env, "files"))) {
+      await sendMessage(env, chatId, "files 테이블 없음.");
+      return;
+    }
+    const count = await env.DB.prepare(`SELECT COUNT(*) AS count FROM files`).first();
+    const total = count?.count || 0;
+    const { files: rawFiles } = await kohFetchRecentFilesAndMessages(env, "", false, null);
+    const deduped = kohDedupFiles(rawFiles);
+    const resolved = await kohResolveItems(env, deduped, "uploader_id", "uploader_name");
+
+    const lines = resolved.slice(0, 15).map(f => {
+      const duplicateIds = (f._duplicateIds || []).filter(id => id !== f.id);
+      const roomDisplay = Number(f.room_id || 0) > 0
+        ? `${f._resolvedRoom} / room_id=${f.room_id}`
+        : `${f._resolvedRoom || f.room_title || "알 수 없는 방"} / room_id=${f.room_id || ""}`;
+      return [
+        `id=${f.id} representative=${f._representativeId || f.id}`,
+        `duplicate_group: ${f._dedupKey || f.file_name || f.id}`,
+        `duplicate_ids: ${duplicateIds.length ? duplicateIds.join(",") : "없음"}`,
+        `room: ${roomDisplay}`,
+        `file_name: ${f.file_name || "파일명 없음"}`,
+        `raw_uploader: ${f.uploader_name || f.sender_name || "없음"}`,
+        `resolved_uploader: ${f._resolvedName || "공유자 확인 필요"}`,
+        `telegram_file_id: ${f.telegram_file_id ? "있음" : "없음"} send_row=${f._sendFileRowId || f.id}`,
+        `telegram_file_unique_id: ${f.telegram_file_unique_id ? "있음" : "없음"}`,
+        `summary: ${f.summary ? "있음" : "없음"} extracted_text: ${f.extracted_text ? "있음" : "없음"} content: ${f.content ? "있음" : "없음"}`,
+        `created_at: ${String(f.created_at || "").slice(0, 19)}`,
+      ].join("\n  ");
+    }).join("\n\n") || "없음";
+
+    await sendMessage(env, chatId, `files total count: ${total}\ndeduped files count: ${deduped.length}\nraw fetched count: ${rawFiles.length}\n\n${lines}`.slice(0, 3900));
   } catch (e) {
     await sendMessage(env, chatId, `debug_files 실패\n${String(e?.stack || e?.message || e).slice(0, 1200)}`);
   }
@@ -3174,6 +3280,7 @@ async function searchFilesForResend(env, text) {
     files = (await env.DB.prepare(`${baseSelect} ORDER BY f.created_at DESC LIMIT 6`)
       .bind(...params).all()).results || [];
   }
+  files = kohDedupFiles(files);
   let messages = [];
   if (!files.length && await tableExists(env, "messages")) {
     const hasRoomsMsg = await tableExists(env, "rooms");
@@ -3195,7 +3302,7 @@ async function searchFilesForResend(env, text) {
 }
 
 async function sendFileRow(env, chatId, row) {
-  const document = row.telegram_file_id || "";
+  const document = row._sendTelegramFileId || row.telegram_file_id || "";
   if (!document) {
     const room = row.joined_room_title || normalizeRoomTitle(row) || "알 수 없는 방";
     const actor = row.actor || row.uploader_name || row.sender_name || "공유자 미상";
