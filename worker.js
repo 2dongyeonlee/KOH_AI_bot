@@ -25,16 +25,19 @@ const SUMMARY_RULE = `
 · 핵심 내용 1~2줄
 · 위치: [방이름]
 · 공유자: <u>이름</u> (날짜)
+· 링크: (메시지 링크가 있으면 표시, 없으면 생략)
 ⚡ 마감: 날짜 (날짜·기한 있을 때만)
 
 규칙:
 - 안건 사이 반드시 한 줄 띄기
 - 파일명(photo_xxx 등)을 안건명으로 절대 쓰지 말 것
 - 모든 방 자료 빠짐없이 포함 필수
+- 1:1 방에서 공유된 것도 원래 공유자 이름 표시
 - 사람 이름은 <u>이름</u> 형태
 - <b> 볼드 절대 금지
 - *, #, ** 마크다운 절대 금지
 - 자료에 없는 내용 추정 금지
+- AI Agent 도입과 M15 화재는 다른 프로젝트 — 절대 같은 안건으로 묶지 말 것
 `;
 const BOT_OWNER_NAME = "권오혁";
 const BOT_OWNER_ROLE = "6R전략담당";
@@ -42,7 +45,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-natural-response-summary-rule-20260609-1000";
+const BUILD_VERSION = "koh-digest-corpus-summary-rule-links-20260608-1200";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -4072,16 +4075,26 @@ function buildDigestCorpus(rows) {
   return rows.map((r, idx) => {
     const typeLabel =
       r.type === "message" ? "대화" :
-      r.type === "file" ? "파일" :
-      r.type === "meeting" ? "회의록" :
-      r.type === "memory" ? "축적 기억" : "자료";
-    const extra = r.file_name ? ` / 파일명: ${r.file_name}` : r.title ? ` / 제목: ${r.title}` : "";
+      r.type === "file" ? "파일" : "자료";
+
+    const actor = r.actor && r.actor !== "unknown"
+      ? r.actor
+      : r.uploader_name || r.sender_name || "공유자 미확인";
+
+    const roomLabel = r.source && r.source !== "1:1"
+      ? r.source
+      : `1:1(${actor})`;
+
+    const extra = r.file_name ? ` / 파일: ${r.file_name}` : "";
+
+    const msgLink = r.telegram_message_id && r.room_id && String(r.room_id).startsWith("-")
+      ? ` / 링크: https://t.me/c/${String(r.room_id).replace("-100", "")}/${r.telegram_message_id}`
+      : "";
+
     return `[${idx + 1}] ${typeLabel}
-room_id: ${r.room_id || ""}
-source_type: ${r.source_type || ""}
-출처: [${r.source || "출처 미상"}] ${r.actor || "작성자 미상"} (${r.created_at || "시간 미상"})${extra}
+출처: [${roomLabel}] ${actor} (${(r.created_at || "").slice(0, 16)})${extra}${msgLink}
 내용:
-${String(r.text || "").slice(0, 700)}`;
+${String(r.text || "").replace(/Telegram export file[^\n]*/g, "").trim().slice(0, 700)}`;
   }).join("\n\n");
 }
 
@@ -4093,12 +4106,45 @@ function isPriorityIntent(text) {
 
 function priorityProjectName(text) {
   const t = String(text || "");
-  if (/New Vision|비전선포식|선포식|서울랜드|이든|앨리스/i.test(t)) return "SK하이닉스 New Vision 선포식";
-  if (/M15|화재|고객사\s*Letter|대외\s*커뮤니케이션|Letter/i.test(t)) return "M15 화재 대응 커뮤니케이션";
-  if (/AI Agent|1인\s*1\s*AI|Comm\.?\s*총괄|6R/i.test(t)) return "Comm. 총괄 AI Agent 도입";
-  if (/솔리다임|Solidigm|EPIC\s*Semi|MOU|낸드/i.test(t)) return "솔리다임/EPIC Semi MOU 커뮤니케이션";
-  const first = t.replace(/\s+/g, " ").slice(0, 28).trim();
-  return first ? `${first} 관련 안건` : "최근 업무 안건";
+
+  if (/New Vision|비전선포식|선포식|서울랜드|이든|앨리스/i.test(t))
+    return "SK하이닉스 New Vision 선포식";
+
+  if (/M15|청주\s*화재|청주\s*캠퍼스|화재\s*대응|화재\s*커뮤니케이션|고객사\s*Letter|Letter\s*검토|낸드\s*화재/i.test(t))
+    return "M15 화재 대응 커뮤니케이션";
+
+  if (/AI\s*Agent\s*Builder|1인\s*1\s*AI|AI\s*비서|비서봇|텔레그램\s*봇|Comm\.?\s*총괄\s*AI|AIX/i.test(t))
+    return "Comm. 총괄 AI Agent 도입";
+
+  if (/솔리다임|Solidigm|EPIC\s*Semi|사우디\s*팹리스|낸드\s*MOU|MOU\s*체결/i.test(t))
+    return "솔리다임/EPIC Semi MOU 커뮤니케이션";
+
+  if (/ADR|상장|SEC|IPO|해외\s*투자자/i.test(t))
+    return "ADR 상장 커뮤니케이션";
+
+  if (/KPI|공과기술서|실적\s*보고|5월\s*실적|사장님\s*KPI/i.test(t))
+    return "사장님 KPI 실적 보고";
+
+  if (/지방선거|선거\s*결과|지자체장|당선/i.test(t))
+    return "6.3 지방선거 결과 동향";
+
+  if (/니케이|포럼|TM\s*말씀|아젠다/i.test(t))
+    return "니케이 포럼 아젠다";
+
+  if (/The소통|더소통|성과급|임금|복리후생/i.test(t))
+    return "The소통 Q&A 대응";
+
+  if (/엔비디아|젠슨\s*황|NVIDIA|Vera\s*Rubin|HBM\s*탑재/i.test(t))
+    return "엔비디아 CEO 발언 대응";
+
+  const firstLine = t.split(/[\n.!?/]/)[0]
+    .replace(/(담당님|사장님|네\s*알겠습니다|그리하겠습니다|확인\s*중|검토\s*중)/g, "")
+    .replace(/Telegram export file[^\n]*/g, "")
+    .trim();
+  if (firstLine.length >= 6 && firstLine.length <= 40)
+    return `${firstLine} 관련`;
+
+  return "업무 안건";
 }
 
 function priorityScore(record) {
