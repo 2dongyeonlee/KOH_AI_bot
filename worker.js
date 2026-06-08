@@ -25,19 +25,22 @@ const SUMMARY_RULE = `
 · 핵심 내용 1~2줄
 · 위치: [방이름]
 · 공유자: <u>이름</u> (날짜)
-· 링크: (메시지 링크가 있으면 표시, 없으면 생략)
+· 링크: URL (뉴스·외부 자료일 때만 표시)
 ⚡ 마감: 날짜 (날짜·기한 있을 때만)
 
 규칙:
-- 안건 사이 반드시 한 줄 띄기
+- 하나의 자료에 여러 안건이 있으면 각각 별도 📌로 분리
+- "확인하겠습니다", "반영하겠습니다", "네 담당님" 등 응답 문장을 안건명으로 쓰지 말 것
 - 파일명(photo_xxx 등)을 안건명으로 절대 쓰지 말 것
+- 안건 사이 반드시 한 줄 띄기
 - 모든 방 자료 빠짐없이 포함 필수
-- 1:1 방에서 공유된 것도 원래 공유자 이름 표시
+- 1:1 방 공유 자료도 실제 공유자 이름 표시
 - 사람 이름은 <u>이름</u> 형태
 - <b> 볼드 절대 금지
 - *, #, ** 마크다운 절대 금지
 - 자료에 없는 내용 추정 금지
-- AI Agent 도입과 M15 화재는 다른 프로젝트 — 절대 같은 안건으로 묶지 말 것
+- AI Agent 도입과 M15 화재는 다른 안건 — 절대 같이 묶지 말 것
+- 뉴스는 📰 아이콘 사용, 링크 포함
 `;
 const BOT_OWNER_NAME = "권오혁";
 const BOT_OWNER_ROLE = "6R전략담당";
@@ -45,7 +48,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-search-accuracy-briefing-who-20260608-1400";
+const BUILD_VERSION = "koh-multi-agenda-news-format-20260608-1600";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -477,27 +480,57 @@ async function resolveUserName(env, userId, fallbackName = "") {
 }
 
 function inferTitle(row) {
+  // 응답·인사말 패턴 — 제목으로 쓰면 안 되는 것들
+  const responsePatterns = [
+    /^(네|넵|알겠습니다|확인하겠습니다|반영하겠습니다|수정하겠습니다|보고드립니다|말씀드립니다)/,
+    /^(그리하겠습니다|검토하겠습니다|전달하겠습니다|진행하겠습니다)/,
+    /^(담당님|사장님|팀장님).{0,5}(네|넵|알겠|확인|반영)/,
+    /Telegram export file/i,
+    /^photo\.|^image\./i,
+  ];
+
   const raw = String(row.summary || row.extracted_text || row.content || "").trim();
+
   if (raw.length >= 6) {
+    // 구조화된 안건 제목이 있으면 우선 사용
+    const agendaMatch = raw.match(/\[안건\d+\]\s*(.+?)(?:\n|$)/);
+    if (agendaMatch) return agendaMatch[1].trim().slice(0, 40);
+
+    // 줄 단위로 제목 후보 탐색
     const lines = raw.split(/[\n.!?\/]/);
     for (const line of lines) {
       const clean = line
-        .replace(/(요약|정리|알려줘|해줘|보내줘|공유해줘|확인|담당님|사장님|네 알겠습니다|네 담당님|그리하겠습니다)/g, "")
-        .replace(/Telegram export file.*/, "")
+        .replace(/(요약|정리|알려줘|해줘|보내줘|공유해줘|확인|담당님|사장님|넵|네\s|그리하겠|반영하|수정하)/g, "")
+        .replace(/Telegram export file.*/i, "")
         .trim();
-      if (clean.length >= 5 && clean.length <= 50) {
-        return clean;
-      }
+
+      // 응답 패턴이면 건너뜀
+      if (responsePatterns.some(p => p.test(clean))) continue;
+      // 너무 짧거나 길면 건너뜀
+      if (clean.length >= 8 && clean.length <= 45) return clean;
     }
-    return raw.replace(/Telegram export file[^\n]*/g, "").trim().slice(0, 40) || "업무 안건";
+
+    // 응답 패턴 필터링 후 첫 30자
+    const cleaned = raw
+      .split("\n")
+      .filter(l => !responsePatterns.some(p => p.test(l.trim())))
+      .join(" ")
+      .replace(/Telegram export file[^\n]*/gi, "")
+      .trim()
+      .slice(0, 40);
+    if (cleaned.length >= 5) return cleaned;
   }
+
+  // 파일명에서 추출 (최후 수단)
   if (row.file_name) {
     const name = String(row.file_name)
       .replace(/\.[a-zA-Z0-9]{1,6}$/, "")
-      .replace(/[@_\-\d]+/g, " ")
+      .replace(/[@_\-\d]/g, " ")
+      .replace(/\s+/g, " ")
       .trim();
-    if (name.length >= 3) return name.slice(0, 40);
+    if (name.length >= 4) return name.slice(0, 40);
   }
+
   return "업무 안건";
 }
 
@@ -1887,9 +1920,20 @@ async function saveExternalSearchResults(env, query, results) {
 }
 
 function buildExternalCorpus(results) {
-  return (results || []).map((r, idx) =>
-    `[외부자료 ${idx + 1}]\n제목: ${r.title || "제목 없음"}\n요약: ${r.snippet || "요약 없음"}\nURL: ${r.url || ""}\n제공: ${r.provider || "external"}`
-  ).join("\n\n");
+  return (results || []).map((r, idx) => {
+    const title = r.title || "제목 없음";
+    const snippet = r.snippet || r.content || "요약 없음";
+    const url = r.url || "";
+    const provider = r.provider || "외신";
+    const date = r.published_date || r.date || "";
+    return (
+      `[외부자료 ${idx + 1}]\n` +
+      `제목: ${title}\n` +
+      `요약: ${snippet.slice(0, 300)}\n` +
+      `출처: ${provider}${date ? " (" + date + ")" : ""}\n` +
+      `링크: ${url}`
+    );
+  }).join("\n\n");
 }
 
 async function answerExternalSearchNotConfigured(env, text) {
@@ -1913,15 +1957,21 @@ async function answerWithExternalSearch(env, text, userId) {
     if (!externalResults.length && !internalRows.length) {
       return `내부 기록과 외부 검색 모두에서 충분한 자료를 찾지 못했음.\n\n- 검색어: ${searchQuery}\n- 확인 필요: /web_test ${searchQuery}`;
     }
-    const query =
-      SUMMARY_TONE_RULE +
+    const corpus = buildExternalCorpus(externalResults) || "외부 검색 결과 없음";
+    const query = TONE_RULE +
       `[사용자 질문]\n${text}\n\n` +
-      `[내부 기록]\n${internalCorpus || "관련 내부 기록 없음"}\n\n` +
-      `[외부 검색 결과]\n${buildExternalCorpus(externalResults) || "외부 검색 결과 없음"}\n\n` +
-      `[작성 지침]\n` +
-      `- 핵심만 요약체로 작성할 것\n` +
-      `- 문장 끝은 가급적 '~임', '~필요', '~확인 필요' 형식으로 작성할 것\n` +
-      `- 참고 URL을 반드시 포함할 것\n`;
+      (internalCorpus ? `[내부 기록]\n${internalCorpus}\n\n` : "") +
+      `다음은 외부에서 수집된 뉴스/기사입니다. 아래 형식으로 정리해줘.\n\n` +
+      `[뉴스 정리 형식]\n` +
+      `📰 뉴스 제목 (핵심 내용 한 줄 요약)\n` +
+      `· 주요 내용: 1~2줄\n` +
+      `· 업무 참고: SK하이닉스·6R전략실 관점에서 챙겨야 할 점\n` +
+      `· 링크: URL (있으면)\n\n` +
+      `[규칙]\n` +
+      `- 뉴스 하나에 여러 안건이 있으면 각각 별도로 정리\n` +
+      `- <b> 볼드 금지, 사람 이름 <u>이름</u>\n` +
+      `- 마크다운(*, #) 금지\n\n` +
+      `[뉴스 데이터]\n` + corpus;
     const result = await difyChat(env, { query, user: String(userId), conversationId: "" });
     const answer = result?.answer || "외부 검색 기반 답변을 생성하지 못했음.";
     const sourceLines = externalResults.slice(0, 3).map((r, idx) =>
@@ -4683,30 +4733,70 @@ async function analyzeAndStructureFile(env, fileId, content) {
   if (!env.DIFY_API_KEY) return null;
 
   const query = TONE_RULE +
-    `다음 문서를 분석해서 아래 항목을 추출해줘. 없으면 "없음"으로.\n\n` +
-    `[추출 항목]\n` +
-    `요약: (3줄 이내 핵심 요약)\n` +
-    `주요배경: (왜 이 자료가 필요한지, 이슈 배경)\n` +
-    `액션플랜: (해야 할 일, 다음 단계)\n` +
-    `마감일자: (날짜·기한·일정 언급된 것, 없으면 "없음")\n` +
-    `주요담당자: (이름 언급된 사람들)\n\n` +
-    `문서 내용:\n${content.slice(0, 6000)}`;
+    `다음 문서/대화를 분석해서 포함된 모든 안건을 각각 추출해줘.\n\n` +
+    `[핵심 규칙]\n` +
+    `- 문서에 여러 안건이 있으면 반드시 각각 별도로 추출 (합치지 말 것)\n` +
+    `- 예: IPO 관련 + 개발 착수 → 2개 안건으로 분리\n` +
+    `- "확인하겠습니다", "반영하겠습니다", "네 담당님" 같은 응답/인사말은 안건 아님\n` +
+    `- 실질적인 업무 내용(보고·결정·요청·이슈)만 안건으로 추출\n\n` +
+    `[추출 형식 — 안건이 여러 개면 이 형식을 반복]\n` +
+    `안건1:\n` +
+    `  제목: (업무 안건명 10~25자, 핵심 주제 기반)\n` +
+    `  배경: (왜 이 안건이 나왔는지 1~2줄)\n` +
+    `  액션: (다음에 해야 할 일)\n` +
+    `  마감: (날짜·기한, 없으면 생략)\n` +
+    `  담당자: (이름 언급된 사람)\n\n` +
+    `안건2:\n` +
+    `  제목: ...\n` +
+    `  ...\n\n` +
+    `(안건 없으면 "안건없음" 으로)\n\n` +
+    `문서 내용:\n${content.slice(0, 7000)}`;
 
   try {
     const result = await difyChat(env, { query, user: "file_analysis", conversationId: "" });
     const answer = result.answer || "";
 
-    const extract = (label) => {
-      const m = answer.match(new RegExp(`${label}[:\\s]+([\\s\\S]*?)(?=\\n[가-힣]+:|$)`, "i"));
+    if (!answer || answer.includes("안건없음")) return null;
+
+    // 다중 안건 파싱
+    const agendaBlocks = answer.split(/안건\d+[:：]/i).filter(b => b.trim().length > 10);
+
+    if (agendaBlocks.length === 0) return null;
+
+    const extractField = (block, label) => {
+      const m = block.match(new RegExp(`${label}[:\\s]+([\\s\\S]*?)(?=\\n\\s*(제목|배경|액션|마감|담당자|안건):|$)`, "i"));
       return m ? m[1].trim().replace(/^없음$/, "") : "";
     };
 
+    // 다중 안건이면 JSON 배열로 반환
+    const agendas = agendaBlocks.map(block => ({
+      title: extractField(block, "제목"),
+      background: extractField(block, "배경"),
+      actionPlan: extractField(block, "액션"),
+      deadline: extractField(block, "마감"),
+      keyPersons: extractField(block, "담당자"),
+    })).filter(a => a.title && a.title.length >= 4);
+
+    if (agendas.length === 0) return null;
+
+    // 첫 번째 안건은 기존 방식으로, 나머지는 별도 저장
+    const first = agendas[0];
+    const allSummary = agendas.map((a, i) =>
+      `[안건${i+1}] ${a.title}\n` +
+      (a.background ? `배경: ${a.background}\n` : "") +
+      (a.actionPlan ? `액션: ${a.actionPlan}\n` : "") +
+      (a.deadline ? `마감: ${a.deadline}\n` : "") +
+      (a.keyPersons ? `담당자: ${a.keyPersons}` : "")
+    ).join("\n\n");
+
     return {
-      summary: extract("요약"),
-      background: extract("주요배경"),
-      actionPlan: extract("액션플랜"),
-      deadline: extract("마감일자"),
-      keyPersons: extract("주요담당자"),
+      summary: allSummary,
+      background: first.background,
+      actionPlan: first.actionPlan,
+      deadline: first.deadline,
+      keyPersons: first.keyPersons,
+      agendaCount: agendas.length,
+      agendas: agendas,
     };
   } catch (e) {
     console.error("analyzeAndStructureFile:", e);
