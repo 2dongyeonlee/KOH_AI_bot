@@ -1,0 +1,10 @@
+{
+  "scripts": {
+    "import:telegram": "node scripts/import_telegram_export.js"
+  },
+  "dependencies": {
+    "@cloudflare/workers-types": "latest",
+    "wrangler": "latest"
+  },
+  "devDependencies": {}
+}

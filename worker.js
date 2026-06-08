@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-file-dedup-uploader-normalize-20260609-0100";
+const BUILD_VERSION = "koh-export-importer-codex-20260609-0400";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -2090,6 +2090,10 @@ async function routeSlashCommand(env, message, text, chatId) {
     await handleDebugFiles(env, chatId);
     return true;
   }
+  if (/^\/debug_imports\b/.test(t)) {
+    await handleDebugImports(env, chatId);
+    return true;
+  }
   if (/^\/users\b/.test(t) || isUserListQuery(t)) {
     await handleUserList(chatId, env);
     return true;
@@ -2572,6 +2576,65 @@ async function handleDebugFiles(env, chatId) {
   }
 }
 
+async function handleDebugImports(env, chatId) {
+  if (!env.DB) {
+    await sendMessage(env, chatId, "DB 없음");
+    return;
+  }
+  try {
+    const roomsHasSource = await columnExists(env, "rooms", "source");
+    const roomsHasType = await columnExists(env, "rooms", "room_type");
+    const roomsWhere = roomsHasSource && roomsHasType
+      ? "WHERE room_type = 'telegram_export' OR source = 'telegram_export'"
+      : roomsHasType
+      ? "WHERE room_type = 'telegram_export'"
+      : roomsHasSource
+      ? "WHERE source = 'telegram_export'"
+      : "";
+    const rooms = (await tableExists(env, "rooms"))
+      ? await env.DB.prepare(`
+        SELECT COUNT(*) AS count, MAX(room_title) AS latest_room
+        FROM rooms
+        ${roomsWhere}
+      `).first()
+      : { count: 0, latest_room: "" };
+    const messages = (await tableExists(env, "messages"))
+      ? await env.DB.prepare(`
+        SELECT COUNT(*) AS count, MIN(created_at) AS min_at, MAX(created_at) AS max_at
+        FROM messages
+        WHERE source_type = 'telegram_export'
+      `).first()
+      : { count: 0, min_at: "", max_at: "" };
+    const filesHasSource = await columnExists(env, "files", "source_type");
+    const filesHasSavedBy = await columnExists(env, "files", "saved_by");
+    const filesWhere = filesHasSource && filesHasSavedBy
+      ? "WHERE source_type = 'telegram_export' OR saved_by = 'telegram_export_importer'"
+      : filesHasSource
+      ? "WHERE source_type = 'telegram_export'"
+      : filesHasSavedBy
+      ? "WHERE saved_by = 'telegram_export_importer'"
+      : "";
+    const files = (await tableExists(env, "files"))
+      ? await env.DB.prepare(`
+        SELECT COUNT(*) AS count, MAX(room_title) AS latest_room
+        FROM files
+        ${filesWhere}
+      `).first()
+      : { count: 0, latest_room: "" };
+    await sendMessage(
+      env,
+      chatId,
+      `imported rooms count: ${rooms?.count || 0}\n` +
+      `imported messages count: ${messages?.count || 0}\n` +
+      `imported files count: ${files?.count || 0}\n` +
+      `latest import room: ${files?.latest_room || rooms?.latest_room || "없음"}\n` +
+      `latest import date range: ${messages?.min_at || "없음"} ~ ${messages?.max_at || "없음"}`
+    );
+  } catch (e) {
+    await sendMessage(env, chatId, `debug_imports 실패: ${String(e?.message || e).slice(0, 500)}`);
+  }
+}
+
 function isFileSearchQuery(text) {
   return /(자료|파일).{0,20}(어디|찾아|요약|정리|있지|있어)|지난번.{0,20}(자료|파일)|단체방.{0,20}(자료|파일).{0,20}(정리|요약)|그\s*자료\s*어디/i.test(String(text || ""));
 }
@@ -2698,7 +2761,7 @@ async function searchFilesForResend(env, text) {
 }
 
 async function sendFileRow(env, chatId, row) {
-  const document = row.telegram_file_id || row.file_id || "";
+  const document = row.telegram_file_id || "";
   if (!document) {
     const room = row.joined_room_title || normalizeRoomTitle(row) || "알 수 없는 방";
     const actor = row.actor || row.uploader_name || row.sender_name || "공유자 미상";
