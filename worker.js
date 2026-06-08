@@ -45,7 +45,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-digest-corpus-summary-rule-links-20260608-1200";
+const BUILD_VERSION = "koh-search-accuracy-briefing-who-20260608-1400";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -544,9 +544,31 @@ function kohExtractSearchTerms(text = "") {
     "방에서", "단톡방", "포함된방", "좀", "조", "줘라"
   ]);
 
-  // Also filter tokens that end with common Korean request/action suffixes
   const stopSuffix = /^(요약|정리|알려|보여|보내|전달|공유|찾아|확인|첨부|올려)(해줘|해라|해야|해|줘|야)$|^(있어|있지|뭐야|뭐가|뭐있어|뭐있었|올라온|공유됐|공유된|됐어|됐지|됩니다)$/;
 
+  // 1. 복합 키워드 우선 추출 (2~4단어 조합이 더 정확)
+  const compoundPatterns = [
+    { re: /M15\s*화재|화재\s*대응|청주\s*화재|화재\s*커뮤니케이션/i, term: "M15화재" },
+    { re: /AI\s*Agent|에이전트\s*도입|1인\s*1\s*AI/i, term: "AIAgent" },
+    { re: /비전\s*선포식|New\s*Vision|선포식/i, term: "비전선포식" },
+    { re: /솔리다임|EPIC\s*Semi|MOU\s*체결/i, term: "솔리다임MOU" },
+    { re: /ADR\s*상장|해외\s*상장|SEC.*IPO/i, term: "ADR상장" },
+    { re: /KPI.*보고|공과기술서|사장님.*KPI/i, term: "KPI보고" },
+    { re: /지방선거|선거\s*결과|6\.3\s*선거/i, term: "지방선거" },
+    { re: /The소통|더소통|성과급.*Q&A/i, term: "The소통" },
+    { re: /엔비디아|젠슨\s*황|NVIDIA/i, term: "엔비디아" },
+    { re: /니케이\s*포럼|포럼.*TM|TM.*아젠다/i, term: "니케이포럼" },
+  ];
+
+  const foundCompounds = [];
+  for (const { re, term } of compoundPatterns) {
+    if (re.test(text)) foundCompounds.push(term);
+  }
+
+  // 복합 키워드 있으면 단어 분리 없이 그것만 사용 (노이즈 차단)
+  if (foundCompounds.length > 0) return foundCompounds;
+
+  // 2. 단어 분리 (복합 없을 때)
   return [...new Set(
     kohNormalizeText(text)
       .split(" ")
@@ -554,7 +576,7 @@ function kohExtractSearchTerms(text = "") {
       .filter(t => t.length >= 2)
       .filter(t => !stopWords.has(t))
       .filter(t => !stopSuffix.test(t))
-      .slice(0, 10)
+      .slice(0, 6)
   )];
 }
 
@@ -685,8 +707,14 @@ function kohScoreRecord(record, terms) {
     const n = kohNormalizeText(term);
     if (!n) continue;
 
-    if (source.includes(n)) score += 10;
-    if (source.replace(/\s+/g, "").includes(n.replace(/\s+/g, ""))) score += 5;
+    // 복합 키워드는 높은 가중치
+    if (n.length >= 4) {
+      if (source.includes(n)) score += 20;
+      else if (source.replace(/\s+/g, "").includes(n.replace(/\s+/g, ""))) score += 15;
+    } else {
+      if (source.includes(n)) score += 10;
+      if (source.replace(/\s+/g, "").includes(n.replace(/\s+/g, ""))) score += 5;
+    }
   }
 
   if (record.file_name) score += 2;
@@ -2411,6 +2439,21 @@ async function routeSlashCommand(env, message, text, chatId) {
     await handleDebugSearch(env, chatId, t);
     return true;
   }
+  if (/^\/briefing_who\b/.test(t)) {
+    const adminId = env.ADMIN_TELEGRAM_ID || "(미설정)";
+    const dyleeId = env.DYLEE_CHAT_ID || "(미설정)";
+    await sendMessage(env, chatId,
+      `[브리핑 발송 대상]\n\n` +
+      `개인 DM:\n` +
+      `· 권오혁 (ID: ${adminId})\n` +
+      `· 이동연 (ID: ${dyleeId})\n\n` +
+      `단체방:\n` +
+      `· AI 컴기획팀과 권 (-5287392652)\n` +
+      `· 테스트방임 (-5156923133)\n\n` +
+      `발송 시각: 매일 08:00 KST (UTC 23:00)`
+    );
+    return true;
+  }
   if (/^\/debug_briefing\b/.test(t)) {
     await handleDebugBriefing(env, chatId);
     return true;
@@ -3207,6 +3250,14 @@ async function handleDebugBriefing(env, chatId) {
     const data = await kohBuildBriefingCandidates(env, 7);
     const selectedFiles = data.candidateFiles.slice(0, 5).map(f => `file: ${f.file_name || ""} / ${f.room_title || ""} / ${String(f.created_at || "").slice(0, 10)}`);
     const selectedMessages = data.candidateMessages.slice(0, 5).map(m => `msg: ${m.room_title || ""} / ${m.sender_name || ""} / ${kohShortText(m.content || "", 80)}`);
+    const adminId = env.ADMIN_TELEGRAM_ID || "(미설정)";
+    const dyleeId = env.DYLEE_CHAT_ID || "(미설정)";
+    const allowedRooms = [
+      { id: "-5287392652", name: "AI 컴기획팀과 권" },
+      { id: "-5156923133", name: "테스트방임" },
+    ];
+    const roomLines = allowedRooms.map(r => `  ${r.name} (${r.id})`).join("\n");
+
     const out =
       `[debug_briefing]\n` +
       `candidate_messages: ${data.candidateMessages.length}\n` +
@@ -3215,7 +3266,11 @@ async function handleDebugBriefing(env, chatId) {
       `candidate_files: ${data.candidateFiles.length}\n` +
       `export_files: ${data.exportFiles.length}\n` +
       `excluded_room_count: ${data.excludedRoomCount}\n\n` +
-      `selected_items:\n${[...selectedFiles, ...selectedMessages].join("\n") || "없음"}`;
+      `selected_items:\n${[...selectedFiles, ...selectedMessages].join("\n") || "없음"}\n\n` +
+      `[브리핑 발송 대상]\n` +
+      `개인 DM: 권오혁 (${adminId})\n` +
+      `개인 DM: 이동연 (${dyleeId})\n` +
+      `단체방:\n${roomLines}`;
     await sendMessage(env, chatId, out.slice(0, 3500));
   } catch (e) {
     await sendMessage(env, chatId, `debug_briefing 실패: ${String(e?.message || e).slice(0, 500)}`);
