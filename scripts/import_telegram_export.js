@@ -143,11 +143,36 @@ function insertSelect(table, values, existingColumns, whereNotExists = "") {
   return `INSERT INTO ${table} (${cols}) VALUES (${vals});`;
 }
 
+function updateWhere(table, values, existingColumns, whereClause = "") {
+  const entries = Object.entries(values).filter(([key]) => existingColumns.has(key));
+  if (!entries.length || !whereClause) return "";
+  const set = entries.map(([key, value]) => `${key} = ${sql(value)}`).join(", ");
+  return `UPDATE ${table} SET ${set} WHERE ${whereClause};`;
+}
+
 function userFromMessage(message) {
   const id = message.from_id || message.actor_id || "";
   const name = message.from || message.actor || "";
   if (!id && !name) return null;
   return { id: String(id || `export_user_${hashText(name)}`), name: String(name || id) };
+}
+
+function contextMessages(messages, index, radius = 3) {
+  const start = Math.max(0, index - radius);
+  const end = Math.min(messages.length, index + radius + 1);
+  const out = [];
+  for (let i = start; i < end; i++) {
+    const msg = messages[i];
+    const text = normalizeText(msg?.text || msg?.caption).replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    out.push({
+      id: msg.id || "",
+      date: msg.date || "",
+      from: msg.from || msg.actor || "",
+      text: text.slice(0, 500),
+    });
+  }
+  return out.slice(0, 7);
 }
 
 function fileFromMessage(message, exportDir) {
@@ -204,11 +229,18 @@ function main() {
     last_seen_at: new Date().toISOString(),
   }, roomCols, `SELECT 1 FROM rooms WHERE room_id = ${sql(roomId)}`));
 
-  for (const message of messages) {
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
+    const message = messages[messageIndex];
     if (message.type && message.type !== "message" && message.type !== "service") continue;
     const text = normalizeText(message.text || message.caption);
     const file = fileFromMessage(message, exportDir);
-    const contentForMessage = text || (file ? `[file] ${file.fileName}` : "");
+    const nearbyMessages = file ? contextMessages(messages, messageIndex, 3) : [];
+    const nearbyText = nearbyMessages.map((item) => item.text).join(" / ");
+    const fileContextText = text || nearbyText;
+    const fileSummary = fileContextText
+      ? fileContextText.slice(0, 1000)
+      : (file ? `Telegram export file: ${file.fileName}` : "");
+    const contentForMessage = text || (file ? `[file] ${file.fileName}\n${fileSummary}`.trim() : "");
     const user = userFromMessage(message);
     if (user) {
       statements.push(insertSelect("users", {
@@ -269,19 +301,41 @@ function main() {
           file_type: file.fileType,
           mime_type: file.mimeType,
           file_size: file.fileSize,
-          content: text,
-          summary: text || "Telegram export file",
-          extracted_text: text,
+          content: fileContextText,
+          summary: fileSummary,
+          extracted_text: fileContextText,
           room_id: roomId,
           room_title: roomTitle,
           telegram_file_id: null,
           telegram_file_unique_id: null,
           r2_key: file.localPath,
-          tags_json: JSON.stringify({ source_type: "telegram_export", local_path: file.localPath, abs_path: file.absPath }),
+          tags_json: JSON.stringify({
+            source_type: "telegram_export",
+            local_path: file.localPath,
+            abs_path: file.absPath,
+            export_path: file.localPath,
+            source_room: roomTitle,
+            context_messages: nearbyMessages,
+          }),
           saved_by: "telegram_export_importer",
           source_type: "telegram_export",
           created_at: message.date || new Date().toISOString(),
         }, fileCols, where));
+        statements.push(updateWhere("files", {
+          content: fileContextText,
+          summary: fileSummary,
+          extracted_text: fileContextText,
+          tags_json: JSON.stringify({
+            source_type: "telegram_export",
+            local_path: file.localPath,
+            abs_path: file.absPath,
+            export_path: file.localPath,
+            source_room: roomTitle,
+            context_messages: nearbyMessages,
+          }),
+          saved_by: "telegram_export_importer",
+          source_type: "telegram_export",
+        }, fileCols, `room_id = ${sql(roomId)} AND file_name = ${sql(file.fileName)} AND COALESCE(file_size, 0) = ${Number(file.fileSize) || 0} AND created_at = ${sql(message.date || "")}`));
         importedFiles++;
       }
     }

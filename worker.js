@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-export-importer-codex-20260609-0400";
+const BUILD_VERSION = "koh-export-search-briefing-fix-20260609-0500";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -545,6 +545,58 @@ function kohIsGroupRoomPreferred(text = "") {
   return /(내가\s*포함된\s*방|단체방|단톡방|방들|다른\s*방|전체\s*방|각\s*방|각종\s*방|포함된\s*단체방|보고된\s*내용|공유된\s*내용)/.test(String(text || ""));
 }
 
+const KOH_EXCLUDED_ROOM_TITLES = ["다시왔지롱", "테스트봇방", "장난치지마라"];
+
+function kohNormalizeRoomAlias(value = "") {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/20\d{2}/g, "")
+    .replace(/방/g, "")
+    .replace(/[\s_\/\\\-.,()[\]{}:;'"`~!@#$%^&*+=|<>?]/g, "")
+    .trim();
+}
+
+function kohResolveRoomAliasFromText(text = "") {
+  const n = kohNormalizeRoomAlias(text);
+  if ((n.includes("6r") || n.includes("6알")) && n.includes("전략") && (n.includes("권") || n.includes("kwon"))) {
+    return "6R전략_w/권_2026";
+  }
+  if ((n.includes("6r") || n.includes("6알")) && n.includes("전략")) {
+    return "6R전략_w/권_2026";
+  }
+  return "";
+}
+
+function kohRoomAliasMatches(rowOrTitle, aliasTitle = "") {
+  if (!aliasTitle) return false;
+  const row = typeof rowOrTitle === "object" && rowOrTitle ? rowOrTitle : { room_title: rowOrTitle };
+  const target = kohNormalizeRoomAlias(aliasTitle);
+  const values = [row.room_title, row._resolvedRoom, row.source_room, row.room_id].filter(Boolean);
+  return values.some(v => {
+    const n = kohNormalizeRoomAlias(v);
+    return n && (n.includes(target) || target.includes(n) || (target.includes("6r전략") && n.includes("6r전략")));
+  });
+}
+
+function kohIsExcludedRoomTitle(title = "") {
+  const n = kohNormalizeRoomAlias(title);
+  return KOH_EXCLUDED_ROOM_TITLES.some(t => n === kohNormalizeRoomAlias(t));
+}
+
+function kohIsRequestLikeForBriefing(content = "") {
+  const t = String(content || "").trim();
+  if (!t) return true;
+  if (/^\/\w+/.test(t)) return true;
+  if (/@KOH_AI_bot/i.test(t)) return true;
+  if (kohLooksLikeCommandOrRequestOnly(t)) return true;
+  if (/(요약해줘|정리해줘|알려줘|보여줘|보내줘|공유해줘|찾아줘|뭐야|무엇|어디|있어\?|테스트|저장 테스트|브리핑_test|debug)/i.test(t)) return true;
+  return false;
+}
+
+function kohHasWorkSignal(content = "") {
+  return /(보고|자료|공유|회의|일정|마감|확인|검토|완료|진행|담당|결정|리스크|후속|follow|임원|사장|CEO|PMO|TF|MOU|Letter|화재|대외|IR|PR|CR|선포식|비전|Vision|Solidigm|솔리다임|EPIC)/i.test(String(content || ""));
+}
+
 function kohLooksLikeCommandOrRequestOnly(content = "") {
   const t = String(content || "").trim();
 
@@ -665,7 +717,7 @@ async function kohSendDocument(env, chatId, file, caption = "") {
 }
 
 // fileDays: number of days back to look (null = no date limit)
-async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRoomOnly = false, fileDays = 30) {
+async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRoomOnly = false, fileDays = 30, roomAliasTitle = "") {
   // Compute dates in JS for reliable D1 compatibility
   const fileSince = fileDays !== null
     ? new Date(Date.now() - Number(fileDays) * 86400000).toISOString().slice(0, 19).replace("T", " ")
@@ -697,6 +749,10 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
       f.summary,
       f.extracted_text,
       f.content,
+      f.tags_json,
+      f.source_type,
+      f.saved_by,
+      f.r2_key,
       f.created_at
     FROM files f
     LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(f.room_id AS TEXT)
@@ -720,6 +776,8 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
       ) AS room_title,
       m.sender_name,
       m.sender_id,
+      m.source_type,
+      m.saved_by,
       m.content,
       m.created_at
     FROM messages m
@@ -750,9 +808,26 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
     msgStmt.bind(...msgParams).all(),
   ]);
 
+  const rawFiles = fileRes.results || [];
+  const rawMessages = msgRes.results || [];
+  const aliasFiles = roomAliasTitle ? rawFiles.filter(r => kohRoomAliasMatches(r, roomAliasTitle)) : rawFiles;
+  const aliasMessages = roomAliasTitle ? rawMessages.filter(r => kohRoomAliasMatches(r, roomAliasTitle)) : rawMessages;
+  const roomScopedFiles = roomAliasTitle && aliasFiles.length ? aliasFiles : rawFiles;
+  const roomScopedMessages = roomAliasTitle && aliasMessages.length ? aliasMessages : rawMessages;
+  const excludedFiles = roomScopedFiles.filter(r => kohIsExcludedRoomTitle(r.room_title));
+  const excludedMessages = roomScopedMessages.filter(r => kohIsExcludedRoomTitle(r.room_title));
+
   return {
-    files: fileRes.results || [],
-    messages: msgRes.results || [],
+    files: roomScopedFiles.filter(r => !kohIsExcludedRoomTitle(r.room_title)),
+    messages: roomScopedMessages.filter(r => !kohIsExcludedRoomTitle(r.room_title)),
+    debug: {
+      rawFiles: rawFiles.length,
+      rawMessages: rawMessages.length,
+      aliasFiles: aliasFiles.length,
+      aliasMessages: aliasMessages.length,
+      excludedRoomCount: excludedFiles.length + excludedMessages.length,
+      roomAliasTitle,
+    },
   };
 }
 
@@ -933,7 +1008,8 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
   const intent          = kohDetectIntent(text);
   const terms           = kohExtractSearchTerms(text);
   const currentRoomOnly = kohIsCurrentRoomOnly(text);
-  const groupPreferred  = kohIsGroupRoomPreferred(text);
+  const roomAliasTitle  = kohResolveRoomAliasFromText(text);
+  const groupPreferred  = kohIsGroupRoomPreferred(text) || !!roomAliasTitle;
   const hasTerms        = terms.length > 0;
   const MIN_SCORE       = hasTerms ? 5 : 0;
 
@@ -941,7 +1017,9 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
   function scoreFiles(rows) {
     return rows.map(r => ({
       ...r,
-      _score: kohScoreRecord(r, terms) + (groupPreferred && Number(r.room_id || 0) < 0 ? 10 : 0),
+      _score: kohScoreRecord(r, terms) +
+        (groupPreferred && Number(r.room_id || 0) < 0 ? 10 : 0) +
+        (roomAliasTitle && kohRoomAliasMatches(r, roomAliasTitle) ? 25 : 0),
     }))
     .filter(r => r._score >= MIN_SCORE)
     .sort((a, b) => b._score - a._score);
@@ -952,7 +1030,9 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
       .filter(m => !kohLooksLikeCommandOrRequestOnly(m.content))
       .map(m => ({
         ...m,
-        _score: kohScoreRecord(m, terms) + (groupPreferred && Number(m.room_id || 0) < 0 ? 20 : 0),
+        _score: kohScoreRecord(m, terms) +
+          (groupPreferred && Number(m.room_id || 0) < 0 ? 20 : 0) +
+          (roomAliasTitle && kohRoomAliasMatches(m, roomAliasTitle) ? 25 : 0),
       }))
       .filter(r => r._score >= (hasTerms ? 5 : 1))
       .sort((a, b) => b._score - a._score);
@@ -962,9 +1042,15 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
     return f.summary || f.extracted_text || f.content || null;
   }
 
+  function exportFileNote(f) {
+    return !f.telegram_file_id && (f.source_type === "telegram_export" || f.saved_by === "telegram_export_importer")
+      ? "\n원본은 export 자료 기준으로 확인됨. Telegram 재전송은 불가할 수 있음."
+      : "";
+  }
+
   // Initial fetch: 30-day window (or 7-day for FILE_LIST)
   const initDays = (intent === KOH_INTENT.FILE_LIST && !hasTerms) ? 7 : 30;
-  const { files: rawFiles, messages } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, initDays);
+  const { files: rawFiles, messages } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, initDays, roomAliasTitle);
   const files = kohDedupFiles(rawFiles);
 
   let scoredFiles = scoreFiles(files);
@@ -996,16 +1082,16 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
   if (intent === KOH_INTENT.FILE_LIST) {
     // Phase 1: already fetched (7-day or 30-day). Phase 2: 14-day. Phase 3: no date limit.
     if (!scoredFiles.length && !hasTerms) {
-      const { files: f14r } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, 14);
+      const { files: f14r } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, 14, roomAliasTitle);
       scoredFiles = scoreFiles(kohDedupFiles(f14r));
     }
     if (!scoredFiles.length) {
-      const { files: fAllR } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, null);
+      const { files: fAllR } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, null, roomAliasTitle);
       scoredFiles = scoreFiles(kohDedupFiles(fAllR));
     }
 
     if (!scoredFiles.length) {
-      await kohSendHtml(env, chatId, "저장된 파일 기록이 없습니다.");
+      await kohSendHtml(env, chatId, "최근 저장 기록에서 관련 자료를 찾지 못했습니다.");
       return true;
     }
 
@@ -1013,7 +1099,7 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
     const items = await kohResolveItems(env, display, "uploader_id", "uploader_name");
     const body = items.map((f, i) => kohFormatThreeLineItem({
       title: `${i + 1}. ${inferTitle(f)}`,
-      content: fileSummaryText(f) || "요약 없음",
+      content: (fileSummaryText(f) || "요약 없음") + exportFileNote(f),
       location: `${f._resolvedRoom} > ${f.file_name || "파일명 없음"}`,
       person: f._resolvedName,
       date: kohFormatDate(f.created_at),
@@ -1039,7 +1125,7 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
       await kohSavePending(env, chatId, KOH_INTENT.FILE_SUMMARY, candidates);
       const body = candidates.map((f, i) => kohFormatThreeLineItem({
         title: `${i + 1}. ${inferTitle(f)}`,
-        content: fileSummaryText(f) || "요약 없음",
+        content: (fileSummaryText(f) || "요약 없음") + exportFileNote(f),
         location: `${f._resolvedRoom} > ${f.file_name || "파일명 없음"}`,
         person: f._resolvedName,
         date: kohFormatDate(f.created_at),
@@ -1107,7 +1193,7 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
     await kohSavePending(env, chatId, KOH_INTENT.FILE_RESEND, candidates);
     const body = candidates.map((f, i) => kohFormatThreeLineItem({
       title: `${i + 1}. ${inferTitle(f)}`,
-      content: fileSummaryText(f) || "요약 없음",
+      content: (fileSummaryText(f) || "요약 없음") + exportFileNote(f),
       location: `${f._resolvedRoom} > ${f.file_name || "파일명 없음"}`,
       person: f._resolvedName,
       date: kohFormatDate(f.created_at),
@@ -1135,7 +1221,7 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
     const items = await kohResolveItems(env, scoredFiles.slice(0, 3), "uploader_id", "uploader_name");
     const body = items.map((f, i) => kohFormatThreeLineItem({
       title: `${i + 1}. ${inferTitle(f)}`,
-      content: fileSummaryText(f) || "요약 없음",
+      content: (fileSummaryText(f) || "요약 없음") + exportFileNote(f),
       location: `${f._resolvedRoom} > ${f.file_name || "파일명 없음"}`,
       person: f._resolvedName,
       date: kohFormatDate(f.created_at),
@@ -2123,6 +2209,10 @@ async function routeSlashCommand(env, message, text, chatId) {
     await handleDebugSearch(env, chatId, t);
     return true;
   }
+  if (/^\/debug_briefing\b/.test(t)) {
+    await handleDebugBriefing(env, chatId);
+    return true;
+  }
   if (/^\/debug_intent\b/.test(t)) {
     await handleDebugIntent(env, chatId, t);
     return true;
@@ -2502,27 +2592,42 @@ async function handleDebugSearch(env, chatId, text) {
   try {
     const terms = query ? kohExtractSearchTerms(query) : [];
     const MIN_SCORE = terms.length ? 5 : 0;
-    const { files: rawFiles, messages } = await kohFetchRecentFilesAndMessages(env, "", false, 30);
+    const intent = kohDetectIntent(query);
+    const roomAliasTitle = kohResolveRoomAliasFromText(query);
+    const { files: rawFiles, messages, debug } = await kohFetchRecentFilesAndMessages(env, "", false, 30, roomAliasTitle);
     const deduped = kohDedupFiles(rawFiles);
     const resolved = await kohResolveItems(env, deduped, "uploader_id", "uploader_name");
+    const exportFiles = rawFiles.filter(f => f.source_type === "telegram_export" || f.saved_by === "telegram_export_importer" || String(f.tags_json || "").includes("telegram_export"));
+    const telegramFileIdFiles = rawFiles.filter(f => f.telegram_file_id);
+    const requestFilteredMessages = messages.filter(m => !kohIsRequestLikeForBriefing(m.content));
 
     const scoredFiles = resolved
-      .map(f => ({ ...f, _score: kohScoreRecord(f, terms) }))
+      .map(f => ({ ...f, _score: kohScoreRecord(f, terms) + (roomAliasTitle && kohRoomAliasMatches(f, roomAliasTitle) ? 25 : 0) }))
       .sort((a, b) => b._score - a._score)
       .slice(0, 5);
 
     const scoredMsgs = messages
-      .map(m => ({ ...m, _score: kohScoreRecord(m, terms), _filtered: kohLooksLikeCommandOrRequestOnly(m.content) }))
+      .map(m => ({ ...m, _score: kohScoreRecord(m, terms), _filtered: kohIsRequestLikeForBriefing(m.content) }))
       .sort((a, b) => b._score - a._score)
       .slice(0, 5);
 
-    let out = `[debug_search: "${query || "(전체)"}"]\nterms: [${terms.join(", ") || "없음"}] MIN_SCORE=${MIN_SCORE}\n`;
-    out += `raw_files: ${rawFiles.length}건  deduped: ${deduped.length}건\n\n`;
+    let out = `[debug_search: "${query || "(전체)"}"]\n`;
+    out += `intent: ${kohIntentLabel(intent)}\n`;
+    out += `terms: [${terms.join(", ") || "없음"}] MIN_SCORE=${MIN_SCORE}\n`;
+    out += `room_alias_matched: ${roomAliasTitle || "없음"}\n`;
+    out += `raw_files: ${debug?.rawFiles ?? rawFiles.length}\n`;
+    out += `export_files: ${exportFiles.length}\n`;
+    out += `after_telegram_file_id_filter: ${telegramFileIdFiles.length}\n`;
+    out += `after_room_filter: ${rawFiles.length}\n`;
+    out += `after_dedup: ${deduped.length}\n`;
+    out += `messages_raw: ${debug?.rawMessages ?? messages.length}\n`;
+    out += `messages_after_request_filter: ${requestFilteredMessages.length}\n`;
+    out += `excluded_room_count: ${debug?.excludedRoomCount || 0}\n\n`;
     out += `files (deduped, top 5 by score):\n`;
     for (const f of scoredFiles) {
       out += `  score=${f._score} id=${f.id}${f._isDuplicate ? ` dups=[${f._duplicateIds.join(",")}]` : ""}\n`;
       out += `    room=${f._resolvedRoom} file=${f.file_name || ""}\n`;
-      out += `    raw_uploader=${f.uploader_name || "?"} resolved=${f._resolvedName} tg=${f.telegram_file_id ? "✓" : "✗"} ${String(f.created_at || "").slice(0, 10)}\n`;
+      out += `    raw_uploader=${f.uploader_name || "?"} resolved=${f._resolvedName} tg=${f.telegram_file_id ? "Y" : "N"} export=${exportFiles.some(x => x.id === f.id) ? "Y" : "N"} ${String(f.created_at || "").slice(0, 10)}\n`;
     }
     out += `\nmessages (total ${messages.length}건, top 5 before filter):\n`;
     for (const m of scoredMsgs) {
@@ -2554,6 +2659,8 @@ async function handleDebugFiles(env, chatId) {
     const lines = resolved.slice(0, 10).map(f => {
       const rawName = f.uploader_name || f.uploader_id || "?";
       const resolvedName = f._resolvedName;
+      let tags = {};
+      try { tags = JSON.parse(f.tags_json || "{}"); } catch (_) {}
       const roomDisplay = Number(f.room_id || 0) > 0
         ? `1:1(${resolvedName}) / room_id=${f.room_id}`
         : `${f._resolvedRoom} / room_id=${f.room_id}`;
@@ -2573,6 +2680,62 @@ async function handleDebugFiles(env, chatId) {
     );
   } catch (e) {
     await sendMessage(env, chatId, `debug_files 실패\n${String(e?.stack || e?.message || e).slice(0, 1200)}`);
+  }
+}
+
+async function kohBuildBriefingCandidates(env, days = 1) {
+  const { files, messages, debug } = await kohFetchRecentFilesAndMessages(env, "", false, days || 1, "");
+  const excludedRequestMessages = messages.filter(m => kohIsRequestLikeForBriefing(m.content));
+  const excludedBotMessages = messages.filter(m => /@KOH_AI_bot|^\/\w+/.test(String(m.content || "")));
+  const candidateMessages = messages
+    .filter(m => !kohIsRequestLikeForBriefing(m.content))
+    .filter(m => kohHasWorkSignal(m.content) || String(m.content || "").length >= 20)
+    .slice(0, 80);
+  const candidateFiles = files.slice(0, 50);
+  const exportFiles = files.filter(f => f.source_type === "telegram_export" || f.saved_by === "telegram_export_importer" || String(f.tags_json || "").includes("telegram_export"));
+  return {
+    candidateMessages,
+    candidateFiles,
+    exportFiles,
+    excludedRequestMessages,
+    excludedBotMessages,
+    excludedRoomCount: debug?.excludedRoomCount || 0,
+  };
+}
+
+function kohBuildBriefingCorpusFromCandidates(data) {
+  const fileLines = (data.candidateFiles || []).slice(0, 30).map(f => {
+    const room = f.room_title || "알 수 없는 방";
+    const who = f.uploader_name || f.sender_name || "공유자 미상";
+    const text = kohShortText(f.summary || f.extracted_text || f.content || f.file_name || "", 250);
+    return `[FILE] ${String(f.created_at || "").slice(0, 10)} / ${room} / ${who} / ${f.file_name || "파일명 없음"} / ${text}`;
+  });
+  const msgLines = (data.candidateMessages || []).slice(0, 80).map(m => {
+    const room = m.room_title || "알 수 없는 방";
+    const who = m.sender_name || "공유자 미상";
+    return `[MSG] ${String(m.created_at || "").slice(0, 10)} / ${room} / ${who} / ${kohShortText(m.content || "", 250)}`;
+  });
+  return [...fileLines, ...msgLines].join("\n");
+}
+
+async function handleDebugBriefing(env, chatId) {
+  if (!env.DB) { await sendMessage(env, chatId, "DB 없음"); return; }
+  try {
+    const data = await kohBuildBriefingCandidates(env, 7);
+    const selectedFiles = data.candidateFiles.slice(0, 5).map(f => `file: ${f.file_name || ""} / ${f.room_title || ""} / ${String(f.created_at || "").slice(0, 10)}`);
+    const selectedMessages = data.candidateMessages.slice(0, 5).map(m => `msg: ${m.room_title || ""} / ${m.sender_name || ""} / ${kohShortText(m.content || "", 80)}`);
+    const out =
+      `[debug_briefing]\n` +
+      `candidate_messages: ${data.candidateMessages.length}\n` +
+      `excluded_request_like: ${data.excludedRequestMessages.length}\n` +
+      `excluded_bot_messages: ${data.excludedBotMessages.length}\n` +
+      `candidate_files: ${data.candidateFiles.length}\n` +
+      `export_files: ${data.exportFiles.length}\n` +
+      `excluded_room_count: ${data.excludedRoomCount}\n\n` +
+      `selected_items:\n${[...selectedFiles, ...selectedMessages].join("\n") || "없음"}`;
+    await sendMessage(env, chatId, out.slice(0, 3500));
+  } catch (e) {
+    await sendMessage(env, chatId, `debug_briefing 실패: ${String(e?.message || e).slice(0, 500)}`);
   }
 }
 
@@ -4915,8 +5078,9 @@ async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) 
         .map((s) => `- ${formatShortDate(s.date || today)} ${s.time || ""} ${s.title || s.text || "일정"}`.replace(/\s+/g, " ").trim())
         .join("\n")
     : "- 오늘 일정 데이터가 없습니다.";
-  const rows = await fetchDigestRows(env, isMonday ? 7 : 1, 140);
-  if (!rows.length && !schedules.length) {
+  const briefingData = await kohBuildBriefingCandidates(env, isMonday ? 7 : 1);
+  const briefingCorpus = kohBuildBriefingCorpusFromCandidates(briefingData);
+  if (!briefingCorpus && !schedules.length) {
     if (mock && targetChatId) await sendMessage(env, targetChatId, "최근 자료를 찾지 못했습니다.");
     return;
   }
@@ -4926,7 +5090,7 @@ async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) 
     const query =
       TONE_RULE +
       `[브리핑 제목]\n${title}\n\n` +
-      `[수집 기록]\n${buildDigestCorpus(rows)}\n\n` +
+      `[수집 기록]\n${briefingCorpus}\n\n` +
       `[일정]\n${scheduleLines}\n\n` +
       `[출력 형식]\n` +
       `${title}\n\n` +
