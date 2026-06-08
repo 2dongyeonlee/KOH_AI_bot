@@ -38,7 +38,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-file-auto-structure-20260609-0700";
+const BUILD_VERSION = "koh-userlist-clean-20260609-0800";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -4339,19 +4339,19 @@ async function handleUserList(chatId, env) {
   if (env.DB) {
     try {
       const result = await env.DB.prepare(`
-        SELECT telegram_id, name, username, source, last_seen_at
+        SELECT telegram_id, name, source
         FROM users
-        ORDER BY last_seen_at DESC
-        LIMIT 100
+        WHERE telegram_id NOT LIKE 'user%'
+          AND name IS NOT NULL
+          AND name != ''
+        ORDER BY name ASC
       `).all();
       const rows = result.results || [];
       if (rows.length) {
-        const lines = rows.map((u, idx) => {
-          const username = u.username ? ` / @${u.username}` : "";
-          const source = u.source ? ` / ${u.source}` : "";
-          return `${idx + 1}. ${u.name || "이름 없음"} / ID: ${u.telegram_id}${username}${source}`;
-        });
-        await sendMessage(env, chatId, `등록된 사용자 ${rows.length}명\n\n${lines.join("\n")}`);
+        const lines = rows.map((u) => `${u.name} (${u.telegram_id})`);
+        await sendMessage(env, chatId,
+          `등록된 팀원 ${rows.length}명:\n\n${lines.join("\n")}`
+        );
         return;
       }
     } catch (e) {
@@ -4365,13 +4365,10 @@ async function handleUserList(chatId, env) {
     if (!raw) continue;
     const u = JSON.parse(raw);
     if (u.name && !u.step) {
-      const name = cleanName(u.name) || u.name;
-      users.push(`${name} (${u.id})`);
+      users.push(`${cleanName(u.name) || u.name} (${u.id})`);
     }
   }
-  await sendMessage(
-    env,
-    chatId,
+  await sendMessage(env, chatId,
     users.length
       ? `등록된 팀원 ${users.length}명:\n\n${users.join("\n")}`
       : "아직 등록된 분이 없습니다."
