@@ -677,7 +677,7 @@ function kohShortText(value = "", max = 180) {
   return s.length > max ? s.slice(0, max) + "..." : s;
 }
 
-function kohFormatThreeLineItem({ title = "", content = "", location = "", person = "", date = "" }) {
+function kohFormatThreeLineItemOld({ title = "", content = "", location = "", person = "", date = "" }) {
   const safeTitle = kohEscapeHtml(title || "확인된 안건");
   const safeContent = kohEscapeHtml(kohShortText(content || "관련 내용 확인 필요", 220));
   const safeLocation = kohEscapeHtml(location || "위치 확인 필요");
@@ -974,7 +974,7 @@ async function kohResolveItems(env, items, idField, nameField) {
 // Deduplicates files, picks one representative per unique file.
 // Primary key is file_name+room_id so rows with/without telegram_file_unique_id
 // for the same file always end up in the same group.
-function kohDedupFiles(files) {
+function kohDedupFilesOld(files) {
   const groups = new Map();
 
   for (const f of files) {
@@ -2867,7 +2867,7 @@ async function handleDebugSearch(env, chatId, text) {
   }
 }
 
-async function handleDebugFiles(env, chatId) {
+async function handleDebugFilesOld(env, chatId) {
   try {
     if (!env.DB || !(await tableExists(env, "files"))) {
       await sendMessage(env, chatId, "files 테이블 없음.");
