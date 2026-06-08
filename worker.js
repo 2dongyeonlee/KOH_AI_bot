@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-cross-room-user-normalize-20260608-1530";
+const BUILD_VERSION = "koh-crossroom-file-resend-userfix-20260608-1700";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -488,14 +488,20 @@ function kohLooksLikeCommandOrRequestOnly(content = "") {
 
   if (!t) return true;
   if (/^\/\w+/.test(t)) return true;
+  // 봇 멘션 포함된 요청문
+  if (/@KOH_AI_bot|@KOH_ai_bot/i.test(t)) return true;
 
   const normalized = kohNormalizeText(t);
   const words = normalized.split(" ").filter(Boolean);
 
+  // 강한 요청 패턴 — 길이 무관
+  const strongRequest = /(내가\s*포함된\s*방|포함된\s*단체방|단체방에\s*보고된|공유된\s*내용\s*요약|다른\s*방들도|방들에서|알려줘야지)/.test(t);
+  if (strongRequest) return true;
+
+  // 단순 요청형 — 짧은 문장만
   const requestLike =
     /(요약|정리|알려줘|보내줘|공유해줘|찾아줘|해줘|해라|어디|뭐야|확인해줘)/.test(t);
-
-  if (requestLike && words.length <= 5) return true;
+  if (requestLike && words.length <= 6) return true;
 
   return false;
 }
@@ -642,6 +648,7 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
       AND m.content IS NOT NULL
       AND m.content != ''
       AND m.content NOT LIKE '/%'
+      AND m.content NOT LIKE '%@KOH_AI_bot%'
       ${msgRoomFilter}
     ORDER BY m.created_at DESC
     LIMIT 300
@@ -2063,8 +2070,9 @@ async function handleSetUserName(env, chatId, text) {
   if (!env.DB) { await sendMessage(env, chatId, "DB 없음"); return; }
   const { hasCanonical } = await getUserNameColumnInfo(env);
   if (!hasCanonical) {
-    await sendMessage(env, chatId, "canonical_name 컬럼 없음. migrations/0010_user_canonical_name.sql 실행 필요.");
-    return;
+    try {
+      await env.DB.prepare(`ALTER TABLE users ADD COLUMN canonical_name TEXT DEFAULT ''`).run();
+    } catch (_) {}
   }
   try {
     await env.DB.prepare(`
@@ -2228,15 +2236,17 @@ function fileLocation(row) {
 }
 
 function fileCaption(row) {
-  const file = escapeHtml(row.file_name || "파일명 없음");
-  const room = escapeHtml(normalizeRoomTitle(row) || "알 수 없는 방");
-  const actor = escapeHtml(row.actor || row.uploader_name || row.sender_name || "공유자 미상");
-  const date = escapeHtml(formatShortDate(row.created_at));
-  return `자료 확인했습니다. 아래 파일을 공유드립니다.\n\n` +
-    `📎 <b>${file}</b>\n` +
-    `🔎 위치: ${room} &gt; ${file}\n` +
-    `👤 공유자: ${actor}\n` +
-    `🗓 일자: ${date}`;
+  const file = row.file_name || "파일명 없음";
+  const room = row.joined_room_title || normalizeRoomTitle(row) || "알 수 없는 방";
+  const actor = row.actor || row.uploader_name || row.sender_name || "공유자 미상";
+  const date = formatShortDate(row.created_at);
+  return kohFormatThreeLineItem({
+    title: file,
+    content: row.summary || row.extracted_text || "첨부 파일",
+    location: `${room} > ${file}`,
+    person: actor,
+    date,
+  });
 }
 
 async function searchFilesForResend(env, text) {
@@ -2247,7 +2257,7 @@ async function searchFilesForResend(env, text) {
   const hasRooms = await tableExists(env, "rooms");
   const hasUsers = await tableExists(env, "users");
   const { hasCanonical } = await getUserNameColumnInfo(env);
-  const joins = `${hasRooms ? "LEFT JOIN rooms r ON r.room_id = f.room_id" : ""} ${hasUsers ? "LEFT JOIN users u ON u.telegram_id = f.uploader_id" : ""}`;
+  const joins = `${hasRooms ? "LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(f.room_id AS TEXT)" : ""} ${hasUsers ? "LEFT JOIN users u ON CAST(u.telegram_id AS TEXT) = CAST(f.uploader_id AS TEXT)" : ""}`;
   const sourceExpr = hasRooms
     ? `COALESCE(CASE WHEN CAST(f.room_id AS INTEGER) > 0 THEN '1:1' END, CASE WHEN CAST(f.room_id AS INTEGER) < 0 THEN COALESCE(r.room_title, NULLIF(f.room_title, '1:1'), '알 수 없는 방') END, f.room_title, '알 수 없는 방')`
     : `COALESCE(CASE WHEN CAST(f.room_id AS INTEGER) > 0 THEN '1:1' END, NULLIF(f.room_title, ''), '알 수 없는 방')`;
@@ -2269,16 +2279,28 @@ async function searchFilesForResend(env, text) {
     exactDateMiss = files.length === 0;
   }
   if (!files.length) {
-    files = (await env.DB.prepare(`${baseSelect} AND datetime(f.created_at) >= datetime('now', '-14 days') ORDER BY f.created_at DESC LIMIT 6`)
+    files = (await env.DB.prepare(`${baseSelect} AND datetime(f.created_at) >= datetime('now', '-30 days') ORDER BY f.created_at DESC LIMIT 6`)
+      .bind(...params).all()).results || [];
+  }
+  // 키워드 없으면 최근 파일 전체 기준
+  if (!files.length && !keyword) {
+    files = (await env.DB.prepare(`${baseSelect} ORDER BY f.created_at DESC LIMIT 6`)
       .bind(...params).all()).results || [];
   }
   let messages = [];
   if (!files.length && await tableExists(env, "messages")) {
+    const hasRoomsMsg = await tableExists(env, "rooms");
+    const msgRoomJoin = hasRoomsMsg ? "LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(m.room_id AS TEXT)" : "";
+    const msgRoomExpr = hasRoomsMsg
+      ? `COALESCE(CASE WHEN CAST(m.room_id AS INTEGER)<0 THEN NULLIF(r.room_title,'') END, CASE WHEN CAST(m.room_id AS INTEGER)>0 THEN '1:1' END, m.room_title, '알 수 없는 방')`
+      : `COALESCE(m.room_title, '알 수 없는 방')`;
     messages = (await env.DB.prepare(`
-      SELECT content, room_title, sender_name, created_at
-      FROM messages
-      WHERE content LIKE ? AND datetime(created_at) >= datetime('now', '-14 days')
-      ORDER BY created_at DESC
+      SELECT m.content, ${msgRoomExpr} AS room_title, m.sender_name, m.created_at
+      FROM messages m ${msgRoomJoin}
+      WHERE m.content LIKE ? AND datetime(m.created_at) >= datetime('now', '-14 days')
+        AND m.content NOT LIKE '/%'
+        AND m.content NOT LIKE '%@KOH_AI_bot%'
+      ORDER BY m.created_at DESC
       LIMIT 5
     `).bind(like).all()).results || [];
   }
@@ -2288,10 +2310,17 @@ async function searchFilesForResend(env, text) {
 async function sendFileRow(env, chatId, row) {
   const document = row.telegram_file_id || row.file_id || "";
   if (!document) {
-    await sendMessage(env, chatId, "파일 원본 재전송용 ID가 저장되어 있지 않음.");
+    const room = row.joined_room_title || normalizeRoomTitle(row) || "알 수 없는 방";
+    const actor = row.actor || row.uploader_name || row.sender_name || "공유자 미상";
+    await kohSendHtml(env, chatId, kohFormatThreeLineItem({
+      title: "자료 확인 (원본 전송 불가)",
+      content: "파일은 확인됐지만 telegram_file_id가 없어 원본을 보낼 수 없음.",
+      location: `${room} > ${row.file_name || "파일명 없음"}`,
+      person: actor,
+      date: formatShortDate(row.created_at),
+    }));
     return;
   }
-  await sendMessage(env, chatId, `자료 확인했습니다. 아래 파일을 공유드립니다.\n📎 ${row.file_name || "파일명 없음"}\n🔎 위치: ${fileLocation(row)}`);
   await sendDocument(env, chatId, document, fileCaption(row));
 }
 
@@ -2361,18 +2390,29 @@ async function answerFileSearch(env, text) {
   const keyword = extractSearchKeyword(text);
   const like = `%${keyword}%`;
   try {
+    const hasRooms = await tableExists(env, "rooms");
+    const fRoomJoin = hasRooms ? "LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(f.room_id AS TEXT)" : "";
+    const fRoomTitle = hasRooms
+      ? `COALESCE(CASE WHEN CAST(f.room_id AS INTEGER)<0 THEN NULLIF(r.room_title,'') END, CASE WHEN CAST(f.room_id AS INTEGER)>0 THEN '1:1' END, f.room_title, '알 수 없는 방')`
+      : `COALESCE(f.room_title, '알 수 없는 방')`;
     const files = (await env.DB.prepare(`
-      SELECT 'file' AS type, file_name AS title, summary AS summary, room_title, COALESCE(uploader_name, sender_name) AS actor, created_at, file_name AS location
-      FROM files
-      WHERE file_name LIKE ? OR summary LIKE ?
-      ORDER BY created_at DESC
+      SELECT 'file' AS type, f.file_name AS title, f.summary AS summary, ${fRoomTitle} AS room_title,
+        COALESCE(f.uploader_name, f.sender_name) AS actor, f.created_at, f.file_name AS location
+      FROM files f ${fRoomJoin}
+      WHERE f.file_name LIKE ? OR f.summary LIKE ?
+      ORDER BY f.created_at DESC
       LIMIT 10
     `).bind(like, like).all()).results || [];
+    const mRoomJoin = hasRooms ? "LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(m.room_id AS TEXT)" : "";
+    const mRoomTitle = hasRooms
+      ? `COALESCE(CASE WHEN CAST(m.room_id AS INTEGER)<0 THEN NULLIF(r.room_title,'') END, CASE WHEN CAST(m.room_id AS INTEGER)>0 THEN '1:1' END, m.room_title, '알 수 없는 방')`
+      : `COALESCE(m.room_title, '알 수 없는 방')`;
     const messages = (await env.DB.prepare(`
-      SELECT 'message' AS type, content AS title, content AS summary, room_title, sender_name AS actor, created_at, '' AS location
-      FROM messages
-      WHERE content LIKE ?
-      ORDER BY created_at DESC
+      SELECT 'message' AS type, m.content AS title, m.content AS summary, ${mRoomTitle} AS room_title,
+        m.sender_name AS actor, m.created_at, '' AS location
+      FROM messages m ${mRoomJoin}
+      WHERE m.content LIKE ? AND m.content NOT LIKE '/%' AND m.content NOT LIKE '%@KOH_AI_bot%'
+      ORDER BY m.created_at DESC
       LIMIT 10
     `).bind(like).all()).results || [];
     let external = [];
