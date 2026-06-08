@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-display-file-owner-title-fix-20260608-1800";
+const BUILD_VERSION = "koh-intent-file-summary-fix-20260608-1900";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -715,149 +715,277 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
   };
 }
 
+// ── Intent constants ──────────────────────────────────────────────────────────
+const KOH_INTENT = {
+  FILE_LIST:       "FILE_LIST",
+  FILE_SUMMARY:    "FILE_SUMMARY",
+  FILE_RESEND:     "FILE_RESEND",
+  MESSAGE_SUMMARY: "MESSAGE_SUMMARY",
+  PRIORITY:        "PRIORITY",
+};
+
+function kohDetectIntent(text = "") {
+  const t = String(text || "").trim();
+  if (/(보내줘|전달해줘|첨부해줘|올려줘)/.test(t)) return KOH_INTENT.FILE_RESEND;
+  if (/(파일\s*(목록|뭐야|뭐가|어떤|있어|있지|공유됐|공유된)|자료\s*(목록|뭐야|있어|있지|공유됐|공유된)|공유된\s*파일|저장된\s*파일)/.test(t)) return KOH_INTENT.FILE_LIST;
+  if (/(먼저\s*챙길|우선순위|챙겨야\s*할|이번주\s*안건)/.test(t)) return KOH_INTENT.PRIORITY;
+  if (/(파일\s*(내용|요약|정리|상세)|자료\s*(내용|요약|정리|상세)|문서\s*(내용|요약)|보고자료.*요약|자료.*요약해|내용.*알려줘|내용.*정리해)/.test(t)) return KOH_INTENT.FILE_SUMMARY;
+  return KOH_INTENT.MESSAGE_SUMMARY;
+}
+
+// Pending selection: store up to 3 candidates by chatId, expire 10 min
+async function kohSavePending(env, chatId, intent, items) {
+  if (!env.CONVERSATIONS) return;
+  await env.CONVERSATIONS.put(
+    `koh_pending_${chatId}`,
+    JSON.stringify({ intent, files: items, createdAt: Date.now() }),
+    { expirationTtl: 600 }
+  );
+}
+
+async function kohHandlePendingSelection(env, chatId, userId, text) {
+  if (!env.CONVERSATIONS) return false;
+  const raw = await env.CONVERSATIONS.get(`koh_pending_${chatId}`);
+  if (!raw) return false;
+  let state;
+  try { state = JSON.parse(raw); } catch (_) { return false; }
+  if (Date.now() - (state.createdAt || 0) > 600000) {
+    await env.CONVERSATIONS.delete(`koh_pending_${chatId}`);
+    return false;
+  }
+  const n = Number(String(text || "").replace(/[번호\s]/g, "").trim());
+  if (!Number.isInteger(n) || n < 1 || n > 3) return false;
+  const item = (state.files || [])[n - 1];
+  if (!item) return false;
+  await env.CONVERSATIONS.delete(`koh_pending_${chatId}`);
+
+  if (state.intent === KOH_INTENT.FILE_RESEND) {
+    const document = item.telegram_file_id || item.file_id || "";
+    if (document) {
+      const caption = kohFormatThreeLineItem({
+        title: inferTitle(item),
+        content: item.summary || item.extracted_text || "첨부 파일",
+        location: `${item._resolvedRoom || "알 수 없는 방"} > ${item.file_name || "파일명 없음"}`,
+        person: item._resolvedName || item.uploader_name || "공유자 확인 필요",
+        date: kohFormatDate(item.created_at),
+      });
+      await kohSendDocument(env, chatId, item, caption);
+    } else {
+      await kohSendHtml(env, chatId, kohFormatThreeLineItem({
+        title: inferTitle(item),
+        content: "파일은 확인됐지만 telegram_file_id가 없어 원본을 보낼 수 없음.",
+        location: `${item._resolvedRoom || "알 수 없는 방"} > ${item.file_name || "파일명 없음"}`,
+        person: item._resolvedName || item.uploader_name || "공유자 확인 필요",
+        date: kohFormatDate(item.created_at),
+      }));
+    }
+  } else {
+    // FILE_SUMMARY
+    const summaryText = item.summary || item.extracted_text;
+    await kohSendHtml(env, chatId, kohFormatThreeLineItem({
+      title: inferTitle(item),
+      content: summaryText ? String(summaryText).slice(0, 400) : "본문/요약이 없어 내용 요약은 불가합니다. 필요하면 '보내줘'라고 하시면 파일을 전달드릴 수 있습니다.",
+      location: `${item._resolvedRoom || "알 수 없는 방"} > ${item.file_name || "파일명 없음"}`,
+      person: item._resolvedName || item.uploader_name || "공유자 확인 필요",
+      date: kohFormatDate(item.created_at),
+    }));
+  }
+  return true;
+}
+
+// Helper: resolve names and room titles for a list of file/message rows
+async function kohResolveItems(env, items, idField, nameField) {
+  return Promise.all(items.map(async item => {
+    const name = await resolveUserName(env, item[idField], item[nameField]);
+    const room = kohResolveRoomTitle(item, name);
+    return { ...item, _resolvedName: name, _resolvedRoom: room };
+  }));
+}
+
 async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomId = "") {
   if (!env.DB) {
     await kohSendHtml(env, chatId, "DB 연결이 없어 저장 기록을 확인할 수 없음.");
     return true;
   }
 
-  const terms = kohExtractSearchTerms(text);
+  const intent       = kohDetectIntent(text);
+  const terms        = kohExtractSearchTerms(text);
   const currentRoomOnly = kohIsCurrentRoomOnly(text);
-  const sendFile = kohIsFileSendRequest(text);
-
-  const groupPreferred = kohIsGroupRoomPreferred(text);
+  const groupPreferred  = kohIsGroupRoomPreferred(text);
   const { files, messages } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly);
 
-  const rankedFiles = files
-    .map(f => {
-      const score = kohScoreRecord(f, terms);
-      const isGroup = Number(f.room_id || 0) < 0;
-      const groupBonus = groupPreferred && isGroup ? 20 : (groupPreferred && !isGroup ? -15 : 0);
-      return { ...f, _score: score + groupBonus };
-    })
-    .filter(f => terms.length ? f._score > 0 : true)
-    .sort((a, b) => b._score - a._score)
-    .slice(0, 5);
+  // Minimum score: require keyword match when terms exist
+  const MIN_SCORE = terms.length ? 5 : 1;
 
-  const rankedMessages = messages
+  function scoreItems(rows, field = "content") {
+    return rows.map(r => {
+      const base = kohScoreRecord(r, terms);
+      const isGroup = Number(r.room_id || 0) < 0;
+      const bonus = groupPreferred ? (isGroup ? 20 : -15) : 0;
+      return { ...r, _score: base + bonus };
+    })
+    .filter(r => r._score >= MIN_SCORE)
+    .sort((a, b) => b._score - a._score);
+  }
+
+  const scoredFiles = scoreItems(files).slice(0, 10);
+  const scoredMsgs  = messages
     .filter(m => !kohLooksLikeCommandOrRequestOnly(m.content))
-    .map(m => {
-      const score = kohScoreRecord(m, terms);
-      const isGroup = Number(m.room_id || 0) < 0;
-      const groupBonus = groupPreferred && isGroup ? 20 : (groupPreferred && !isGroup ? -15 : 0);
-      return { ...m, _score: score + groupBonus };
-    })
-    .filter(m => terms.length ? m._score > 0 : true)
+    .reduce((acc, m) => { const scored = { ...m, _score: kohScoreRecord(m, terms) + (groupPreferred && Number(m.room_id||0)<0 ? 20 : 0) }; if (scored._score >= MIN_SCORE) acc.push(scored); return acc; }, [])
     .sort((a, b) => b._score - a._score)
-    .slice(0, 8);
+    .slice(0, 10);
 
-  // Resolve user names for ranked files and messages
-  const resolvedFiles = await Promise.all(rankedFiles.map(async f => ({
-    ...f,
-    _resolvedName: await resolveUserName(env, f.uploader_id || f.sender_id, f.uploader_name || f.sender_name),
-    _resolvedRoom: kohResolveRoomTitle(f, ""),
-  })));
-  // For 1:1 rooms, try to use resolved uploader name in room label
-  for (const f of resolvedFiles) {
-    if (Number(f.room_id || 0) > 0 && f._resolvedName && f._resolvedName !== "공유자 확인 필요") {
-      f._resolvedRoom = `1:1(${f._resolvedName})`;
-    }
+  // For MESSAGE_SUMMARY with groupPreferred: prefer group rooms
+  let filteredMsgs = scoredMsgs;
+  if (groupPreferred) {
+    const groupOnly = scoredMsgs.filter(m => Number(m.room_id || 0) < 0);
+    if (groupOnly.length > 0) filteredMsgs = groupOnly;
   }
 
-  const resolvedMessages = await Promise.all(rankedMessages.map(async m => ({
-    ...m,
-    _resolvedName: await resolveUserName(env, m.sender_id, m.sender_name),
-    _resolvedRoom: kohResolveRoomTitle(m, ""),
-  })));
-  for (const m of resolvedMessages) {
-    if (Number(m.room_id || 0) > 0 && m._resolvedName && m._resolvedName !== "공유자 확인 필요") {
-      m._resolvedRoom = `1:1(${m._resolvedName})`;
+  // PRIORITY: delegate to existing handler
+  if (intent === KOH_INTENT.PRIORITY) return false;
+
+  if (intent === KOH_INTENT.FILE_LIST) {
+    if (!scoredFiles.length) {
+      await kohSendHtml(env, chatId, "<b>저장된 관련 파일이 없습니다.</b>");
+      return true;
     }
+    const items = await kohResolveItems(env, scoredFiles.slice(0, 5), "uploader_id", "uploader_name");
+    const body = items.map((f, i) => kohFormatThreeLineItem({
+      title: `${i + 1}. ${inferTitle(f)}`,
+      content: f.summary || f.extracted_text || "요약 없음",
+      location: `${f._resolvedRoom} > ${f.file_name || "파일명 없음"}`,
+      person: f._resolvedName,
+      date: kohFormatDate(f.created_at),
+    })).join("\n\n");
+    await kohSendHtml(env, chatId, `<b>저장된 파일 ${items.length}건입니다.</b>\n\n${body}`);
+    return true;
   }
 
-  if (sendFile && resolvedFiles.length > 0) {
-    if (resolvedFiles.length > 1) {
-      const candidates = resolvedFiles.slice(0, 3);
-      // KV 저장 생략 (kohHandleInternalKnowledgeRequest는 message 객체 없음)
-      const lines = candidates.map((f, i) => kohFormatThreeLineItem({
+  if (intent === KOH_INTENT.FILE_SUMMARY) {
+    if (!scoredFiles.length) {
+      await kohSendHtml(env, chatId, "<b>관련 파일을 찾을 수 없습니다.</b>");
+      return true;
+    }
+    const top = scoredFiles[0], second = scoredFiles[1];
+    const ambiguous = second && (top._score - second._score) <= 5;
+    if (ambiguous) {
+      const candidates = await kohResolveItems(env, scoredFiles.slice(0, 3), "uploader_id", "uploader_name");
+      await kohSavePending(env, chatId, KOH_INTENT.FILE_SUMMARY, candidates);
+      const body = candidates.map((f, i) => kohFormatThreeLineItem({
         title: `${i + 1}. ${inferTitle(f)}`,
         content: f.summary || f.extracted_text || "요약 없음",
         location: `${f._resolvedRoom} > ${f.file_name || "파일명 없음"}`,
         person: f._resolvedName,
         date: kohFormatDate(f.created_at),
-      }));
-      await kohSendHtml(env, chatId, `<b>관련 자료 ${candidates.length}건 확인됩니다.</b>\n\n${lines.join("\n\n")}\n\n원하는 번호를 입력해주세요.`);
+      })).join("\n\n");
+      await kohSendHtml(env, chatId, `<b>관련 파일 후보가 여러 개입니다. 요약할 번호를 선택해주세요.</b>\n\n${body}`);
       return true;
     }
-    const file = resolvedFiles[0];
-    const fileName = file.file_name || "파일명 없음";
-    const summary = file.summary || file.extracted_text || "관련 자료가 확인됨.";
-    const caption = kohFormatThreeLineItem({
-      title: inferTitle(file),
-      content: summary,
-      location: `${file._resolvedRoom} > ${fileName}`,
-      person: file._resolvedName,
-      date: kohFormatDate(file.created_at),
-    });
-    const sent = await kohSendDocument(env, chatId, file, caption);
-    if (sent) return true;
+    const [item] = await kohResolveItems(env, [top], "uploader_id", "uploader_name");
+    const summaryText = item.summary || item.extracted_text;
     await kohSendHtml(env, chatId, kohFormatThreeLineItem({
-      title: "자료 확인 (원본 전송 불가)",
-      content: "파일은 확인됐지만 telegram_file_id가 없어 원본을 보낼 수 없음.",
-      location: `${file._resolvedRoom} > ${fileName}`,
-      person: file._resolvedName,
-      date: kohFormatDate(file.created_at),
+      title: inferTitle(item),
+      content: summaryText
+        ? String(summaryText).slice(0, 400)
+        : "파일 원본은 확인됐지만 추출된 본문/요약이 없어 내용 요약은 불가합니다. 필요하면 '보내줘'라고 하시면 파일을 전달드릴 수 있습니다.",
+      location: `${item._resolvedRoom} > ${item.file_name || "파일명 없음"}`,
+      person: item._resolvedName,
+      date: kohFormatDate(item.created_at),
     }));
     return true;
   }
 
-  if (resolvedFiles.length > 0) {
-    const body = resolvedFiles.slice(0, 3).map((f, i) => {
-      const fileName = f.file_name || "파일명 없음";
-      const summary = f.summary || f.extracted_text || "요약 정보 없음";
-      return kohFormatThreeLineItem({
-        title: `${i + 1}. ${inferTitle(f)}`,
-        content: summary,
-        location: `${f._resolvedRoom} > ${fileName}`,
-        person: f._resolvedName,
-        date: kohFormatDate(f.created_at),
-      });
-    }).join("\n\n");
-
-    const hint = resolvedFiles.some(f => f.telegram_file_id)
-      ? "\n\n필요하면 파일명을 언급해 '보내줘'라고 하시면 원본을 전달해드릴 수 있습니다."
-      : "";
-    await kohSendHtml(env, chatId, `<b>저장된 자료 기준으로 확인한 내용입니다.</b>\n\n${body}${hint}`);
+  if (intent === KOH_INTENT.FILE_RESEND) {
+    if (!scoredFiles.length) {
+      if (filteredMsgs.length) {
+        const items = await kohResolveItems(env, filteredMsgs.slice(0, 3), "sender_id", "sender_name");
+        const body = items.map((m, i) => kohFormatThreeLineItem({
+          title: `${i + 1}. ${inferTitle(m)}`,
+          content: String(m.content || "관련 메시지 확인됨").slice(0, 200),
+          location: `${m._resolvedRoom} > 관련 메시지`,
+          person: m._resolvedName,
+          date: kohFormatDate(m.created_at),
+        })).join("\n\n");
+        await kohSendHtml(env, chatId, `<b>파일 원본은 없음. 관련 메시지 기준 확인한 내용입니다.</b>\n\n${body}`);
+      } else {
+        await kohSendHtml(env, chatId, "<b>관련 파일이나 메시지를 찾을 수 없습니다.</b>");
+      }
+      return true;
+    }
+    if (scoredFiles.length === 1) {
+      const [item] = await kohResolveItems(env, [scoredFiles[0]], "uploader_id", "uploader_name");
+      const document = item.telegram_file_id || item.file_id || "";
+      if (document) {
+        const caption = kohFormatThreeLineItem({
+          title: inferTitle(item),
+          content: item.summary || item.extracted_text || "첨부 파일",
+          location: `${item._resolvedRoom} > ${item.file_name || "파일명 없음"}`,
+          person: item._resolvedName,
+          date: kohFormatDate(item.created_at),
+        });
+        await kohSendDocument(env, chatId, item, caption);
+      } else {
+        await kohSendHtml(env, chatId, kohFormatThreeLineItem({
+          title: "자료 확인 (원본 전송 불가)",
+          content: "파일은 확인됐지만 telegram_file_id가 없어 원본을 보낼 수 없음.",
+          location: `${item._resolvedRoom} > ${item.file_name || "파일명 없음"}`,
+          person: item._resolvedName,
+          date: kohFormatDate(item.created_at),
+        }));
+      }
+      return true;
+    }
+    const candidates = await kohResolveItems(env, scoredFiles.slice(0, 3), "uploader_id", "uploader_name");
+    await kohSavePending(env, chatId, KOH_INTENT.FILE_RESEND, candidates);
+    const body = candidates.map((f, i) => kohFormatThreeLineItem({
+      title: `${i + 1}. ${inferTitle(f)}`,
+      content: f.summary || f.extracted_text || "요약 없음",
+      location: `${f._resolvedRoom} > ${f.file_name || "파일명 없음"}`,
+      person: f._resolvedName,
+      date: kohFormatDate(f.created_at),
+    })).join("\n\n");
+    await kohSendHtml(env, chatId, `<b>관련 파일 ${candidates.length}건 확인됩니다. 번호를 선택해주세요.</b>\n\n${body}`);
     return true;
   }
 
-  if (resolvedMessages.length > 0) {
-    const body = resolvedMessages.slice(0, 5).map((m, i) => {
-      const content = m.content || "관련 메시지 확인됨";
-      return kohFormatThreeLineItem({
-        title: `${i + 1}. ${inferTitle(m)}`,
-        content,
-        location: `${m._resolvedRoom} > 관련 메시지`,
-        person: m._resolvedName,
-        date: kohFormatDate(m.created_at),
-      });
-    }).join("\n\n");
-
-    await kohSendHtml(env, chatId,
-`<b>관련 파일 원본은 확인되지 않음.</b>
-다만 포함된 방의 최근 기록 기준으로 확인된 내용입니다.
-
-${body}`);
+  // MESSAGE_SUMMARY (default)
+  if (filteredMsgs.length > 0) {
+    const items = await kohResolveItems(env, filteredMsgs.slice(0, 5), "sender_id", "sender_name");
+    const body = items.map((m, i) => kohFormatThreeLineItem({
+      title: `${i + 1}. ${inferTitle(m)}`,
+      content: String(m.content || "관련 메시지 확인됨").slice(0, 200),
+      location: `${m._resolvedRoom} > 관련 메시지`,
+      person: m._resolvedName,
+      date: kohFormatDate(m.created_at),
+    })).join("\n\n");
+    await kohSendHtml(env, chatId, `<b>포함된 방 최근 기록입니다.</b>\n\n${body}`);
     return true;
   }
 
-  const fallbackScope = currentRoomOnly ? "현재 방" : "포함된 방 전체";
+  // Fallback: show files if messages empty
+  if (scoredFiles.length > 0) {
+    const items = await kohResolveItems(env, scoredFiles.slice(0, 3), "uploader_id", "uploader_name");
+    const body = items.map((f, i) => kohFormatThreeLineItem({
+      title: `${i + 1}. ${inferTitle(f)}`,
+      content: f.summary || f.extracted_text || "요약 없음",
+      location: `${f._resolvedRoom} > ${f.file_name || "파일명 없음"}`,
+      person: f._resolvedName,
+      date: kohFormatDate(f.created_at),
+    })).join("\n\n");
+    const hint = items.some(f => f.telegram_file_id) ? "\n\n파일을 받으려면 파일명 언급 후 '보내줘'라고 해주세요." : "";
+    await kohSendHtml(env, chatId, `<b>관련 파일 기록입니다.</b>\n\n${body}${hint}`);
+    return true;
+  }
 
-  await kohSendHtml(env, chatId,
-`<b>[검색 결과 없음]</b>
- 🧩 <b>내용</b>: ${fallbackScope}의 최근 저장 기록에서 관련 내용을 찾지 못함.
- 📎 <b>자료 위치</b>: 확인된 자료 또는 관련 메시지 없음
- 👤 <b>공유자</b>: 확인 불가 / 확인 불가`);
+  const scope = currentRoomOnly ? "현재 방" : "포함된 방 전체";
+  await kohSendHtml(env, chatId, kohFormatThreeLineItem({
+    title: "검색 결과 없음",
+    content: `${scope}의 최근 기록에서 관련 내용을 찾지 못했습니다.`,
+    location: "확인된 자료 없음",
+    person: "확인 불가",
+    date: "확인 불가",
+  }));
   return true;
 }
 
@@ -3739,6 +3867,12 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
+  // pending candidate selection (1/2/3 after file list)
+  if (/^[123]$/.test(String(text || "").trim())) {
+    const uid = String(message.from?.id || "");
+    if (await kohHandlePendingSelection(env, chatId, uid, text)) return;
+  }
+
   // internal knowledge: digest/file/priority 앞에서 먼저 처리
   if (kohIsInternalKnowledgeRequest(text)) {
     const handled = await kohHandleInternalKnowledgeRequest(env, chatId, text, "");
@@ -4080,6 +4214,12 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     const answer = await answerUrlSummary(env, cleanText, userId);
     await sendMessage(env, chatId, answer);
     return;
+  }
+
+  // pending candidate selection (1/2/3 after file list)
+  if (/^[123]$/.test(String(cleanText || "").trim())) {
+    const uid = String(message.from?.id || "");
+    if (await kohHandlePendingSelection(env, chatId, uid, cleanText)) return;
   }
 
   // internal knowledge: digest/file/priority 앞에서 먼저 처리
