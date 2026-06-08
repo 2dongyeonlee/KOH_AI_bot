@@ -17,13 +17,28 @@ const SUMMARY_TONE_RULE =
   "- 출처가 없으면 확인 필요로 표시합니다.\n" +
   "- 마크다운 강조 기호는 사용하지 않습니다.\n\n";
 const ADMIN_NAME = "권오혁";
+const SUMMARY_RULE = `
+[요약 형식 규칙 — 반드시 준수]
+1. 안건별 형식:
+   📌 <b>안건명</b> (파일명 아닌 업무 내용 기반)
+   · 핵심 내용 1~2줄 (<u>담당자이름</u> 형태로 사람이름 밑줄 처리)
+   · 출처: [방이름] (<u>공유자이름</u>) (날짜)
+   ⚡ 마감: 날짜 (날짜·기한 있을 때만)
+
+2. 안건 사이 반드시 한 줄 띄기
+3. 파일명(photo_xxx 등)을 안건명으로 절대 쓰지 말 것
+4. 사람 이름은 모두 <u>이름</u> 형태로 밑줄 처리
+5. 마크다운(*,#) 사용 금지 — HTML 태그(<b>,<u>) 사용
+6. 납기·기한·마감일이 있으면 ⚡ 마감: 날짜 형태로 표시
+7. 전체 방(단체방 + 1:1 포함) 자료를 모두 포함할 것
+`;
 const BOT_OWNER_NAME = "권오혁";
 const BOT_OWNER_ROLE = "6R전략담당";
 const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-briefing-30d-html-bold-20260609-0500";
+const BUILD_VERSION = "koh-summary-rule-html-rooms-20260609-0600";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -4816,7 +4831,7 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
       `- 이모티콘(📌) 포함\n\n` +
       corpus;
     const result = await difyChat(env, { query, user: userId, conversationId: "" });
-    await sendMessage(env, chatId, result.answer || "정리 중 오류가 발생했습니다.");
+    await sendMessage(env, chatId, result.answer || "정리 중 오류가 발생했습니다.", { parseMode: "HTML" });
     return;
   }
 
@@ -4835,7 +4850,7 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
       .slice(0, 8000);
     const query = TONE_RULE + "다음 팀 대화 기록의 핵심 논의를 항목별로 요약해줘.\n\n" + corpus;
     const result = await difyChat(env, { query, user: userId, conversationId: "" });
-    await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했습니다.");
+    await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했습니다.", { parseMode: "HTML" });
     return;
   }
 
@@ -4873,7 +4888,7 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
       `- 이모티콘(📌) 포함\n\n` +
       corpus;
     const result = await difyChat(env, { query, user: userId, conversationId: "" });
-    await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했습니다.");
+    await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했습니다.", { parseMode: "HTML" });
     return;
   }
 
@@ -5181,7 +5196,7 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
       `- 이모티콘(📌) 포함\n\n` +
       corpus;
     const result = await difyChat(env, { query, user: userId, conversationId: "" });
-    await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했습니다.");
+    await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했습니다.", { parseMode: "HTML" });
     return;
   }
 
@@ -5200,7 +5215,7 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
       .slice(0, 6000);
     const query = TONE_RULE + "다음 팀 대화 기록의 핵심 논의를 항목별로 요약해줘.\n\n" + corpus;
     const result = await difyChat(env, { query, user: userId, conversationId: "" });
-    await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했습니다.");
+    await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했습니다.", { parseMode: "HTML" });
     return;
   }
 
@@ -5598,24 +5613,21 @@ async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) 
     return;
   }
 
-  // 봇이 속한 모든 방에 발송 (1:1 + 단체방)
-  const sent = new Set();
+  // 권오혁 개인 DM
   if (env.ADMIN_TELEGRAM_ID) {
     await sendMessage(env, env.ADMIN_TELEGRAM_ID, briefing, HTML);
-    sent.add(String(env.ADMIN_TELEGRAM_ID));
   }
-  try {
-    const rooms = await env.DB.prepare(
-      `SELECT room_id FROM rooms WHERE bot_name = 'koh' ORDER BY joined_at DESC LIMIT 50`
-    ).all();
-    for (const room of (rooms.results || [])) {
-      const rid = String(room.room_id);
-      if (sent.has(rid)) continue;
-      sent.add(rid);
-      const label = rid.startsWith("-") ? "[아침 브리핑]\n\n" : "";
-      await sendMessage(env, rid, `${label}${briefing}`, HTML);
-    }
-  } catch (e) { console.error("브리핑 발송 오류:", e.message); }
+
+  // 브리핑 발송 단체방 (허용된 방만)
+  const allowedRoomIds = [
+    "-5287392652", // AI 컴기획팀과 권
+    "-5156923133", // 테스트방임
+  ];
+  for (const roomId of allowedRoomIds) {
+    try {
+      await sendMessage(env, roomId, `[아침 브리핑]\n\n${briefing}`, HTML);
+    } catch (e) { console.error(`브리핑 발송 실패 ${roomId}:`, e.message); }
+  }
 }
 
 async function difyChat(env, { query, user, conversationId = "", files = [] }) {
@@ -5714,16 +5726,29 @@ function sanitizeTelegramHtml(value) {
     .replace(/&lt;\/u&gt;/g, "</u>");
 }
 
-async function sendMessage(env, chatId, text, options = {}) {
-  const clean = options.parseMode === "HTML"
-    ? sanitizeTelegramHtml(text).slice(0, 3900)
-    : stripMarkdown(text).slice(0, 3900);
-  const body = { chat_id: chatId, text: clean };
-  if (options.parseMode === "HTML") body.parse_mode = "HTML";
+async function sendMessage(env, chatId, text, opts = {}) {
+  const parseMode = opts.parseMode || "";
+  let body;
+  if (parseMode === "HTML") {
+    body = JSON.stringify({
+      chat_id: chatId,
+      text: String(text),
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    });
+  } else {
+    const clean = String(text)
+      .replace(/\*\*(.+?)\*\*/gs, "$1")
+      .replace(/\*(.+?)\*/gs, "$1")
+      .replace(/^#{1,6}\s+/gm, "")
+      .replace(/__(.+?)__/gs, "$1")
+      .replace(/`{1,3}([^`]*)`{1,3}/g, "$1");
+    body = JSON.stringify({ chat_id: chatId, text: clean });
+  }
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body,
   });
 }
 
