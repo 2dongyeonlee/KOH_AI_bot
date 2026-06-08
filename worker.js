@@ -872,18 +872,22 @@ async function kohResolveItems(env, items, idField, nameField) {
   }));
 }
 
-// Deduplicates files, picks one representative per unique file
+// Deduplicates files, picks one representative per unique file.
+// Primary key is file_name+room_id so rows with/without telegram_file_unique_id
+// for the same file always end up in the same group.
 function kohDedupFiles(files) {
   const groups = new Map();
 
   for (const f of files) {
-    // Key by priority: unique_id > file_id > name+room > id
-    const key = f.telegram_file_unique_id
+    const baseName = String(f.file_name || "").toLowerCase().replace(/\s+/g, " ").trim();
+    // file_name+room_id is most reliable — groups same file regardless of whether
+    // telegram_file_unique_id is present on all rows.
+    const key = baseName
+      ? `name:${baseName}:${f.room_id || ""}`
+      : f.telegram_file_unique_id
       ? `uniq:${f.telegram_file_unique_id}`
       : f.telegram_file_id
       ? `fid:${f.telegram_file_id}`
-      : f.file_name
-      ? `name:${String(f.file_name || "").toLowerCase().trim()}:${f.room_id || ""}:${f.file_size || ""}`
       : `id:${f.id}`;
 
     if (!groups.has(key)) groups.set(key, []);
