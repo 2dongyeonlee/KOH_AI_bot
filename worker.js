@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-three-line-format-20260608-1230";
+const BUILD_VERSION = "koh-internal-routing-format-20260608-1400";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -3532,6 +3532,12 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
+  // internal knowledge: files → messages fallback (반드시 external search / Dify 앞)
+  if (kohIsInternalKnowledgeRequest(text)) {
+    const handled = await kohHandleInternalKnowledgeRequest(env, chatId, text, "");
+    if (handled) return;
+  }
+
   if (needsExternalSearch(text)) {
     const answer = isExternalSearchEnabled(env) && hasTavilyConfig(env)
       ? await answerWithExternalSearch(env, text, userId)
@@ -3887,6 +3893,12 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     const answer = await answerDigest(env, cleanText, userId);
     await sendMessage(env, chatId, answer, { parseMode: "HTML" });
     return;
+  }
+
+  // internal knowledge MUST run before external search / Dify
+  if (kohIsInternalKnowledgeRequest(cleanText)) {
+    const handled = await kohHandleInternalKnowledgeRequest(env, chatId, cleanText, String(chatId));
+    if (handled) return;
   }
 
   if (needsExternalSearch(cleanText)) {
