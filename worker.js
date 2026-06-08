@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-internal-routing-format-20260608-1400";
+const BUILD_VERSION = "koh-routing-format-fix-20260608-1500";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -1985,15 +1985,17 @@ async function handleFilesCommand(env, chatId) {
       const fileName = f.file_name || "파일명 없음";
       const roomTitle = f.room_title || "알 수 없는 방";
       const summary = hasGeneratedSummary(f.summary)
-        ? String(f.summary || "").replace(/\s+/g, " ").slice(0, 140)
+        ? String(f.summary || "").replace(/\s+/g, " ").slice(0, 180)
         : "요약 미생성임.";
-      return `${idx + 1}. <b>${fileName}</b>\n` +
-        `   • <b>요약</b>: ${summary}\n` +
-        `   🗓 ${formatShortDate(f.created_at)}  📍 ${roomTitle}\n` +
-        `   👤 ${f.uploader_name || f.sender_name || "공유자 미상"}\n` +
-        `   🔎 위치: ${roomTitle} > ${fileName}`;
+      return kohFormatThreeLineItem({
+        title: `${idx + 1}. ${fileName}`,
+        content: summary,
+        location: `${roomTitle} > ${fileName}`,
+        person: f.uploader_name || f.sender_name || "공유자 미상",
+        date: formatShortDate(f.created_at),
+      });
     });
-    await sendMessage(env, chatId, `최근 저장 자료 ${rows.length}건임.\n\n${lines.join("\n\n")}`, { parseMode: "HTML" });
+    await kohSendHtml(env, chatId, `<b>최근 저장 자료 ${rows.length}건입니다.</b>\n\n${lines.join("\n\n")}`);
   } catch (e) {
     console.error("handleFilesCommand:", e);
     await sendMessage(env, chatId, `파일 목록 조회 실패함.\n${String(e?.message || e).slice(0, 300)}`);
@@ -2180,18 +2182,29 @@ async function handleFileResendRequest(env, message, text, chatId) {
       await env.CONVERSATIONS.put(`file_resend_${message.from.id}`, JSON.stringify({ files: candidates, createdAt: new Date().toISOString() }), { expirationTtl: 600 });
     }
     const lines = candidates.map((f, idx) =>
-      `${idx + 1}. ${f.file_name || "파일명 없음"}\n` +
-      `   • 위치: ${fileLocation(f)}\n` +
-      `   • 일자: ${formatShortDate(f.created_at)}`
+      kohFormatThreeLineItem({
+        title: `${idx + 1}. ${f.file_name || "파일명 없음"}`,
+        content: f.summary || f.extracted_text || "요약 없음",
+        location: fileLocation(f),
+        person: f.actor || f.uploader_name || f.sender_name || "공유자 미상",
+        date: formatShortDate(f.created_at),
+      })
     );
-    await sendMessage(env, chatId, `${prefix}자료 후보 ${candidates.length}건임.\n\n${lines.join("\n\n")}\n\n원하는 번호를 입력해주세요.`, { parseMode: "HTML" });
+    await kohSendHtml(env, chatId, `${prefix}자료 후보 ${candidates.length}건입니다.\n\n${lines.join("\n\n")}\n\n원하는 번호를 입력해주세요.`);
     return true;
   }
   if (result.messages.length) {
-    const lines = result.messages.slice(0, 3).map((m, idx) =>
-      `${idx + 1}. ${formatShortDate(m.created_at)} / ${normalizeRoomTitle(m)}\n- ${String(m.content || "").slice(0, 90)}`
-    );
-    await sendMessage(env, chatId, `${result.date?.label || ""} 저장된 관련 파일은 없음.\n관련 메시지는 확인됨.\n\n${lines.join("\n\n")}`.trim());
+    const body = result.messages.slice(0, 3).map((m, idx) => {
+      const room = normalizeRoomTitle(m) || "알 수 없는 방";
+      return kohFormatThreeLineItem({
+        title: `${idx + 1}. ${room}`,
+        content: String(m.content || "관련 메시지 확인됨").slice(0, 180),
+        location: `${room} > 관련 메시지`,
+        person: m.sender_name || "공유자 미상",
+        date: formatShortDate(m.created_at),
+      });
+    }).join("\n\n");
+    await kohSendHtml(env, chatId, `<b>파일 원본은 없음. 관련 메시지 기준 확인한 내용입니다.</b>\n\n${body}`);
     return true;
   }
   const dateLabel = result.date?.label ? `${result.date.label}에 저장된 ` : "";
@@ -2231,16 +2244,19 @@ async function answerFileSearch(env, text) {
     const rows = [...files, ...messages, ...external]
       .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
       .slice(0, 5);
-    if (!rows.length) return "찾은 자료 0건임.\n직접 매칭된 기록은 없음. 최근 7일 기록 기준으로 다시 확인함.";
-    const lines = rows.map((r, idx) =>
-      `${idx + 1}. ${String(r.title || "자료").slice(0, 60)}\n` +
-      `* 일자: ${formatShortDate(r.created_at)}\n` +
-      `* 공유자: ${r.actor || "미상"}\n` +
-      `* 방: ${r.room_title || "외부자료"}\n` +
-      `* 요약: ${String(r.summary || "요약 미생성임.").slice(0, 120)}\n` +
-      `* 위치: ${r.location || r.title || "messages"}`
-    );
-    return `찾은 자료 ${rows.length}건임.\n\n${lines.join("\n\n")}`;
+    if (!rows.length) return "<b>찾은 자료 0건임.</b>\n직접 매칭된 기록은 없음. 최근 14일 기록 기준으로 다시 확인함.";
+    const lines = rows.map((r, idx) => {
+      const room = r.room_title || "외부자료";
+      const loc = r.location ? `${room} > ${r.location}` : `${room} > ${String(r.title || "").slice(0, 40)}`;
+      return kohFormatThreeLineItem({
+        title: `${idx + 1}. ${String(r.title || "자료").slice(0, 60)}`,
+        content: String(r.summary || "요약 미생성임.").slice(0, 180),
+        location: loc,
+        person: r.actor || "미상",
+        date: formatShortDate(r.created_at),
+      });
+    });
+    return `<b>찾은 자료 ${rows.length}건입니다.</b>\n\n${lines.join("\n\n")}`;
   } catch (e) {
     console.error("answerFileSearch:", e);
     return "자료 검색 실패함.";
@@ -2940,25 +2956,23 @@ function summarizePriorityText(item) {
 
 function formatPriorityAnswer(candidates) {
   if (!candidates.length) return "최근 저장된 업무 기록이 없어 우선순위를 판단할 수 없음.";
-  const top = candidates[0];
-  const summary = summarizePriorityText(top);
-  const date = formatShortDate(top.latest);
-  const room = [...top.rooms][0] || "알 수 없는 방";
-  const actor = [...top.actors][0] || "공유자 미상";
-  const file = [...top.files][0] || "없음";
-  const next = candidates.slice(1).map((item, idx) => {
+  const items = candidates.slice(0, 5).map((item, idx) => {
     const s = summarizePriorityText(item);
-    return `${idx + 2}. ${escapeHtml(item.name)}\n• ${escapeHtml(s.action)}`;
+    const date = formatShortDate(item.latest);
+    const room = [...item.rooms][0] || "알 수 없는 방";
+    const actor = [...item.actors][0] || "공유자 미상";
+    const file = [...item.files][0] || "";
+    const loc = file ? `${room} > ${file}` : `${room} > 관련 메시지`;
+    const content = `${s.judgment} / ${s.action}`;
+    return kohFormatThreeLineItem({
+      title: `${idx + 1}. ${item.name}`,
+      content,
+      location: loc,
+      person: actor,
+      date,
+    });
   }).join("\n\n");
-  return `<b>이번주 1순위로 챙길 안건은 ${escapeHtml(top.name)}으로 보입니다.</b>\n\n` +
-    `• <b>판단</b>: ${escapeHtml(summary.judgment)}\n` +
-    `• <b>먼저 할 일</b>: ${escapeHtml(summary.action)}\n` +
-    `• <b>근거</b>: 저장된 메시지/자료 ${top.records.length}건 기준으로 반복 확인됨.\n\n` +
-    `🗓 관련 일자: ${escapeHtml(date)}\n` +
-    `📍 관련 방: ${escapeHtml(room)}\n` +
-    `👤 공유자: ${escapeHtml(actor)}\n` +
-    `📎 관련 자료: ${escapeHtml(file)}\n\n` +
-    (next ? `<b>다음 순위</b>\n${next}` : `<b>다음 순위</b>\n추가 후보는 명확하지 않음.`);
+  return `<b>이번주 챙길 안건 ${candidates.slice(0, 5).length}건입니다.</b>\n\n${items}`;
 }
 
 async function handlePriorityQuestion(env, chatId, text) {
@@ -3504,6 +3518,12 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
+  // internal knowledge: digest/file/priority 앞에서 먼저 처리
+  if (kohIsInternalKnowledgeRequest(text)) {
+    const handled = await kohHandleInternalKnowledgeRequest(env, chatId, text, "");
+    if (handled) return;
+  }
+
   if (isFileResendQuery(text)) {
     await handleFileResendRequest(env, message, text, chatId);
     return;
@@ -3516,7 +3536,7 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
 
   if (isFileSearchQuery(text)) {
     const answer = await answerFileSearch(env, text);
-    await sendMessage(env, chatId, answer);
+    await sendMessage(env, chatId, answer, { parseMode: "HTML" });
     return;
   }
 
@@ -3530,12 +3550,6 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     const answer = await answerDigest(env, text, userId);
     await sendMessage(env, chatId, answer, { parseMode: "HTML" });
     return;
-  }
-
-  // internal knowledge: files → messages fallback (반드시 external search / Dify 앞)
-  if (kohIsInternalKnowledgeRequest(text)) {
-    const handled = await kohHandleInternalKnowledgeRequest(env, chatId, text, "");
-    if (handled) return;
   }
 
   if (needsExternalSearch(text)) {
@@ -3847,6 +3861,12 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     return;
   }
 
+  // internal knowledge: digest/file/priority 앞에서 먼저 처리
+  if (kohIsInternalKnowledgeRequest(cleanText)) {
+    const handled = await kohHandleInternalKnowledgeRequest(env, chatId, cleanText, String(chatId));
+    if (handled) return;
+  }
+
   if (isFileResendQuery(cleanText)) {
     await handleFileResendRequest(env, message, cleanText, chatId);
     return;
@@ -3859,7 +3879,7 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
 
   if (isFileSearchQuery(cleanText)) {
     const answer = await answerFileSearch(env, cleanText);
-    await sendMessage(env, chatId, answer);
+    await sendMessage(env, chatId, answer, { parseMode: "HTML" });
     return;
   }
 
@@ -3893,12 +3913,6 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     const answer = await answerDigest(env, cleanText, userId);
     await sendMessage(env, chatId, answer, { parseMode: "HTML" });
     return;
-  }
-
-  // internal knowledge MUST run before external search / Dify
-  if (kohIsInternalKnowledgeRequest(cleanText)) {
-    const handled = await kohHandleInternalKnowledgeRequest(env, chatId, cleanText, String(chatId));
-    if (handled) return;
   }
 
   if (needsExternalSearch(cleanText)) {
