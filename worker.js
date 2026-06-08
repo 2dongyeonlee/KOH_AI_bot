@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-natural-intent-files-final-20260609-0000";
+const BUILD_VERSION = "koh-file-dedup-uploader-normalize-20260609-0100";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -463,7 +463,10 @@ function inferTitle(row) {
 
 function kohResolveRoomTitle(row, personName = "") {
   const roomId = Number(row?.room_id || 0);
-  if (roomId > 0) return personName ? `1:1(${personName})` : "1:1";
+  if (roomId > 0) {
+    const name = String(personName || "").trim();
+    return name && name !== "공유자 확인 필요" ? `1:1(${name})` : "1:1";
+  }
   const t = String(row?.room_title || row?.joined_room_title || "").trim();
   return (t && t !== "1:1") ? t : "알 수 없는 방";
 }
@@ -684,10 +687,11 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
         f.room_title,
         '알 수 없는 방'
       ) AS room_title,
-      COALESCE(NULLIF(f.uploader_name, ''), NULLIF(f.sender_name, ''), '공유자 확인 필요') AS uploader_name,
+      COALESCE(NULLIF(f.uploader_name, ''), NULLIF(f.sender_name, ''), '') AS uploader_name,
       f.uploader_id,
       f.sender_id,
       f.file_name,
+      f.file_size,
       f.telegram_file_id,
       f.telegram_file_unique_id,
       f.summary,
@@ -862,10 +866,58 @@ async function kohHandlePendingSelection(env, chatId, userId, text) {
 // Helper: resolve names and room titles for a list of file/message rows
 async function kohResolveItems(env, items, idField, nameField) {
   return Promise.all(items.map(async item => {
-    const name = await resolveUserName(env, item[idField], item[nameField]);
+    const name = await resolveUserName(env, item[idField], item[nameField] || "공유자 확인 필요");
     const room = kohResolveRoomTitle(item, name);
     return { ...item, _resolvedName: name, _resolvedRoom: room };
   }));
+}
+
+// Deduplicates files, picks one representative per unique file
+function kohDedupFiles(files) {
+  const groups = new Map();
+
+  for (const f of files) {
+    // Key by priority: unique_id > file_id > name+room > id
+    const key = f.telegram_file_unique_id
+      ? `uniq:${f.telegram_file_unique_id}`
+      : f.telegram_file_id
+      ? `fid:${f.telegram_file_id}`
+      : f.file_name
+      ? `name:${String(f.file_name || "").toLowerCase().trim()}:${f.room_id || ""}:${f.file_size || ""}`
+      : `id:${f.id}`;
+
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(f);
+  }
+
+  return [...groups.entries()].map(([, rows]) => {
+    // Score each row to find best representative
+    const ranked = rows.slice().sort((a, b) => {
+      const s = r =>
+        (r.telegram_file_id ? 10000 : 0) +
+        (r.summary ? 2000 : 0) +
+        (r.extracted_text ? 1000 : 0) +
+        (r.content ? 500 : 0) +
+        Number(r.file_size || 0);
+      return s(b) - s(a);
+    });
+
+    const rep = { ...ranked[0] };
+    rep._duplicateIds = rows.map(r => r.id);
+    rep._isDuplicate  = rows.length > 1;
+
+    // Merge best summary/extracted_text from duplicates if representative is missing
+    if (!rep.summary) {
+      const best = rows.map(r => r.summary || "").sort((a, b) => b.length - a.length)[0];
+      if (best) rep.summary = best;
+    }
+    if (!rep.extracted_text) {
+      const best = rows.map(r => r.extracted_text || "").sort((a, b) => b.length - a.length)[0];
+      if (best) rep.extracted_text = best;
+    }
+
+    return rep;
+  });
 }
 
 async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomId = "") {
@@ -908,7 +960,8 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
 
   // Initial fetch: 30-day window (or 7-day for FILE_LIST)
   const initDays = (intent === KOH_INTENT.FILE_LIST && !hasTerms) ? 7 : 30;
-  const { files, messages } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, initDays);
+  const { files: rawFiles, messages } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, initDays);
+  const files = kohDedupFiles(rawFiles);
 
   let scoredFiles = scoreFiles(files);
   const scoredMsgs = scoreMsgs(messages);
@@ -939,12 +992,12 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
   if (intent === KOH_INTENT.FILE_LIST) {
     // Phase 1: already fetched (7-day or 30-day). Phase 2: 14-day. Phase 3: no date limit.
     if (!scoredFiles.length && !hasTerms) {
-      const { files: f14 } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, 14);
-      scoredFiles = scoreFiles(f14);
+      const { files: f14r } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, 14);
+      scoredFiles = scoreFiles(kohDedupFiles(f14r));
     }
     if (!scoredFiles.length) {
-      const { files: fAll } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, null);
-      scoredFiles = scoreFiles(fAll);
+      const { files: fAllR } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, null);
+      scoredFiles = scoreFiles(kohDedupFiles(fAllR));
     }
 
     if (!scoredFiles.length) {
@@ -2440,10 +2493,12 @@ async function handleDebugSearch(env, chatId, text) {
   if (!env.DB) { await sendMessage(env, chatId, "DB 없음"); return; }
   try {
     const terms = query ? kohExtractSearchTerms(query) : [];
-    const MIN_SCORE = terms.length ? 5 : 1;
-    const { files, messages } = await kohFetchRecentFilesAndMessages(env, "", false, 30);
+    const MIN_SCORE = terms.length ? 5 : 0;
+    const { files: rawFiles, messages } = await kohFetchRecentFilesAndMessages(env, "", false, 30);
+    const deduped = kohDedupFiles(rawFiles);
+    const resolved = await kohResolveItems(env, deduped, "uploader_id", "uploader_name");
 
-    const scoredFiles = files
+    const scoredFiles = resolved
       .map(f => ({ ...f, _score: kohScoreRecord(f, terms) }))
       .sort((a, b) => b._score - a._score)
       .slice(0, 5);
@@ -2453,10 +2508,13 @@ async function handleDebugSearch(env, chatId, text) {
       .sort((a, b) => b._score - a._score)
       .slice(0, 5);
 
-    let out = `[debug_search: "${query || "(전체)"}"]\nterms: [${terms.join(", ") || "없음"}] MIN_SCORE=${MIN_SCORE}\n\n`;
-    out += `files (total ${files.length}건, top 5):\n`;
+    let out = `[debug_search: "${query || "(전체)"}"]\nterms: [${terms.join(", ") || "없음"}] MIN_SCORE=${MIN_SCORE}\n`;
+    out += `raw_files: ${rawFiles.length}건  deduped: ${deduped.length}건\n\n`;
+    out += `files (deduped, top 5 by score):\n`;
     for (const f of scoredFiles) {
-      out += `  score=${f._score} room=${f.room_title || "?"} file=${f.file_name || ""} uploader=${f.uploader_name || ""} tg=${f.telegram_file_id ? "✓" : "✗"} ${String(f.created_at || "").slice(0, 10)}\n`;
+      out += `  score=${f._score} id=${f.id}${f._isDuplicate ? ` dups=[${f._duplicateIds.join(",")}]` : ""}\n`;
+      out += `    room=${f._resolvedRoom} file=${f.file_name || ""}\n`;
+      out += `    raw_uploader=${f.uploader_name || "?"} resolved=${f._resolvedName} tg=${f.telegram_file_id ? "✓" : "✗"} ${String(f.created_at || "").slice(0, 10)}\n`;
     }
     out += `\nmessages (total ${messages.length}건, top 5 before filter):\n`;
     for (const m of scoredMsgs) {
@@ -2476,30 +2534,35 @@ async function handleDebugFiles(env, chatId) {
     }
     const count = await env.DB.prepare(`SELECT COUNT(*) AS count FROM files`).first();
     const total = count?.count || 0;
-    const hasRooms = await tableExists(env, "rooms");
-    const roomJoin = hasRooms ? "LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(f.room_id AS TEXT)" : "";
-    const resolvedRoom = hasRooms
-      ? `COALESCE(CASE WHEN CAST(f.room_id AS INTEGER)<0 THEN NULLIF(r.room_title,'') END, CASE WHEN CAST(f.room_id AS INTEGER)>0 THEN '1:1' END, f.room_title, '?')`
-      : `COALESCE(f.room_title, '?')`;
-    const recent = await env.DB.prepare(`
-      SELECT f.id, f.room_id, ${resolvedRoom} AS resolved_room, f.file_name,
-        f.uploader_id, f.uploader_name,
-        f.telegram_file_id, f.telegram_file_unique_id,
-        f.summary, f.extracted_text, f.content,
-        f.created_at
-      FROM files f ${roomJoin}
-      ORDER BY f.created_at DESC LIMIT 10
-    `).all();
-    const lines = (recent.results || []).map(f =>
-      `id=${f.id} [${String(f.created_at || "").slice(0, 10)}]\n` +
-      `  room: ${f.resolved_room} (room_id=${f.room_id})\n` +
-      `  file: ${f.file_name || "(없음)"}\n` +
-      `  uploader: ${f.uploader_name || f.uploader_id || "?"}\n` +
-      `  telegram_file_id: ${f.telegram_file_id ? "✓" : "✗"}\n` +
-      `  telegram_file_unique_id: ${f.telegram_file_unique_id ? "✓" : "✗"}\n` +
-      `  summary: ${f.summary ? "✓" : "✗"}  extracted_text: ${f.extracted_text ? "✓" : "✗"}  content: ${f.content ? "✓" : "✗"}`
-    ).join("\n\n") || "(없음)";
-    await sendMessage(env, chatId, `files total: ${total}건\n\n${lines}`);
+
+    // Fetch all (up to 50) for dedup display
+    const { files: rawFiles } = await kohFetchRecentFilesAndMessages(env, "", false, null);
+    const rawSlice = rawFiles.slice(0, 50);
+    const deduped = kohDedupFiles(rawSlice);
+
+    // Resolve names for deduped representatives
+    const resolved = await kohResolveItems(env, deduped, "uploader_id", "uploader_name");
+
+    const lines = resolved.slice(0, 10).map(f => {
+      const rawName = f.uploader_name || f.uploader_id || "?";
+      const resolvedName = f._resolvedName;
+      const roomDisplay = Number(f.room_id || 0) > 0
+        ? `1:1(${resolvedName}) / room_id=${f.room_id}`
+        : `${f._resolvedRoom} / room_id=${f.room_id}`;
+      return (
+        `id=${f.id}${f._isDuplicate ? ` [rep, dups: ${f._duplicateIds.join(",")}]` : " [unique]"} [${String(f.created_at || "").slice(0, 10)}]\n` +
+        `  room: ${roomDisplay}\n` +
+        `  file: ${f.file_name || "(없음)"}\n` +
+        `  raw_uploader: ${rawName}\n` +
+        `  resolved_uploader: ${resolvedName}\n` +
+        `  telegram_file_id: ${f.telegram_file_id ? "✓" : "✗"}  telegram_file_unique_id: ${f.telegram_file_unique_id ? "✓" : "✗"}\n` +
+        `  summary: ${f.summary ? "✓" : "✗"}  extracted_text: ${f.extracted_text ? "✓" : "✗"}  content: ${f.content ? "✓" : "✗"}`
+      );
+    }).join("\n\n") || "(없음)";
+
+    await sendMessage(env, chatId,
+      `files total: ${total}건  raw_fetched: ${rawSlice.length}건  deduped: ${deduped.length}건\n\n${lines}`
+    );
   } catch (e) {
     await sendMessage(env, chatId, `debug_files 실패\n${String(e?.stack || e?.message || e).slice(0, 1200)}`);
   }
