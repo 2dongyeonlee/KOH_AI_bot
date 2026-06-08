@@ -20,15 +20,15 @@ const ADMIN_NAME = "권오혁";
 const SUMMARY_RULE = `
 [요약 형식 규칙 — 반드시 준수]
 1. 안건별 형식:
-   📌 <b>안건명</b> (파일명 아닌 업무 내용 기반)
+   📌 안건명 (파일명 아닌 업무 내용 기반, 볼드 없이 일반 텍스트)
    · 핵심 내용 1~2줄 (<u>담당자이름</u> 형태로 사람이름 밑줄 처리)
    · 출처: [방이름] (<u>공유자이름</u>) (날짜)
    ⚡ 마감: 날짜 (날짜·기한 있을 때만)
 
 2. 안건 사이 반드시 한 줄 띄기
 3. 파일명(photo_xxx 등)을 안건명으로 절대 쓰지 말 것
-4. 사람 이름은 모두 <u>이름</u> 형태로 밑줄 처리
-5. 마크다운(*,#) 사용 금지 — HTML 태그(<b>,<u>) 사용
+4. 사람 이름은 <u>이름</u> 형태로 밑줄 처리
+5. 볼드(<b>) 사용 금지 — 안건명도 일반 텍스트로
 6. 납기·기한·마감일이 있으면 ⚡ 마감: 날짜 형태로 표시
 7. 전체 방(단체방 + 1:1 포함) 자료를 모두 포함할 것
 `;
@@ -38,7 +38,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-userlist-clean-20260609-0800";
+const BUILD_VERSION = "koh-debug-db-no-bold-20260609-0900";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -2293,6 +2293,26 @@ async function routeSlashCommand(env, message, text, chatId) {
   }
   if (/^\/rooms\b/.test(t) || isRoomListQuery(t)) {
     await handleRoomList(env, chatId);
+    return true;
+  }
+  if (/^\/debug_db\b/.test(t)) {
+    try {
+      const msgCount = await env.DB.prepare(`SELECT COUNT(*) as cnt FROM messages`).first();
+      const fileCount = await env.DB.prepare(`SELECT COUNT(*) as cnt FROM files`).first();
+      const userCount = await env.DB.prepare(`SELECT COUNT(*) as cnt FROM users WHERE telegram_id NOT LIKE 'user%'`).first();
+      const roomCount = await env.DB.prepare(`SELECT COUNT(*) as cnt FROM rooms`).first();
+      const recentMsg = await env.DB.prepare(`SELECT room_title, sender_name, created_at FROM messages ORDER BY created_at DESC LIMIT 1`).first();
+      await sendMessage(env, chatId,
+        `DB 현황\n\n` +
+        `메시지: ${msgCount?.cnt || 0}건\n` +
+        `파일: ${fileCount?.cnt || 0}건\n` +
+        `사용자: ${userCount?.cnt || 0}명\n` +
+        `방: ${roomCount?.cnt || 0}개\n\n` +
+        `최근 메시지: ${recentMsg ? `[${recentMsg.room_title}] ${recentMsg.sender_name} (${(recentMsg.created_at||"").slice(0,16)})` : "없음"}`
+      );
+    } catch (e) {
+      await sendMessage(env, chatId, `DB 조회 오류: ${e.message}`);
+    }
     return true;
   }
   if (/^\/debug_rooms\b/.test(t)) {
