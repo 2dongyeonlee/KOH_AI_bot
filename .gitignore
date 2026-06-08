@@ -10,3 +10,5 @@ exports/
 *.zip
 
 .wrangler/
+
+node_modules/

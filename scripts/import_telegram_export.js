@@ -32,32 +32,62 @@ function readWranglerDbName() {
   return m ? m[1] : "6r-ai-db";
 }
 
+function winCommandExists(command) {
+  if (process.platform !== "win32") return true;
+  const result = spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/c", "where", command], {
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf8",
+  });
+  return result.status === 0;
+}
+
 function runWrangler(dbName, args, inputFile = "") {
+  const localWrangler = path.join(process.cwd(), "node_modules", ".bin", process.platform === "win32" ? "wrangler.cmd" : "wrangler");
+  const localWranglerJs = path.join(process.cwd(), "node_modules", "wrangler", "bin", "wrangler.js");
+  const cmd = process.env.ComSpec || "cmd.exe";
   const candidates = process.platform === "win32"
     ? [
-        { bin: "npx.cmd", prefix: ["wrangler"] },
-        { bin: "wrangler.cmd", prefix: [] },
-        { bin: "wrangler", prefix: [] },
+        ...(winCommandExists("npx.cmd") ? [{ command: cmd, prefix: ["/d", "/c", "npx.cmd", "wrangler"], shell: false }] : []),
+        ...(fs.existsSync(localWranglerJs) ? [{ command: process.execPath, prefix: [localWranglerJs], shell: false }] : []),
+        { command: localWrangler, prefix: [], shell: true },
+        { command: cmd, prefix: ["/d", "/c", `"${localWrangler}"`], shell: false },
+        ...(winCommandExists("wrangler.cmd") ? [{ command: cmd, prefix: ["/d", "/c", "wrangler.cmd"], shell: false }] : []),
       ]
     : [
-        { bin: "npx", prefix: ["wrangler"] },
-        { bin: "wrangler", prefix: [] },
+        { command: "npx", prefix: ["wrangler"], shell: false },
+        { command: localWrangler, prefix: [], shell: false },
+        { command: "wrangler", prefix: [], shell: false },
       ];
-  let lastError = null;
+  const errors = [];
   for (const candidate of candidates) {
     const fullArgs = [...candidate.prefix, "d1", "execute", dbName, "--remote", ...args];
-    const result = spawnSync(candidate.bin, fullArgs, {
-      stdio: inputFile ? ["ignore", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
+    const capture = args.includes("--json");
+    const result = spawnSync(candidate.command, fullArgs, {
+      stdio: capture ? ["ignore", "pipe", "pipe"] : "inherit",
       encoding: "utf8",
+      shell: candidate.shell,
     });
     if (result.error) {
-      lastError = `${candidate.bin}: ${result.error.message}`;
+      errors.push([
+        "wrangler 실행 실패",
+        `command: ${candidate.command}`,
+        `args: ${fullArgs.join(" ")}`,
+        `error: ${result.error.message}`,
+        "해결 안내: npm.cmd install 또는 npx.cmd wrangler --version 확인",
+      ].join("\n"));
       continue;
     }
     if (result.status === 0) return result.stdout || "";
-    lastError = `${candidate.bin} ${fullArgs.join(" ")}\n${result.stderr || result.stdout || `exit ${result.status}`}`;
+    errors.push([
+      "wrangler 실행 실패",
+      `command: ${candidate.command}`,
+      `args: ${fullArgs.join(" ")}`,
+      `exit: ${result.status}`,
+      result.stderr || result.stdout || "",
+      "해결 안내: npm.cmd install 또는 npx.cmd wrangler --version 확인",
+    ].join("\n"));
   }
-  throw new Error(`wrangler failed or missing. Install Node.js/npm and run npm install first.\n${lastError || ""}`);
+  throw new Error(errors.join("\n\n---\n\n") || "wrangler 실행 실패");
 }
 
 function sql(v) {
@@ -83,14 +113,23 @@ function hashText(value) {
 
 function columnsFor(dbName, table) {
   const out = runWrangler(dbName, ["--command", `PRAGMA table_info(${table});`, "--json"]);
+  const rows = parseWranglerResults(out);
+  if (rows.length) return new Set(rows.map((r) => r.name));
+  return new Set();
+}
+
+function parseWranglerResults(out) {
   try {
     const parsed = JSON.parse(out);
-    const rows = parsed?.[0]?.results || parsed?.results || [];
-    return new Set(rows.map((r) => r.name));
+    return parsed?.[0]?.results || parsed?.results || [];
   } catch {
-    const names = [...out.matchAll(/"name"\s*:\s*"([^"]+)"/g)].map((m) => m[1]);
-    return new Set(names);
+    return [];
   }
+}
+
+function queryRows(dbName, command) {
+  const out = runWrangler(dbName, ["--command", command, "--json"]);
+  return parseWranglerResults(out);
 }
 
 function insertSelect(table, values, existingColumns, whereNotExists = "") {
@@ -149,7 +188,7 @@ function main() {
   const messageCols = columnsFor(dbName, "messages");
   const fileCols = columnsFor(dbName, "files");
 
-  const statements = ["BEGIN TRANSACTION;"];
+  const statements = [];
   let importedMessages = 0;
   let importedFiles = 0;
   let skippedMessages = 0;
@@ -168,6 +207,8 @@ function main() {
   for (const message of messages) {
     if (message.type && message.type !== "message" && message.type !== "service") continue;
     const text = normalizeText(message.text || message.caption);
+    const file = fileFromMessage(message, exportDir);
+    const contentForMessage = text || (file ? `[file] ${file.fileName}` : "");
     const user = userFromMessage(message);
     if (user) {
       statements.push(insertSelect("users", {
@@ -181,34 +222,37 @@ function main() {
       }, userCols, `SELECT 1 FROM users WHERE telegram_id = ${sql(user.id)}`));
     }
 
-    const exportMessageId = message.id ? String(message.id) : hashText(`${message.date}|${user?.id || ""}|${text}`);
+    const exportMessageId = message.id ? String(message.id) : hashText(`${message.date}|${user?.id || ""}|${contentForMessage}`);
     const dedupeKey = `${roomId}|${exportMessageId}`;
     if (seenMessages.has(dedupeKey)) {
       skippedMessages++;
     } else {
       seenMessages.add(dedupeKey);
-      const fallbackHash = hashText(`${roomId}|${message.date}|${user?.id || ""}|${text}`);
+      const fallbackHash = hashText(`${roomId}|${message.date}|${user?.id || ""}|${contentForMessage}`);
       const where = messageCols.has("telegram_message_id")
         ? `SELECT 1 FROM messages WHERE room_id = ${sql(roomId)} AND telegram_message_id = ${sql(exportMessageId)}`
-        : `SELECT 1 FROM messages WHERE room_id = ${sql(roomId)} AND created_at = ${sql(message.date)} AND sender_id = ${sql(user?.id || "")} AND content = ${sql(text.slice(0, 4000))}`;
-      statements.push(insertSelect("messages", {
-        telegram_message_id: exportMessageId,
-        export_message_id: exportMessageId,
-        room_id: roomId,
-        room_title: roomTitle,
-        sender_id: user?.id || "",
-        sender_name: user?.name || "",
-        content: text,
-        raw_json: JSON.stringify(message),
-        saved_by: "telegram_export_importer",
-        source_type: "telegram_export",
-        created_at: message.date || new Date().toISOString(),
-        message_hash: fallbackHash,
-      }, messageCols, where));
-      importedMessages++;
+        : `SELECT 1 FROM messages WHERE room_id = ${sql(roomId)} AND created_at = ${sql(message.date)} AND sender_id = ${sql(user?.id || "")} AND content = ${sql(contentForMessage.slice(0, 4000))}`;
+      if (contentForMessage) {
+        statements.push(insertSelect("messages", {
+          telegram_message_id: exportMessageId,
+          export_message_id: exportMessageId,
+          room_id: roomId,
+          room_title: roomTitle,
+          sender_id: user?.id || "",
+          sender_name: user?.name || "",
+          content: contentForMessage,
+          raw_json: JSON.stringify(message),
+          saved_by: "telegram_export_importer",
+          source_type: "telegram_export",
+          created_at: message.date || new Date().toISOString(),
+          message_hash: fallbackHash,
+        }, messageCols, where));
+        importedMessages++;
+      } else {
+        skippedMessages++;
+      }
     }
 
-    const file = fileFromMessage(message, exportDir);
     if (file) {
       const fileKey = `${roomId}|${file.fileName}|${file.fileSize}|${message.date || ""}`;
       if (seenFiles.has(fileKey)) {
@@ -243,7 +287,6 @@ function main() {
     }
   }
 
-  statements.push("COMMIT;");
   const sqlFile = path.join(os.tmpdir(), `telegram_export_import_${Date.now()}.sql`);
   fs.writeFileSync(sqlFile, statements.filter(Boolean).join("\n"), "utf8");
   runWrangler(dbName, ["--file", sqlFile]);
