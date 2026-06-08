@@ -3,3 +3,10 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+
+telegram_exports/
+exports/
+*.tgz
+*.zip
+
+.wrangler/
