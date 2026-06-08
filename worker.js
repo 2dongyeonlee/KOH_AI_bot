@@ -1,6 +1,6 @@
 const DIFY_API_URL = "https://api.dify.ai/v1";
 const SUMMARY_PROMPT =
-  "[요약 응답 규칙]\n" +
+  "[요약 응답 규칙]\n" 
   "- 답변은 보고 메모체로 작성합니다.\n" +
   "- 문장 끝은 가급적 '~임', '~필요', '~확인 필요' 형식으로 작성합니다.\n" +
   "다음 파일 내용을 업무 보고 메모체로 정리해줘.\n" +
@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-morning-briefing-cron-20260608-0200";
+const BUILD_VERSION = "koh-three-line-format-20260608-1230";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
