@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-db-schema-fix-20260609-0200";
+const BUILD_VERSION = "koh-response-quality-ux-20260609-0300";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -455,21 +455,28 @@ async function resolveUserName(env, userId, fallbackName = "") {
 }
 
 function inferTitle(row) {
+  const raw = String(row.summary || row.extracted_text || row.content || "").trim();
+  if (raw.length >= 6) {
+    const lines = raw.split(/[\n.!?\/]/);
+    for (const line of lines) {
+      const clean = line
+        .replace(/(요약|정리|알려줘|해줘|보내줘|공유해줘|확인|담당님|사장님|네 알겠습니다|네 담당님|그리하겠습니다)/g, "")
+        .replace(/Telegram export file.*/, "")
+        .trim();
+      if (clean.length >= 5 && clean.length <= 50) {
+        return clean;
+      }
+    }
+    return raw.replace(/Telegram export file[^\n]*/g, "").trim().slice(0, 40) || "업무 안건";
+  }
   if (row.file_name) {
     const name = String(row.file_name)
       .replace(/\.[a-zA-Z0-9]{1,6}$/, "")
-      .replace(/[_\-]+/g, " ")
+      .replace(/[@_\-\d]+/g, " ")
       .trim();
-    if (name.length >= 3) return name.slice(0, 60);
+    if (name.length >= 3) return name.slice(0, 40);
   }
-  const raw = String(row.summary || row.extracted_text || row.content || "").trim();
-  if (raw.length >= 6) {
-    const first = raw.split(/[\n.!?]/)[0]
-      .replace(/(요약|정리|알려줘|해줘|보내줘|공유해줘|확인)/g, "")
-      .trim();
-    return (first.length >= 4 ? first : raw).slice(0, 60);
-  }
-  return "확인된 업무 안건";
+  return "업무 안건";
 }
 
 function kohResolveRoomTitle(row, personName = "") {
@@ -1156,7 +1163,6 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
 
   // ── FILE_LIST ─────────────────────────────────────────────────────────────
   if (intent === KOH_INTENT.FILE_LIST) {
-    // Phase 1: already fetched (7-day or 30-day). Phase 2: 14-day. Phase 3: no date limit.
     if (!scoredFiles.length && !hasTerms) {
       const { files: f14r } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, 14, roomAliasTitle);
       scoredFiles = scoreFiles(kohDedupFiles(f14r));
@@ -1173,14 +1179,36 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
 
     const display = scoredFiles.slice(0, 10);
     const items = await kohResolveItems(env, display, "uploader_id", "uploader_name");
-    const body = items.map((f, i) => kohFormatThreeLineItem({
-      title: `${i + 1}. ${inferTitle(f)}`,
-      content: (fileSummaryText(f) || "요약 없음") + exportFileNote(f),
-      location: `${f._resolvedRoom} > ${f.file_name || "파일명 없음"}`,
-      person: f._resolvedName,
-      date: kohFormatDate(f.created_at),
-    })).join("\n\n");
-    await kohSendHtml(env, chatId, `<b>저장된 파일 ${items.length}건입니다.</b>\n\n${body}`);
+
+    const fileCorpus = items.map((f, i) => {
+      const content = String(f.summary || f.content || "").replace(/Telegram export file[^\n]*/g, "").trim().slice(0, 300);
+      return `[${i+1}] 공유자: ${f._resolvedName || "미확인"} / 날짜: ${kohFormatDate(f.created_at)}\n내용: ${content || "내용 없음"}`;
+    }).join("\n\n");
+
+    const aiQuery = TONE_RULE +
+      `다음은 팀에서 공유된 파일들의 내용입니다. 각 파일을 업무 안건명(5~20자)으로 명확히 제목을 붙이고, 핵심 내용을 2줄로 요약해줘.\n\n` +
+      `형식:\n[번호] 안건명: OOO 관련 보고 건\n내용: 핵심 내용 1줄\n출처: 공유자 / 날짜\n\n` +
+      `파일 내용이 없거나 "Telegram export"만 있으면 "이미지 자료 (내용 확인 필요)"로 표시.\n\n` +
+      fileCorpus;
+
+    let aiResult = "";
+    try {
+      const r = await difyChat(env, { query: aiQuery, user: userId, conversationId: "" });
+      aiResult = r.answer || "";
+    } catch(e) { console.error("FILE_LIST AI:", e); }
+
+    if (aiResult) {
+      await sendMessage(env, chatId, `최근 공유 자료 ${items.length}건\n\n${aiResult}`);
+    } else {
+      const body = items.map((f, i) => kohFormatThreeLineItem({
+        title: `${i + 1}. ${inferTitle(f)}`,
+        content: String(f.summary || f.content || "내용 없음").replace(/Telegram export file[^\n]*/g, "").trim().slice(0, 200),
+        location: `${f._resolvedRoom}`,
+        person: f._resolvedName,
+        date: kohFormatDate(f.created_at),
+      })).join("\n\n");
+      await kohSendHtml(env, chatId, `<b>저장된 파일 ${items.length}건입니다.</b>\n\n${body}`);
+    }
     return true;
   }
 
@@ -4272,36 +4300,12 @@ async function handleNewsQuery(chatId, env) {
 }
 
 async function handleSelfInfo(user, userId, chatId, env) {
-  if (!user?.name) {
-    await sendMessage(env, chatId, `아직 등록되지 않으셨습니다.\n텔레그램 ID: ${userId}`);
-    return;
-  }
-  let msg = `${user.name}님으로 등록되어 있습니다.\n텔레그램 ID: ${userId}`;
-  if (user.team) msg += `\n소속: ${user.team}`;
-  if (user.role) msg += `\n담당: ${user.role}`;
-  await sendMessage(env, chatId, msg);
+  const name = user?.name || "(미등록)";
+  await sendMessage(env, chatId, `${name}\nID: ${userId}`);
 }
 
 async function handleIntro(chatId, env) {
-  await sendMessage(
-    env,
-    chatId,
-    `권오혁 담당의 AI 비서입니다.
-
-일정
-- 오늘/이번주 일정 알려줘
-
-파일·이미지
-- PDF, PPT, 사진 올리면 요약·분석
-
-팀방 검색
-- A방 지난주 논의 정리해줘
-- HBM 관련 대화 찾아줘
-
-내 정보
-- 내 아이디 뭐야
-- 누가 등록됐어`
-  );
+  await sendMessage(env, chatId, "권오혁 담당의 비서입니다.");
 }
 
 async function handleUserList(chatId, env) {
@@ -4600,11 +4604,25 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     if (isRelay) {
       user = { id: userId, name: message.from?.first_name || "사용자", chat_id: chatId };
     } else {
-      const tgName =
+      const rawName =
         [message.from?.first_name, message.from?.last_name].filter(Boolean).join(" ").trim() ||
         `user_${userId}`;
+      const tgName = cleanName(rawName) || rawName;
       await saveUser(userId, { id: userId, name: tgName, chat_id: chatId }, env);
-      user = await getUser(userId, env);
+      user = { id: userId, name: tgName, chat_id: chatId };
+    }
+  }
+
+  // 이름 변경 요청
+  const nameChangeMatch =
+    text.match(/(?:이름|성함|저를?)\s*([가-힣]{2,5})\s*(?:으?로|이라고)?\s*(?:저장|등록|불러|바꿔|변경)/) ||
+    text.match(/([가-힣]{2,5})\s*(?:으?로|로)\s*(?:저장해줘|불러줘|바꿔줘)/);
+  if (nameChangeMatch) {
+    const newName = cleanName(nameChangeMatch[1]);
+    if (newName && newName.length >= 2) {
+      await saveUser(userId, { ...(user || {}), id: userId, name: newName, chat_id: chatId }, env);
+      await sendMessage(env, chatId, `${newName}님으로 저장했습니다.`);
+      return;
     }
   }
 
@@ -4784,7 +4802,18 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     }
     const query =
       TONE_RULE +
-      `다음은 최근 ${days}일간 팀에서 공유된 자료와 대화입니다. 핵심 내용을 항목별로 정리해줘.\n\n` +
+      `당신은 업무 비서입니다. 다음은 최근 ${days}일간 팀에서 공유된 자료와 대화입니다.\n` +
+      `아래 형식으로 업무 보고서 형태로 정리해줘.\n\n` +
+      `[정리 형식]\n` +
+      `📌 안건명 (5~20자, 업무 맥락 기반으로 직접 작성)\n` +
+      `· 핵심 내용 1~2줄\n` +
+      `· 출처: [방이름] 공유자 (날짜 시간)\n\n` +
+      `[규칙]\n` +
+      `- 파일명(photo_xxx 등)을 제목으로 쓰지 말 것\n` +
+      `- 내용 기반으로 안건명 직접 작성 (예: KPI 공과기술서 보고 건, MOU 커뮤니케이션 방안 등)\n` +
+      `- 안건별로 한 줄 띄어쓰기\n` +
+      `- 마크다운(*,#,**) 사용 금지\n` +
+      `- 이모티콘(📌) 포함\n\n` +
       corpus;
     const result = await difyChat(env, { query, user: userId, conversationId: "" });
     await sendMessage(env, chatId, result.answer || "정리 중 오류가 발생했습니다.");
@@ -4831,7 +4860,17 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
       summaryType === "person" ? "담당자별" : summaryType === "timeline" ? "시계열 순" : "주제별";
     const query =
       TONE_RULE +
-      `다음은 최근 ${days}일간 팀 대화 기록입니다. ${typeLabel}로 핵심 내용을 요약해줘.\n\n` +
+      `당신은 업무 비서입니다. 다음은 최근 ${days}일간 팀 대화 기록입니다.\n` +
+      `${typeLabel} 형태로 업무 보고서처럼 정리해줘.\n\n` +
+      `[정리 형식]\n` +
+      `📌 안건명 (파일명 아닌 업무 내용 기반)\n` +
+      `· 핵심 내용 1~2줄\n` +
+      `· 출처: [방이름] 공유자 (날짜 시간)\n\n` +
+      `[규칙]\n` +
+      `- 파일명(photo_xxx 등)을 제목으로 쓰지 말 것\n` +
+      `- 안건별로 한 줄 띄어쓰기\n` +
+      `- 마크다운(*,#,**) 사용 금지\n` +
+      `- 이모티콘(📌) 포함\n\n` +
       corpus;
     const result = await difyChat(env, { query, user: userId, conversationId: "" });
     await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했습니다.");
@@ -5129,7 +5168,17 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
       summaryType === "person" ? "담당자별" : summaryType === "timeline" ? "시계열 순" : "주제별";
     const query =
       TONE_RULE +
-      `다음은 최근 ${days}일간 팀 대화 기록입니다. ${typeLabel}로 핵심 내용을 요약해줘.\n\n` +
+      `당신은 업무 비서입니다. 다음은 최근 ${days}일간 팀 대화 기록입니다.\n` +
+      `${typeLabel} 형태로 업무 보고서처럼 정리해줘.\n\n` +
+      `[정리 형식]\n` +
+      `📌 안건명 (파일명 아닌 업무 내용 기반)\n` +
+      `· 핵심 내용 1~2줄\n` +
+      `· 출처: [방이름] 공유자 (날짜 시간)\n\n` +
+      `[규칙]\n` +
+      `- 파일명(photo_xxx 등)을 제목으로 쓰지 말 것\n` +
+      `- 안건별로 한 줄 띄어쓰기\n` +
+      `- 마크다운(*,#,**) 사용 금지\n` +
+      `- 이모티콘(📌) 포함\n\n` +
       corpus;
     const result = await difyChat(env, { query, user: userId, conversationId: "" });
     await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했습니다.");
@@ -5510,13 +5559,29 @@ async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) 
 
   const query = TONE_RULE +
     `당신은 권오혁 담당의 개인 비서입니다. ${today} 아침 업무 브리핑을 작성하세요.\n\n` +
-    `[오늘 참석할 회의]\n${calText}\n\n` +
-    `[어제 공유된 자료·대화 (대화 ${msgCount}건, 파일 ${fileCount}건)]\n${digestText}\n\n` +
-    `[작성 규칙]\n` +
-    `섹션1: 오늘 회의 (없으면 생략)\n` +
-    `섹션2: 어제 공유 안건 요약 - 불릿 포인트 ·, 각 항목 아래 출처: [방이름] 발신자 (시간)\n` +
-    `섹션3: 파일 속 안건·마감일 (있을 때만)\n` +
-    `마크다운 기호(* # **) 절대 사용 금지. 이모티콘으로 섹션 구분. 700자 이내.`;
+    `[데이터]\n` +
+    `오늘 회의: ${calText}\n\n` +
+    `어제 공유 자료·대화 (${msgCount}건 대화, ${fileCount}건 파일):\n${digestText}\n\n` +
+    `[작성 형식 — 반드시 지킬 것]\n` +
+    `\n` +
+    `📅 오늘 회의\n` +
+    `(일정이 있으면 시간 · 제목 형태로. 없으면 이 섹션 생략)\n` +
+    `\n` +
+    `📋 챙겨야 할 업무 안건\n` +
+    `📌 안건명 (파일명 아닌 업무 내용 기반으로 직접 작성)\n` +
+    `· 핵심 내용 1줄\n` +
+    `· 출처: [방이름] 공유자 (날짜)\n` +
+    `(안건이 여러 개면 각각 📌로 구분, 안건 사이 한 줄 띄기)\n` +
+    `\n` +
+    `⚡ 마감·기한이 있는 것\n` +
+    `(날짜·기한 언급된 것만. 없으면 생략)\n` +
+    `\n` +
+    `[규칙]\n` +
+    `- 파일명(photo_xxx 등)을 안건명으로 쓰지 말 것\n` +
+    `- 마크다운 기호(*, #, **) 절대 금지\n` +
+    `- 안건별 한 줄 띄어쓰기 필수\n` +
+    `- 전체 800자 이내\n` +
+    `- 이모티콘(📅 📋 📌 ⚡)으로 섹션 구분`;
 
   let briefing = "브리핑 생성 오류";
   try {
