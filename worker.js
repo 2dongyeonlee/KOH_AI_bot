@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-intent-file-summary-fix-20260608-1900";
+const BUILD_VERSION = "koh-flexible-intent-clean-db-20260608-2100";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -488,11 +488,15 @@ function kohNormalizeText(value = "") {
 function kohExtractSearchTerms(text = "") {
   const stopWords = new Set([
     "자료", "파일", "문서", "보고자료", "보고내용", "내용", "상세", "요약", "정리",
-    "보내줘", "공유해줘", "첨부해줘", "알려줘", "찾아줘", "줘", "해줘",
+    "보내줘", "공유해줘", "첨부해줘", "알려줘", "찾아줘", "줘", "해줘", "보여줘",
     "어디", "위치", "관련", "내가", "포함된", "방들", "단체방", "다른방",
     "다른", "에서도", "오늘", "어제", "이번주", "지난주", "최근", "있는",
     "있던", "된거", "공유된", "전체", "기준", "보고", "안건", "회의",
-    "일정", "먼저", "챙겨야", "확인", "필요", "해라", "해줘라"
+    "일정", "먼저", "챙겨야", "확인", "필요", "해라", "해줘라",
+    "전부", "다", "모두", "것들", "거", "것", "뭐야", "뭐가", "뭐",
+    "있어", "있지", "어떤", "올라온", "첨부된", "저장된", "된", "공유됐",
+    "일주일", "최근에", "요즘", "이번", "지난", "알려", "보여", "해줘",
+    "목록", "리스트", "정리해", "알려줘야", "해라", "해줘라", "해줘야"
   ]);
 
   return [...new Set(
@@ -511,11 +515,11 @@ function kohIsInternalKnowledgeRequest(text = "") {
   if (/^\/\w+/.test(t)) return false;
 
   const hasInternalCue =
-    /(자료|파일|문서|보고자료|보고내용|내용|상세|요약|정리|어디|위치|보내줘|공유해줘|첨부해줘|알려줘|포함된 방|다른방|단체방|공유된 내용|챙겨야|우선순위|안건|회의|일정)/.test(t);
+    /(자료|파일|문서|보고자료|보고내용|내용|상세|요약|정리|어디|위치|보내줘|공유해줘|첨부해줘|알려줘|포함된\s*방|다른\s*방|단체방|공유된|챙겨야|우선순위|안건|회의|일정|올라온|첨부된|저장된|뭐야|있어|뭐있어|뭐있었|전달해줘|공유됐|보여줘.*자료|자료.*보여줘|무슨\s*얘기|논의|뭐부터|먼저\s*챙길|핵심만|자세히|보고용)/.test(t);
 
   const isPureExternal =
-    /(뉴스|기사|웹검색|외부검색|검색해줘|오늘자 뉴스)/.test(t) &&
-    !/(방|대화|공유|자료|파일|문서|보고내용)/.test(t);
+    /(뉴스|기사|웹검색|외부검색|검색해줘|오늘자\s*뉴스|시사|최신\s*동향)/.test(t) &&
+    !/(방|대화|공유|자료|파일|문서|보고내용|우리|저희|팀)/.test(t);
 
   return hasInternalCue && !isPureExternal;
 }
@@ -539,16 +543,24 @@ function kohLooksLikeCommandOrRequestOnly(content = "") {
   if (/^\/\w+/.test(t)) return true;
   if (kohIsJunkMessage(t)) return true;
   if (/@KOH_AI_bot|@KOH_ai_bot/i.test(t)) return true;
+  // Filter out bot-style structured answers (contain bullet markers)
+  if (/🧩|📎|👤/.test(t)) return true;
 
   const normalized = kohNormalizeText(t);
   const words = normalized.split(" ").filter(Boolean);
 
-  const strongRequest = /(내가\s*포함된\s*방|포함된\s*단체방|단체방에\s*보고된|공유된\s*내용\s*요약|다른\s*방들도|방들에서|알려줘야지)/.test(t);
-  if (strongRequest) return true;
+  // Strong request patterns — always filter regardless of length
+  if (/(내가\s*포함된\s*방|포함된\s*단체방|단체방에\s*보고된|공유된\s*내용\s*요약|다른\s*방들도|방들에서)/.test(t)) return true;
 
+  // Request verb endings — filter if short sentence (no real content)
+  const requestVerb =
+    /(요약해줘|정리해줘|알려줘|보내줘|공유해줘|찾아줘|보여줘|확인해줘|전달해줘|첨부해줘|올려줘|설명해줘)$/.test(t.replace(/[.!?]$/, ""));
+  if (requestVerb && words.length <= 8) return true;
+
+  // Short request sentences
   const requestLike =
-    /(요약|정리|알려줘|보내줘|공유해줘|찾아줘|해줘|해라|어디|뭐야|확인해줘)/.test(t);
-  if (requestLike && words.length <= 6) return true;
+    /(요약|정리|알려줘|보내줘|공유해줘|찾아줘|해줘|뭐야|확인해줘|뭐있어|뭐있었|뭐가\s*있)/.test(t);
+  if (requestLike && words.length <= 5) return true;
 
   return false;
 }
@@ -643,7 +655,7 @@ async function kohSendDocument(env, chatId, file, caption = "") {
   return res.ok;
 }
 
-async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRoomOnly = false) {
+async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRoomOnly = false, fileDays = 30) {
   const roomFilter = currentRoomOnly && currentRoomId ? "AND CAST(f.room_id AS TEXT) = ?" : "";
   const msgRoomFilter = currentRoomOnly && currentRoomId ? "AND CAST(m.room_id AS TEXT) = ?" : "";
 
@@ -668,7 +680,7 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
       f.created_at
     FROM files f
     LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(f.room_id AS TEXT)
-    WHERE f.created_at >= datetime('now', '-30 days')
+    WHERE f.created_at >= datetime('now', '-' || ? || ' days')
       ${roomFilter}
     ORDER BY f.created_at DESC
     LIMIT 200
@@ -702,8 +714,8 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
   `;
 
   const files = currentRoomOnly && currentRoomId
-    ? await env.DB.prepare(fileSql).bind(String(currentRoomId)).all()
-    : await env.DB.prepare(fileSql).all();
+    ? await env.DB.prepare(fileSql).bind(String(fileDays), String(currentRoomId)).all()
+    : await env.DB.prepare(fileSql).bind(String(fileDays)).all();
 
   const messages = currentRoomOnly && currentRoomId
     ? await env.DB.prepare(msgSql).bind(String(currentRoomId)).all()
@@ -725,12 +737,30 @@ const KOH_INTENT = {
 };
 
 function kohDetectIntent(text = "") {
-  const t = String(text || "").trim();
-  if (/(보내줘|전달해줘|첨부해줘|올려줘)/.test(t)) return KOH_INTENT.FILE_RESEND;
-  if (/(파일\s*(목록|뭐야|뭐가|어떤|있어|있지|공유됐|공유된)|자료\s*(목록|뭐야|있어|있지|공유됐|공유된)|공유된\s*파일|저장된\s*파일)/.test(t)) return KOH_INTENT.FILE_LIST;
-  if (/(먼저\s*챙길|우선순위|챙겨야\s*할|이번주\s*안건)/.test(t)) return KOH_INTENT.PRIORITY;
-  if (/(파일\s*(내용|요약|정리|상세)|자료\s*(내용|요약|정리|상세)|문서\s*(내용|요약)|보고자료.*요약|자료.*요약해|내용.*알려줘|내용.*정리해)/.test(t)) return KOH_INTENT.FILE_SUMMARY;
-  return KOH_INTENT.MESSAGE_SUMMARY;
+  const t = String(text || "").replace(/\s+/g, " ").trim();
+
+  // FILE_RESEND: explicit send/transfer/share of a file
+  if (/(보내줘|전달해줘|첨부해줘|올려줘|파일\s*줘|자료\s*줘|원본\s*보내|다시\s*보내|공유해줘)/.test(t)) return KOH_INTENT.FILE_RESEND;
+
+  // FILE_SUMMARY: asking for content/summary of a specific file
+  if (/(파일\s*(내용|요약|정리|상세|핵심)|자료\s*(내용|요약|정리|상세|기반|핵심)|문서\s*(내용|요약|정리)|보고자료.*요약|자료.*요약해|내용.*알려줘|내용.*정리해|핵심만|자세히\s*알려|보고용.*요약|이\s*자료.*정리|자료.*내용|이\s*내용)/.test(t)) return KOH_INTENT.FILE_SUMMARY;
+
+  // FILE_LIST: list of shared files (no specific content required)
+  if (/(파일\s*(목록|뭐야|뭐가|어떤|있어|있지|공유됐|공유된|뭐있어|뭐있었|올라온|리스트)|자료\s*(목록|뭐야|뭐있어|뭐있었어|있어|있지|공유됐|공유된|올라온|어떤|리스트)|공유된\s*(파일|자료|거|것)|저장된\s*(파일|자료)|올라온\s*(자료|문서|파일)|첨부된\s*(자료|파일)|전부\s*(보여|확인|알려)|전체\s*(보여|확인)|자료\s*전부|파일\s*전부|자료.*보여줘|보여줘.*자료|자료\s*뭐|파일\s*뭐)/.test(t)) return KOH_INTENT.FILE_LIST;
+
+  // PRIORITY: urgency/priority check
+  if (/(먼저\s*챙길|우선순위|챙겨야\s*할|이번주\s*안건|제일\s*급한|오늘\s*챙길|확인\s*필요한\s*일|뭐부터\s*봐야|뭐부터\s*해야)/.test(t)) return KOH_INTENT.PRIORITY;
+
+  // MESSAGE_SUMMARY: discussion/meeting summary
+  if (/(보고된\s*내용|단체방|단톡방|포함된\s*방|다른\s*방|무슨\s*얘기|이번주\s*주요|논의\s*내용|회의\s*내용|주요\s*안건|이번주.*정리|최근.*논의|방에서.*나온)/.test(t)) return KOH_INTENT.MESSAGE_SUMMARY;
+
+  // Ambiguous / low confidence → null
+  return null;
+}
+
+// Returns human-readable intent label for debug
+function kohIntentLabel(intent) {
+  return intent || "UNKNOWN(미분류)";
 }
 
 // Pending selection: store up to 3 candidates by chatId, expire 10 min
@@ -808,8 +838,8 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
     return true;
   }
 
-  const intent       = kohDetectIntent(text);
-  const terms        = kohExtractSearchTerms(text);
+  const intent         = kohDetectIntent(text);
+  const terms          = kohExtractSearchTerms(text);
   const currentRoomOnly = kohIsCurrentRoomOnly(text);
   const groupPreferred  = kohIsGroupRoomPreferred(text);
   const { files, messages } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly);
@@ -817,25 +847,30 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
   // Minimum score: require keyword match when terms exist
   const MIN_SCORE = terms.length ? 5 : 1;
 
-  function scoreItems(rows, field = "content") {
-    return rows.map(r => {
-      const base = kohScoreRecord(r, terms);
-      const isGroup = Number(r.room_id || 0) < 0;
-      const bonus = groupPreferred ? (isGroup ? 20 : -15) : 0;
-      return { ...r, _score: base + bonus };
-    })
+  function scoreFiles(rows) {
+    return rows.map(r => ({
+      ...r,
+      _score: kohScoreRecord(r, terms) + (groupPreferred && Number(r.room_id || 0) < 0 ? 10 : 0),
+    }))
     .filter(r => r._score >= MIN_SCORE)
     .sort((a, b) => b._score - a._score);
   }
 
-  const scoredFiles = scoreItems(files).slice(0, 10);
-  const scoredMsgs  = messages
-    .filter(m => !kohLooksLikeCommandOrRequestOnly(m.content))
-    .reduce((acc, m) => { const scored = { ...m, _score: kohScoreRecord(m, terms) + (groupPreferred && Number(m.room_id||0)<0 ? 20 : 0) }; if (scored._score >= MIN_SCORE) acc.push(scored); return acc; }, [])
-    .sort((a, b) => b._score - a._score)
-    .slice(0, 10);
+  function scoreMsgs(rows) {
+    return rows
+      .filter(m => !kohLooksLikeCommandOrRequestOnly(m.content))
+      .map(m => ({
+        ...m,
+        _score: kohScoreRecord(m, terms) + (groupPreferred && Number(m.room_id || 0) < 0 ? 20 : 0),
+      }))
+      .filter(r => r._score >= MIN_SCORE)
+      .sort((a, b) => b._score - a._score);
+  }
 
-  // For MESSAGE_SUMMARY with groupPreferred: prefer group rooms
+  const scoredFiles = scoreFiles(files);
+  const scoredMsgs  = scoreMsgs(messages);
+
+  // Group-preferred: if group results exist, exclude 1:1 messages
   let filteredMsgs = scoredMsgs;
   if (groupPreferred) {
     const groupOnly = scoredMsgs.filter(m => Number(m.room_id || 0) < 0);
@@ -845,12 +880,39 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
   // PRIORITY: delegate to existing handler
   if (intent === KOH_INTENT.PRIORITY) return false;
 
+  // Low confidence intent — ask user what they mean
+  if (intent === null) {
+    const topFile = scoredFiles[0];
+    const topMsg  = filteredMsgs[0];
+    let hint = "";
+    if (topFile) hint += `\n파일: ${inferTitle(topFile)} (${kohFormatDate(topFile.created_at)})`;
+    if (topMsg)  hint += `\n메시지: ${String(topMsg.content || "").slice(0, 50)}`;
+    await kohSendHtml(env, chatId,
+      `파일 목록 / 내용 요약 / 파일 전달 중 어떤 걸 원하시는지 선택해주세요.\n\n` +
+      `• <b>파일 목록</b>: "공유된 자료 보여줘"\n` +
+      `• <b>내용 요약</b>: "자료 내용 알려줘"\n` +
+      `• <b>파일 전달</b>: "자료 보내줘"` +
+      (hint ? `\n\n최근 저장 기록:${hint}` : "")
+    );
+    return true;
+  }
+
+  // ── FILE_LIST ─────────────────────────────────────────────────────────────
   if (intent === KOH_INTENT.FILE_LIST) {
-    if (!scoredFiles.length) {
-      await kohSendHtml(env, chatId, "<b>저장된 관련 파일이 없습니다.</b>");
+    // If no terms (general list): try 7-day window first, expand to 14 if empty
+    let listFiles = scoredFiles;
+    if (!terms.length && !listFiles.length) {
+      const { files: files14 } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, 14);
+      listFiles = scoreFiles(files14);
+    }
+
+    if (!listFiles.length) {
+      await kohSendHtml(env, chatId, "<b>최근 저장된 파일이 없습니다.</b>\n파일이 공유된 방에 봇이 있어야 저장됩니다.");
       return true;
     }
-    const items = await kohResolveItems(env, scoredFiles.slice(0, 5), "uploader_id", "uploader_name");
+
+    const display = listFiles.slice(0, 10);
+    const items = await kohResolveItems(env, display, "uploader_id", "uploader_name");
     const body = items.map((f, i) => kohFormatThreeLineItem({
       title: `${i + 1}. ${inferTitle(f)}`,
       content: f.summary || f.extracted_text || "요약 없음",
@@ -862,13 +924,18 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
     return true;
   }
 
+  // ── FILE_SUMMARY ──────────────────────────────────────────────────────────
   if (intent === KOH_INTENT.FILE_SUMMARY) {
     if (!scoredFiles.length) {
-      await kohSendHtml(env, chatId, "<b>관련 파일을 찾을 수 없습니다.</b>");
+      await kohSendHtml(env, chatId,
+        terms.length
+          ? `<b>관련 파일이 확인되지 않습니다.</b>\n검색어: ${terms.join(", ")}`
+          : "<b>관련 파일을 찾을 수 없습니다.</b>"
+      );
       return true;
     }
     const top = scoredFiles[0], second = scoredFiles[1];
-    const ambiguous = second && (top._score - second._score) <= 5;
+    const ambiguous = second && (top._score - second._score) <= 8;
     if (ambiguous) {
       const candidates = await kohResolveItems(env, scoredFiles.slice(0, 3), "uploader_id", "uploader_name");
       await kohSavePending(env, chatId, KOH_INTENT.FILE_SUMMARY, candidates);
@@ -879,7 +946,7 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
         person: f._resolvedName,
         date: kohFormatDate(f.created_at),
       })).join("\n\n");
-      await kohSendHtml(env, chatId, `<b>관련 파일 후보가 여러 개입니다. 요약할 번호를 선택해주세요.</b>\n\n${body}`);
+      await kohSendHtml(env, chatId, `<b>관련 파일이 여러 개입니다. 요약할 번호를 선택해주세요.</b>\n\n${body}`);
       return true;
     }
     const [item] = await kohResolveItems(env, [top], "uploader_id", "uploader_name");
@@ -888,7 +955,7 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
       title: inferTitle(item),
       content: summaryText
         ? String(summaryText).slice(0, 400)
-        : "파일 원본은 확인됐지만 추출된 본문/요약이 없어 내용 요약은 불가합니다. 필요하면 '보내줘'라고 하시면 파일을 전달드릴 수 있습니다.",
+        : "파일 원본은 확인됐지만 추출된 본문/요약이 없습니다. 필요하면 '보내줘'라고 하시면 파일을 전달드릴 수 있습니다.",
       location: `${item._resolvedRoom} > ${item.file_name || "파일명 없음"}`,
       person: item._resolvedName,
       date: kohFormatDate(item.created_at),
@@ -896,6 +963,7 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
     return true;
   }
 
+  // ── FILE_RESEND ───────────────────────────────────────────────────────────
   if (intent === KOH_INTENT.FILE_RESEND) {
     if (!scoredFiles.length) {
       if (filteredMsgs.length) {
@@ -907,28 +975,30 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
           person: m._resolvedName,
           date: kohFormatDate(m.created_at),
         })).join("\n\n");
-        await kohSendHtml(env, chatId, `<b>파일 원본은 없음. 관련 메시지 기준 확인한 내용입니다.</b>\n\n${body}`);
+        await kohSendHtml(env, chatId, `<b>파일 원본은 없음. 관련 메시지 기준 내용입니다.</b>\n\n${body}`);
       } else {
-        await kohSendHtml(env, chatId, "<b>관련 파일이나 메시지를 찾을 수 없습니다.</b>");
+        await kohSendHtml(env, chatId,
+          terms.length
+            ? `<b>관련 파일이나 메시지가 없습니다.</b>\n검색어: ${terms.join(", ")}`
+            : "<b>관련 파일이나 메시지를 찾을 수 없습니다.</b>"
+        );
       }
       return true;
     }
     if (scoredFiles.length === 1) {
       const [item] = await kohResolveItems(env, [scoredFiles[0]], "uploader_id", "uploader_name");
-      const document = item.telegram_file_id || item.file_id || "";
-      if (document) {
-        const caption = kohFormatThreeLineItem({
-          title: inferTitle(item),
-          content: item.summary || item.extracted_text || "첨부 파일",
-          location: `${item._resolvedRoom} > ${item.file_name || "파일명 없음"}`,
-          person: item._resolvedName,
-          date: kohFormatDate(item.created_at),
-        });
-        await kohSendDocument(env, chatId, item, caption);
-      } else {
+      const caption = kohFormatThreeLineItem({
+        title: inferTitle(item),
+        content: item.summary || item.extracted_text || "첨부 파일",
+        location: `${item._resolvedRoom} > ${item.file_name || "파일명 없음"}`,
+        person: item._resolvedName,
+        date: kohFormatDate(item.created_at),
+      });
+      const sent = await kohSendDocument(env, chatId, item, caption);
+      if (!sent) {
         await kohSendHtml(env, chatId, kohFormatThreeLineItem({
-          title: "자료 확인 (원본 전송 불가)",
-          content: "파일은 확인됐지만 telegram_file_id가 없어 원본을 보낼 수 없음.",
+          title: inferTitle(item),
+          content: "파일은 확인됐지만 telegram_file_id가 없어 원본을 보낼 수 없습니다.",
           location: `${item._resolvedRoom} > ${item.file_name || "파일명 없음"}`,
           person: item._resolvedName,
           date: kohFormatDate(item.created_at),
@@ -949,7 +1019,7 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
     return true;
   }
 
-  // MESSAGE_SUMMARY (default)
+  // ── MESSAGE_SUMMARY ───────────────────────────────────────────────────────
   if (filteredMsgs.length > 0) {
     const items = await kohResolveItems(env, filteredMsgs.slice(0, 5), "sender_id", "sender_name");
     const body = items.map((m, i) => kohFormatThreeLineItem({
@@ -978,14 +1048,7 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
     return true;
   }
 
-  const scope = currentRoomOnly ? "현재 방" : "포함된 방 전체";
-  await kohSendHtml(env, chatId, kohFormatThreeLineItem({
-    title: "검색 결과 없음",
-    content: `${scope}의 최근 기록에서 관련 내용을 찾지 못했습니다.`,
-    location: "확인된 자료 없음",
-    person: "확인 불가",
-    date: "확인 불가",
-  }));
+  await kohSendHtml(env, chatId, "최근 저장 기록에서 관련 내용을 찾지 못했습니다.");
   return true;
 }
 
@@ -1959,6 +2022,10 @@ async function routeSlashCommand(env, message, text, chatId) {
     await handleDebugSearch(env, chatId, t);
     return true;
   }
+  if (/^\/debug_intent\b/.test(t)) {
+    await handleDebugIntent(env, chatId, t);
+    return true;
+  }
   if (/^\/help\b/.test(t)) {
     await sendMessage(env, chatId, getHelpText());
     return true;
@@ -2306,40 +2373,56 @@ async function handleDebugUsers(env, chatId) {
   }
 }
 
+async function handleDebugIntent(env, chatId, text) {
+  const query = String(text || "").replace(/^\/debug_intent\s*/i, "").trim();
+  if (!query) {
+    await sendMessage(env, chatId, "사용법: /debug_intent <분석할 문장>");
+    return;
+  }
+  const intent = kohDetectIntent(query);
+  const terms  = kohExtractSearchTerms(query);
+  const currentRoomOnly = kohIsCurrentRoomOnly(query);
+  const groupPreferred  = kohIsGroupRoomPreferred(query);
+  const isInternal = kohIsInternalKnowledgeRequest(query);
+  const out =
+    `[debug_intent]\n` +
+    `입력: ${query}\n\n` +
+    `intent: ${kohIntentLabel(intent)}\n` +
+    `terms: [${terms.join(", ") || "(없음)"}]\n` +
+    `currentRoomOnly: ${currentRoomOnly}\n` +
+    `groupPreferred: ${groupPreferred}\n` +
+    `isInternalKnowledge: ${isInternal}`;
+  await sendMessage(env, chatId, out);
+}
+
 async function handleDebugSearch(env, chatId, text) {
-  const keyword = String(text || "").replace(/^\/debug_search\s*/i, "").trim();
-  const like = `%${keyword}%`;
-  let out = `[debug_search: "${keyword || "(전체)"}"]\n\n`;
+  const query = String(text || "").replace(/^\/debug_search\s*/i, "").trim();
   if (!env.DB) { await sendMessage(env, chatId, "DB 없음"); return; }
   try {
-    const hasRooms = await tableExists(env, "rooms");
-    const roomJoin = hasRooms ? "LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(f.room_id AS TEXT)" : "";
-    const msgRoomJoin = hasRooms ? "LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(m.room_id AS TEXT)" : "";
-    const roomTitle = hasRooms
-      ? `COALESCE(CASE WHEN CAST(f.room_id AS INTEGER)<0 THEN NULLIF(r.room_title,'') END, CASE WHEN CAST(f.room_id AS INTEGER)>0 THEN '1:1' END, f.room_title, '?')`
-      : `COALESCE(f.room_title, '?')`;
-    const msgRoomTitle = hasRooms
-      ? `COALESCE(CASE WHEN CAST(m.room_id AS INTEGER)<0 THEN NULLIF(r.room_title,'') END, CASE WHEN CAST(m.room_id AS INTEGER)>0 THEN '1:1' END, m.room_title, '?')`
-      : `COALESCE(m.room_title, '?')`;
+    const terms = query ? kohExtractSearchTerms(query) : [];
+    const MIN_SCORE = terms.length ? 5 : 1;
+    const { files, messages } = await kohFetchRecentFilesAndMessages(env, "", false, 30);
 
-    const fileWhere = keyword ? "(f.file_name LIKE ? OR f.summary LIKE ?)" : "1=1";
-    const files = await env.DB.prepare(
-      `SELECT f.room_id, ${roomTitle} AS resolved_room, f.file_name, f.uploader_name, f.telegram_file_id, f.created_at FROM files f ${roomJoin} WHERE ${fileWhere} ORDER BY f.created_at DESC LIMIT 5`
-    ).bind(...(keyword ? [like, like] : [])).all();
-    out += `files (${files.results?.length || 0}건):\n`;
-    for (const f of files.results || []) {
-      out += `  room_id=${f.room_id} room=${f.resolved_room} file=${f.file_name || ""} uploader=${f.uploader_name || ""} tg_file=${f.telegram_file_id ? "있음" : "없음"} ${String(f.created_at || "").slice(0, 10)}\n`;
-    }
+    const scoredFiles = files
+      .map(f => ({ ...f, _score: kohScoreRecord(f, terms) }))
+      .sort((a, b) => b._score - a._score)
+      .slice(0, 5);
 
-    const msgWhere = keyword ? "m.content LIKE ?" : "1=1";
-    const msgs = await env.DB.prepare(
-      `SELECT m.room_id, ${msgRoomTitle} AS resolved_room, m.sender_name, SUBSTR(m.content,1,80) AS snippet, m.created_at FROM messages m ${msgRoomJoin} WHERE ${msgWhere} ORDER BY m.created_at DESC LIMIT 5`
-    ).bind(...(keyword ? [like] : [])).all();
-    out += `\nmessages (${msgs.results?.length || 0}건):\n`;
-    for (const m of msgs.results || []) {
-      out += `  room_id=${m.room_id} room=${m.resolved_room} sender=${m.sender_name || ""} ${String(m.created_at || "").slice(0, 10)}\n  ${String(m.snippet || "").slice(0, 80)}\n`;
+    const scoredMsgs = messages
+      .map(m => ({ ...m, _score: kohScoreRecord(m, terms), _filtered: kohLooksLikeCommandOrRequestOnly(m.content) }))
+      .sort((a, b) => b._score - a._score)
+      .slice(0, 5);
+
+    let out = `[debug_search: "${query || "(전체)"}"]\nterms: [${terms.join(", ") || "없음"}] MIN_SCORE=${MIN_SCORE}\n\n`;
+    out += `files (total ${files.length}건, top 5):\n`;
+    for (const f of scoredFiles) {
+      out += `  score=${f._score} room=${f.room_title || "?"} file=${f.file_name || ""} uploader=${f.uploader_name || ""} tg=${f.telegram_file_id ? "✓" : "✗"} ${String(f.created_at || "").slice(0, 10)}\n`;
     }
-    await sendMessage(env, chatId, out.slice(0, 3000));
+    out += `\nmessages (total ${messages.length}건, top 5 before filter):\n`;
+    for (const m of scoredMsgs) {
+      out += `  score=${m._score} filtered=${m._filtered} room=${m.room_title || "?"} sender=${m.sender_name || ""} ${String(m.created_at || "").slice(0, 10)}\n  ${String(m.content || "").slice(0, 80)}\n`;
+    }
+    await sendMessage(env, chatId, out.slice(0, 3500));
   } catch (e) {
     await sendMessage(env, chatId, `debug_search 실패: ${String(e?.message || e).slice(0, 500)}`);
   }
