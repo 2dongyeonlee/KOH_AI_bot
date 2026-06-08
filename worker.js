@@ -1607,13 +1607,25 @@ async function handleSqlCommand(env, message, text, chatId) {
 }
 
 async function handleDebugEnv(env, chatId) {
+  let fallbackPrivateChatId = "";
+  try {
+    if (env.DB && await tableExists(env, "messages")) {
+      const hasSourceType = await columnExists(env, "messages", "source_type");
+      const row = hasSourceType
+        ? await env.DB.prepare(`SELECT room_id FROM messages WHERE source_type = 'telegram_private' AND CAST(room_id AS INTEGER) > 0 ORDER BY created_at DESC LIMIT 1`).first()
+        : await env.DB.prepare(`SELECT room_id FROM messages WHERE CAST(room_id AS INTEGER) > 0 ORDER BY created_at DESC LIMIT 1`).first();
+      fallbackPrivateChatId = String(row?.room_id || "");
+    }
+  } catch (_) {}
   await sendMessage(
     env,
     chatId,
     `BUILD_VERSION: ${BUILD_VERSION}\n` +
     `DB binding: ${env.DB ? "있음" : "없음"}\n` +
-    `DAILY_BRIEFING_CHAT_ID: ${env.DAILY_BRIEFING_CHAT_ID ? "있음" : "없음"}\n` +
-    `ADMIN_CHAT_ID: ${env.ADMIN_CHAT_ID ? "있음" : "없음"}\n` +
+    `DAILY_BRIEFING_CHAT_ID: ${env.DAILY_BRIEFING_CHAT_ID || "없음"}\n` +
+    `ADMIN_CHAT_ID: ${env.ADMIN_CHAT_ID || "없음"}\n` +
+    `ADMIN_TELEGRAM_ID: ${env.ADMIN_TELEGRAM_ID || "없음"}\n` +
+    `fallback_private_chat_id: ${fallbackPrivateChatId || "없음"}\n` +
     `cron config: KST 08:00 = UTC 23:00`
   );
 }
@@ -2996,55 +3008,22 @@ async function answerDigest(env, userText, userId) {
     `[요청]\n${userText}\n\n` +
     `[요약 범위]\n${range.label}\n\n` +
     `[내부 기록]\n${buildDigestCorpus(rows)}\n\n` +
-    `아래는 사용자가 포함된 Telegram 방과 1:1에서 수집된 최근 업무 기록이다. 프로젝트/안건 단위로 묶어 요약하라. 단순 나열하지 말고 유사 주제를 병합하라. 각 안건마다 출처 방, 공유자, 일자를 표시하라. 없는 내용은 추정하지 말라.\n\n` +
-    `[보고서 출력 형식]\n` +
-    `${range.label} 주요 안건 N건 공유드립니다.\n\n` +
-    `[프로젝트] 프로젝트/안건명\n` +
-    `- 핵심 내용: 1~2문장. 짧게.\n` +
-    `- 확인 필요: 다음 액션 1~2문장. 짧게.\n\n` +
-    `🗓 일자: MM/DD\n` +
-    `👤 공유자: telegram_id 기준 대표 이름\n` +
-    `📍 방: 실제 room_title 또는 1:1\n` +
-    `📎 자료: 파일명 또는 없음\n` +
-    `🔎 위치: 방 제목 > 파일명 또는 방 제목 > 메시지 일부\n\n` +
-    `[프로젝트 묶음 규칙]\n` +
-    `- 비전선포식/New Vision/선포의 장/서울랜드/이든&앨리스는 같은 프로젝트로 묶어라.\n` +
-    `- AI Agent/1인 1 AI Agent/Comm. 총괄/6R Comm 전략팀은 같은 프로젝트로 묶어라.\n` +
-    `- M15/화재/고객사 Letter/대외 커뮤니케이션은 같은 프로젝트로 묶어라.\n` +
-    `- 같은 파일, 같은 행사, 같은 TF, 같은 회의는 하나로 병합하라.\n` +
-    `- 최대 5개 프로젝트, 전체 1500자 이내. 장문 설명 금지.\n\n` +
+    `아래는 사용자가 포함된 Telegram 방과 1:1에서 수집된 최근 업무 기록이다. 프로젝트/안건 단위로 묶어 요약하라. 단순 나열하지 말고 유사 주제를 병합하라. 없는 내용은 추정하지 말라.\n\n` +
     `[작성 지침]\n` +
-    `너는 ${BOT_OWNER_NAME}의 개인 업무 비서 AI OS입니다.\n` +
-    `아래 기록은 이 봇이 직접 들어가 있는 텔레그램 방, 1:1 대화, 파일, 회의록에서 수집한 내용입니다.\n` +
-    `단순 나열하지 말고, 사용자가 오늘 확인해야 할 안건 중심으로 압축해 주세요.\n\n` +
-    `[출력 형식]\n` +
-    `주요 안건 N건임.\n\n` +
-    `1. 안건명\n` +
-    `* 일자: MM/DD\n` +
-    `* 공유자: 이름\n` +
-    `* 방: 방이름\n` +
-    `* 핵심: 1~2줄임.\n` +
-    `* 확인: 필요사항임.\n` +
-    `* 자료: 파일명 또는 링크\n\n` +
-    `[품질 기준]\n` +
-    `1. 최대 5개 안건까지만 선정합니다.\n` +
-    `2. 각 안건은 현상, 의미, 확인할 일 중심으로 짧게 씁니다.\n` +
-    `3. 업무적으로 중요한 내용만 고릅니다.\n` +
-    `4. 잡담, 웃음, 단순 리액션은 제외합니다.\n` +
-    `5. 출처는 반드시 [방이름] 공유자명 (시간) 형식으로 표시합니다.\n` +
-    `6. 출처 없는 내용은 쓰지 않습니다.\n` +
-    `7. 전체 답변은 1500자 이내로 씁니다.\n` +
-    `8. 마크다운 기호는 쓰지 않습니다.\n` +
-    `\n[최종 출력 강제]\n` +
+    `- 최대 5개 안건까지만 선정한다.\n` +
+    `- 잡담, 웃음, 단순 리액션은 제외한다.\n` +
+    `- 업무적으로 중요한 내용만 선정한다.\n` +
+    `- 같은 파일, 같은 행사, 같은 TF, 같은 회의는 하나로 병합한다.\n` +
+    `- source_type은 출력하지 마라.\n` +
+    `- HTML 태그는 <b>만 사용하라.\n` +
+    `- 전체 1500자 이내.\n\n` +
+    `[출력 형식 - 이 형식 외 절대 다른 형식 사용 금지]\n` +
     `${range.label} 주요 안건 N건 공유드립니다.\n\n` +
-    `<b>[프로젝트] 프로젝트명</b>\n` +
-    `• <b>핵심</b>: 1~2줄 요약임.\n` +
-    `• <b>확인</b>: 확인 필요사항 1줄임.\n\n` +
-    `🗓 MM/DD  📍 방 이름\n` +
-    `👤 공유자  📎 파일명 또는 없음\n` +
-    `📎 자료: 파일명 또는 없음\n` +
-    `🔎 위치: 방 이름 &gt; 파일명 또는 방 이름 &gt; 메시지 일부\n\n` +
-    `이 형식 외 다른 형식은 사용하지 마라. source_type은 출력하지 마라. HTML 태그는 <b>만 사용하라. 전체 1500자 이내.\n`;
+    `<b>[안건명]</b>\n` +
+    ` 🧩 <b>내용</b>: 1~2줄 요약\n` +
+    ` 📎 <b>자료 위치</b>: 방 이름 &gt; 파일명 또는 방 이름 &gt; 메시지 일부\n` +
+    ` 👤 <b>공유자</b>: 공유자이름 / MM/DD\n\n` +
+    `위 형식을 안건마다 반복하라. 핵심/확인/위치: 같은 표현은 절대 쓰지 마라.\n`;
   const result = await difyChat(env, { query, user: String(userId), conversationId: "" });
   return result?.answer || "요약을 생성하지 못했습니다.";
 }
@@ -4189,20 +4168,27 @@ async function resolveDailyBriefingTargetChatId(env, targetChatId = "") {
   if (env.DAILY_BRIEFING_CHAT_ID) return String(env.DAILY_BRIEFING_CHAT_ID);
   if (env.ADMIN_CHAT_ID) return String(env.ADMIN_CHAT_ID);
   if (env.ADMIN_TELEGRAM_ID) return String(env.ADMIN_TELEGRAM_ID);
-  if (!env.DB || !(await tableExists(env, "users"))) return "";
   try {
-    const row = await env.DB.prepare(`
-      SELECT chat_id, telegram_id
-      FROM users
-      WHERE COALESCE(chat_id, '') != ''
-      ORDER BY last_seen_at DESC
-      LIMIT 1
-    `).first();
-    return String(row?.chat_id || row?.telegram_id || "");
+    if (env.DB && await tableExists(env, "users")) {
+      const row = await env.DB.prepare(`
+        SELECT chat_id, telegram_id FROM users
+        WHERE COALESCE(chat_id, '') != ''
+        ORDER BY last_seen_at DESC LIMIT 1
+      `).first();
+      if (row?.chat_id || row?.telegram_id) return String(row.chat_id || row.telegram_id);
+    }
+    if (env.DB && await tableExists(env, "messages")) {
+      const hasSourceType = await columnExists(env, "messages", "source_type");
+      const row = hasSourceType
+        ? await env.DB.prepare(`SELECT room_id FROM messages WHERE source_type = 'telegram_private' AND CAST(room_id AS INTEGER) > 0 ORDER BY created_at DESC LIMIT 1`).first()
+        : await env.DB.prepare(`SELECT room_id FROM messages WHERE CAST(room_id AS INTEGER) > 0 ORDER BY created_at DESC LIMIT 1`).first();
+      if (row?.room_id) return String(row.room_id);
+    }
   } catch (error) {
     console.error("resolveDailyBriefingTargetChatId:", error);
-    return "";
   }
+  console.log("브리핑 대상 chat_id 없음");
+  return "";
 }
 
 async function sendDailyBriefingCurrent_DISABLED(env, { targetChatId = "", mock = false } = {}) {
@@ -4301,13 +4287,14 @@ async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) 
       `[출력 형식]\n` +
       `${title}\n\n` +
       `1) ${section1}\n` +
-      `<b>[프로젝트] 프로젝트/안건명</b>\n` +
-      `• <b>핵심</b>: 1~2줄 요약임.\n` +
-      `• <b>확인</b>: 확인 필요사항 1줄임.\n\n` +
+      `<b>[안건명]</b>\n` +
+      ` 🧩 <b>내용</b>: 1~2줄 요약\n` +
+      ` 📎 <b>자료 위치</b>: 방 이름 &gt; 파일명 또는 메시지\n` +
+      ` 👤 <b>공유자</b>: 공유자이름 / MM/DD\n\n` +
       `2) ${section2}\n- MM/DD HH:MM 일정명\n\n` +
       `3) ${section3}\n- 확인할 일\n\n` +
       `[규칙]\n` +
-      `- 프로젝트별로 병합하고 시간순 나열은 금지.\n` +
+      `- 안건별로 병합. 핵심/확인/위치: 같은 표현은 절대 쓰지 마라.\n` +
       `- source_type은 출력하지 말 것.\n` +
       `- HTML 태그는 <b>만 사용.\n` +
       `- 전체 1200자 이내. 짧고 보고형.\n`;
