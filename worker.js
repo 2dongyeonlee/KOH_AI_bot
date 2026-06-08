@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-response-quality-ux-20260609-0300";
+const BUILD_VERSION = "koh-briefing-all-rooms-20260609-0400";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -5589,23 +5589,29 @@ async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) 
     briefing = result.answer || briefing;
   } catch (e) { console.error("브리핑 Dify 오류:", e.message); }
 
-  const sendTarget = targetChatId || env.ADMIN_TELEGRAM_ID;
-  if (sendTarget) {
-    await sendMessage(env, sendTarget, briefing);
+  if (targetChatId) {
+    await sendMessage(env, targetChatId, briefing);
+    return;
   }
 
-  if (!targetChatId) {
-    try {
-      const rooms = await env.DB.prepare(
-        `SELECT room_id FROM rooms WHERE bot_name = 'koh' ORDER BY joined_at DESC LIMIT 5`
-      ).all();
-      for (const room of (rooms.results || [])) {
-        if (String(room.room_id).startsWith("-")) {
-          await sendMessage(env, room.room_id, `[아침 브리핑]\n\n${briefing}`);
-        }
-      }
-    } catch (e) { console.error("단체방 발송 오류:", e.message); }
+  // 봇이 속한 모든 방에 발송 (1:1 + 단체방)
+  const sent = new Set();
+  if (env.ADMIN_TELEGRAM_ID) {
+    await sendMessage(env, env.ADMIN_TELEGRAM_ID, briefing);
+    sent.add(String(env.ADMIN_TELEGRAM_ID));
   }
+  try {
+    const rooms = await env.DB.prepare(
+      `SELECT room_id FROM rooms WHERE bot_name = 'koh' ORDER BY joined_at DESC LIMIT 50`
+    ).all();
+    for (const room of (rooms.results || [])) {
+      const rid = String(room.room_id);
+      if (sent.has(rid)) continue;
+      sent.add(rid);
+      const label = rid.startsWith("-") ? "[아침 브리핑]\n\n" : "";
+      await sendMessage(env, rid, `${label}${briefing}`);
+    }
+  } catch (e) { console.error("브리핑 발송 오류:", e.message); }
 }
 
 async function difyChat(env, { query, user, conversationId = "", files = [] }) {
