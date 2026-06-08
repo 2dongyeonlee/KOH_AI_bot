@@ -18,19 +18,23 @@ const SUMMARY_TONE_RULE =
   "- 마크다운 강조 기호는 사용하지 않습니다.\n\n";
 const ADMIN_NAME = "권오혁";
 const SUMMARY_RULE = `
-[요약 형식 규칙 — 반드시 준수]
-1. 안건별 형식:
-   📌 안건명 (파일명 아닌 업무 내용 기반, 볼드 없이 일반 텍스트)
-   · 핵심 내용 1~2줄 (<u>담당자이름</u> 형태로 사람이름 밑줄 처리)
-   · 출처: [방이름] (<u>공유자이름</u>) (날짜)
-   ⚡ 마감: 날짜 (날짜·기한 있을 때만)
+[답변 형식 — 모든 요약·정리·브리핑에서 반드시 준수]
 
-2. 안건 사이 반드시 한 줄 띄기
-3. 파일명(photo_xxx 등)을 안건명으로 절대 쓰지 말 것
-4. 사람 이름은 <u>이름</u> 형태로 밑줄 처리
-5. 볼드(<b>) 사용 금지 — 안건명도 일반 텍스트로
-6. 납기·기한·마감일이 있으면 ⚡ 마감: 날짜 형태로 표시
-7. 전체 방(단체방 + 1:1 포함) 자료를 모두 포함할 것
+안건별 형식:
+📌 안건명 (파일명 아닌 업무 내용 기반, 볼드 없이 일반 텍스트)
+· 핵심 내용 1~2줄
+· 위치: [방이름]
+· 공유자: <u>이름</u> (날짜)
+⚡ 마감: 날짜 (날짜·기한 있을 때만)
+
+규칙:
+- 안건 사이 반드시 한 줄 띄기
+- 파일명(photo_xxx 등)을 안건명으로 절대 쓰지 말 것
+- 모든 방 자료 빠짐없이 포함 필수
+- 사람 이름은 <u>이름</u> 형태
+- <b> 볼드 절대 금지
+- *, #, ** 마크다운 절대 금지
+- 자료에 없는 내용 추정 금지
 `;
 const BOT_OWNER_NAME = "권오혁";
 const BOT_OWNER_ROLE = "6R전략담당";
@@ -38,7 +42,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-debug-db-no-bold-20260609-0900";
+const BUILD_VERSION = "koh-natural-response-summary-rule-20260609-1000";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -1178,12 +1182,36 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
 
   // Low confidence intent — ask user what they mean
   if (intent === null) {
+    try {
+      const rows = await fetchDigestRows(env, 7, 150);
+      const corpus = rows.slice(0, 150).map((r) => {
+        const time = (r.created_at || "").slice(0, 16);
+        const room = r.source || "알 수 없는 방";
+        const fname = r.file_name ? ` [파일: ${r.file_name}]` : "";
+        const txt = String(r.text || "").replace(/Telegram export file[^\n]*/g, "").trim().slice(0, 250);
+        return `[${room}] (${time}) ${r.actor || ""}${fname}: ${txt}`;
+      }).join("\n");
+
+      const query =
+        TONE_RULE + SUMMARY_RULE +
+        `당신은 권오혁 담당의 AI 비서입니다.\n` +
+        `아래는 최근 7일간 팀 전체 방에서 공유된 자료와 대화입니다.\n\n` +
+        `[팀 자료]\n${corpus.slice(0, 7000)}\n\n` +
+        `[요청]\n${text}\n\n` +
+        `위 자료를 참고해서 요청에 답해줘.\n` +
+        `반드시 위 SUMMARY_RULE 형식으로 안건별 정리.\n` +
+        `"메뉴 선택" 안내 절대 금지.`;
+
+      const result = await difyChat(env, { query, user: "koh", conversationId: "" });
+      if (result.answer) {
+        await kohSendHtml(env, chatId, result.answer);
+        return true;
+      }
+    } catch (e) {
+      console.error("intent null fallback:", e);
+    }
     await kohSendHtml(env, chatId,
-      `파일 목록 / 파일 요약 / 파일 전달 / 대화 요약 중 어떤 요청인지 선택해주세요.\n\n` +
-      `• <b>파일 목록</b>: "공유된 자료 보여줘"\n` +
-      `• <b>파일 요약</b>: "자료 내용 알려줘"\n` +
-      `• <b>파일 전달</b>: "자료 보내줘"\n` +
-      `• <b>대화 요약</b>: "단체방 내용 정리해줘"`
+      `질문을 이해하지 못했습니다.\n\n예시:\n· "이번주 공유된 자료 정리해줘"\n· "오늘 챙겨야 할 안건 뭐야"\n· "방별로 안건 정리해줘"`
     );
     return true;
   }
@@ -5067,6 +5095,35 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     }
   }
 
+  // 자유 질문 — DB 자료 참고해서 SUMMARY_RULE 형식으로 답변
+  if (text.length > 2) {
+    try {
+      const rows = await fetchDigestRows(env, 7, 100);
+      if (rows.length > 0) {
+        const corpus = rows.map((r) => {
+          const room = r.source || "알 수 없는 방";
+          const time = (r.created_at || "").slice(0, 16);
+          const fname = r.file_name ? ` [파일: ${r.file_name}]` : "";
+          const txt = String(r.text || "").replace(/Telegram export file[^\n]*/g, "").trim().slice(0, 200);
+          return `[${room}] (${time}) ${r.actor || ""}${fname}: ${txt}`;
+        }).join("\n");
+
+        const q =
+          TONE_RULE + SUMMARY_RULE +
+          `당신은 권오혁 담당의 AI 비서입니다.\n\n` +
+          `[팀 자료]\n${corpus.slice(0, 6000)}\n\n` +
+          `[질문]\n${text}\n\n` +
+          `SUMMARY_RULE 형식으로 답해줘. 모든 방 자료 포함 필수.`;
+
+        const result = await difyChat(env, { query: q, user: String(userId), conversationId: "" });
+        if (result.answer) {
+          await sendMessage(env, chatId, result.answer, { parseMode: "HTML" });
+          return;
+        }
+      }
+    } catch (e) { console.error("DM fallback:", e); }
+  }
+
   // 등록 여부 상관없이 모든 메시지 Dify 답변
   await handleUserMessage(userId, chatId, text.trim(), true, env, user?.name || "");
 }
@@ -5365,13 +5422,31 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     return;
   }
 
-  // 일반 응답
-  const contextMsg =
-    TONE_RULE +
-    `[단체방: ${message.chat.title}] [발신자: ${user?.name || message.from?.first_name}]\n` +
-    cleanText;
-  const result = await difyChat(env, { query: contextMsg, user: userId, conversationId: "" });
-  if (result.answer) await sendMessage(env, chatId, result.answer);
+  // 일반 응답 — DB 자료 참고해서 SUMMARY_RULE 형식으로 답변
+  try {
+    const rows = await fetchDigestRows(env, 7, 100);
+    const corpus = rows.map((r) => {
+      const room = r.source || "알 수 없는 방";
+      const time = (r.created_at || "").slice(0, 16);
+      const fname = r.file_name ? ` [파일: ${r.file_name}]` : "";
+      const txt = String(r.text || "").replace(/Telegram export file[^\n]*/g, "").trim().slice(0, 200);
+      return `[${room}] (${time}) ${r.actor || ""}${fname}: ${txt}`;
+    }).join("\n");
+
+    const contextMsg =
+      TONE_RULE + SUMMARY_RULE +
+      `당신은 권오혁 담당의 AI 비서입니다.\n` +
+      `[단체방: ${message.chat?.title || ""}] [발신자: ${user?.name || ""}]\n\n` +
+      `[팀 자료]\n${corpus.slice(0, 6000)}\n\n` +
+      `[질문]\n${cleanText}\n\n` +
+      `SUMMARY_RULE 형식으로 답해줘. 모든 방 포함 필수. "메뉴 선택" 금지.`;
+
+    const result = await difyChat(env, { query: contextMsg, user: userId, conversationId: "" });
+    if (result.answer) await sendMessage(env, chatId, result.answer, { parseMode: "HTML" });
+  } catch (e) {
+    console.error("group fallback:", e);
+    await sendMessage(env, chatId, "자료를 불러오는 중 오류가 발생했습니다.");
+  }
 }
 
 async function handleFile(message, userId, chatId, isAdmin, env) {
@@ -5718,33 +5793,23 @@ async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) 
     if (corpus.trim()) digestText = corpus.slice(0, 8000);
   } catch (e) { console.error("브리핑 자료 오류:", e.message); }
 
-  const query = TONE_RULE +
+  const sectionLabel = "최근 30일 공유 자료·대화";
+  const totalItems = msgCount + fileCount;
+
+  const query =
+    TONE_RULE + SUMMARY_RULE +
     `당신은 권오혁 담당의 개인 비서입니다. ${today} 아침 업무 브리핑을 작성하세요.\n\n` +
     `[데이터]\n` +
-    `오늘 회의: ${calText}\n\n` +
-    `최근 30일 공유 자료·대화 (${msgCount}건 대화, ${fileCount}건 파일):\n${digestText}\n\n` +
-    `[작성 형식 — 반드시 지킬 것]\n` +
-    `출력 언어: HTML (Telegram 지원 태그만 사용: <b>, <u>)\n` +
-    `\n` +
+    `오늘 회의(캘린더):\n${calText}\n\n` +
+    `${sectionLabel} (전체 방 통합, ${totalItems}건):\n${digestText}\n\n` +
+    `[작성 형식]\n` +
     `📅 오늘 회의\n` +
-    `(일정이 있으면 시간 · 제목 형태로. 없으면 이 섹션 생략)\n` +
-    `\n` +
-    `📋 챙겨야 할 업무 안건\n` +
-    `📌 <b>안건명</b> (파일명 아닌 업무 내용 기반으로 직접 작성)\n` +
-    `· 핵심 내용 1줄 — 누가(<b><u>이름</u></b>) 무엇을 누구에게 보고/공유했는지 포함\n` +
-    `· 출처: [방이름] <b><u>공유자이름</u></b> (날짜)\n` +
-    `(안건이 여러 개면 각각 📌로 구분, 안건 사이 한 줄 띄기)\n` +
-    `\n` +
-    `⚡ 마감·기한이 있는 것\n` +
-    `(날짜·기한 언급된 것만. 없으면 생략)\n` +
-    `\n` +
-    `[규칙]\n` +
-    `- 파일명(photo_xxx 등)을 안건명으로 쓰지 말 것\n` +
-    `- *, #, ** 마크다운 기호 절대 금지\n` +
-    `- 안건별 한 줄 띄어쓰기 필수\n` +
-    `- 전체 900자 이내\n` +
-    `- 이모티콘(📅 📋 📌 ⚡)으로 섹션 구분\n` +
-    `- 사람 이름은 반드시 <b><u>이름</u></b> 형태로 감쌀 것`;
+    `(일정 있으면: 시간 · 제목. 없으면 섹션 생략)\n\n` +
+    `📋 ${sectionLabel}\n` +
+    `(SUMMARY_RULE 형식으로 안건별 정리. 모든 방 포함 필수)\n\n` +
+    `⚡ 마감·기한\n` +
+    `(날짜·기한 언급된 것만. 없으면 생략)\n\n` +
+    `전체 1400자 이내.`;
 
   let briefing = "브리핑 생성 오류";
   try {
