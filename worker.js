@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-briefing-all-rooms-20260609-0400";
+const BUILD_VERSION = "koh-briefing-30d-html-bold-20260609-0500";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -5536,41 +5536,42 @@ async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) 
     }
   } catch (e) { calText = "(캘린더 연동 확인 필요)"; }
 
-  let digestText = "(어제 자료 없음)";
+  let digestText = "(최근 자료 없음)";
   let msgCount = 0;
   let fileCount = 0;
   try {
-    const { files, messages } = await kohFetchRecentFilesAndMessages(env, "", false, 1);
+    const { files, messages } = await kohFetchRecentFilesAndMessages(env, "", false, 30);
     msgCount = messages.length;
     fileCount = files.length;
     let corpus = "";
     if (messages.length > 0) {
-      corpus += "[대화]\n" + messages.slice(0, 50)
+      corpus += "[대화]\n" + messages.slice(0, 100)
         .map((m) => `[${m.room_title}] ${m.sender_name} (${(m.created_at||"").slice(0,16)}): ${(m.content||"").slice(0,100)}`)
         .join("\n") + "\n\n";
     }
     if (files.length > 0) {
-      corpus += "[파일]\n" + files.slice(0, 20)
+      corpus += "[파일]\n" + files.slice(0, 50)
         .map((f) => `[${f.room_title}] ${f.uploader_name} - ${f.file_name}: ${(f.summary||f.content||"").slice(0,150)}`)
         .join("\n");
     }
-    if (corpus.trim()) digestText = corpus.slice(0, 6000);
+    if (corpus.trim()) digestText = corpus.slice(0, 8000);
   } catch (e) { console.error("브리핑 자료 오류:", e.message); }
 
   const query = TONE_RULE +
     `당신은 권오혁 담당의 개인 비서입니다. ${today} 아침 업무 브리핑을 작성하세요.\n\n` +
     `[데이터]\n` +
     `오늘 회의: ${calText}\n\n` +
-    `어제 공유 자료·대화 (${msgCount}건 대화, ${fileCount}건 파일):\n${digestText}\n\n` +
+    `최근 30일 공유 자료·대화 (${msgCount}건 대화, ${fileCount}건 파일):\n${digestText}\n\n` +
     `[작성 형식 — 반드시 지킬 것]\n` +
+    `출력 언어: HTML (Telegram 지원 태그만 사용: <b>, <u>)\n` +
     `\n` +
     `📅 오늘 회의\n` +
     `(일정이 있으면 시간 · 제목 형태로. 없으면 이 섹션 생략)\n` +
     `\n` +
     `📋 챙겨야 할 업무 안건\n` +
-    `📌 안건명 (파일명 아닌 업무 내용 기반으로 직접 작성)\n` +
-    `· 핵심 내용 1줄\n` +
-    `· 출처: [방이름] 공유자 (날짜)\n` +
+    `📌 <b>안건명</b> (파일명 아닌 업무 내용 기반으로 직접 작성)\n` +
+    `· 핵심 내용 1줄 — 누가(<b><u>이름</u></b>) 무엇을 누구에게 보고/공유했는지 포함\n` +
+    `· 출처: [방이름] <b><u>공유자이름</u></b> (날짜)\n` +
     `(안건이 여러 개면 각각 📌로 구분, 안건 사이 한 줄 띄기)\n` +
     `\n` +
     `⚡ 마감·기한이 있는 것\n` +
@@ -5578,10 +5579,11 @@ async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) 
     `\n` +
     `[규칙]\n` +
     `- 파일명(photo_xxx 등)을 안건명으로 쓰지 말 것\n` +
-    `- 마크다운 기호(*, #, **) 절대 금지\n` +
+    `- *, #, ** 마크다운 기호 절대 금지\n` +
     `- 안건별 한 줄 띄어쓰기 필수\n` +
-    `- 전체 800자 이내\n` +
-    `- 이모티콘(📅 📋 📌 ⚡)으로 섹션 구분`;
+    `- 전체 900자 이내\n` +
+    `- 이모티콘(📅 📋 📌 ⚡)으로 섹션 구분\n` +
+    `- 사람 이름은 반드시 <b><u>이름</u></b> 형태로 감쌀 것`;
 
   let briefing = "브리핑 생성 오류";
   try {
@@ -5589,15 +5591,17 @@ async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) 
     briefing = result.answer || briefing;
   } catch (e) { console.error("브리핑 Dify 오류:", e.message); }
 
+  const HTML = { parseMode: "HTML" };
+
   if (targetChatId) {
-    await sendMessage(env, targetChatId, briefing);
+    await sendMessage(env, targetChatId, briefing, HTML);
     return;
   }
 
   // 봇이 속한 모든 방에 발송 (1:1 + 단체방)
   const sent = new Set();
   if (env.ADMIN_TELEGRAM_ID) {
-    await sendMessage(env, env.ADMIN_TELEGRAM_ID, briefing);
+    await sendMessage(env, env.ADMIN_TELEGRAM_ID, briefing, HTML);
     sent.add(String(env.ADMIN_TELEGRAM_ID));
   }
   try {
@@ -5609,7 +5613,7 @@ async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) 
       if (sent.has(rid)) continue;
       sent.add(rid);
       const label = rid.startsWith("-") ? "[아침 브리핑]\n\n" : "";
-      await sendMessage(env, rid, `${label}${briefing}`);
+      await sendMessage(env, rid, `${label}${briefing}`, HTML);
     }
   } catch (e) { console.error("브리핑 발송 오류:", e.message); }
 }
@@ -5705,7 +5709,9 @@ function escapeHtml(value) {
 function sanitizeTelegramHtml(value) {
   return escapeHtml(value)
     .replace(/&lt;b&gt;/g, "<b>")
-    .replace(/&lt;\/b&gt;/g, "</b>");
+    .replace(/&lt;\/b&gt;/g, "</b>")
+    .replace(/&lt;u&gt;/g, "<u>")
+    .replace(/&lt;\/u&gt;/g, "</u>");
 }
 
 async function sendMessage(env, chatId, text, options = {}) {
