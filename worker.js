@@ -23,7 +23,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-routing-format-fix-20260608-1500";
+const BUILD_VERSION = "koh-cross-room-user-normalize-20260608-1530";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -479,6 +479,10 @@ function kohIsCurrentRoomOnly(text = "") {
   return /(이 방만|여기만|현재 방만|이 단체방만)/.test(String(text || ""));
 }
 
+function kohIsGroupRoomPreferred(text = "") {
+  return /(내가\s*포함된\s*방|단체방|단톡방|방들|다른\s*방|전체\s*방|각\s*방|각종\s*방|포함된\s*단체방|보고된\s*내용|공유된\s*내용)/.test(String(text || ""));
+}
+
 function kohLooksLikeCommandOrRequestOnly(content = "") {
   const t = String(content || "").trim();
 
@@ -594,42 +598,53 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
     SELECT
       f.id,
       f.room_id,
-      COALESCE(r.room_title, f.room_title,
-        CASE WHEN CAST(f.room_id AS INTEGER) > 0 THEN '1:1' ELSE '알 수 없는 방' END
+      COALESCE(
+        CASE WHEN CAST(f.room_id AS INTEGER) < 0 THEN NULLIF(r.room_title, '') END,
+        CASE WHEN CAST(f.room_id AS INTEGER) < 0 THEN NULLIF(f.room_title, '1:1') END,
+        CASE WHEN CAST(f.room_id AS INTEGER) > 0 THEN '1:1' END,
+        f.room_title,
+        '알 수 없는 방'
       ) AS room_title,
-      f.uploader_name,
+      COALESCE(NULLIF(f.uploader_name, ''), NULLIF(f.sender_name, ''), '공유자 확인 필요') AS uploader_name,
+      f.uploader_id,
+      f.sender_id,
       f.file_name,
       f.telegram_file_id,
       f.summary,
       f.extracted_text,
       f.created_at
     FROM files f
-    LEFT JOIN rooms r ON r.room_id = f.room_id
+    LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(f.room_id AS TEXT)
     WHERE f.created_at >= datetime('now', '-30 days')
       ${roomFilter}
     ORDER BY f.created_at DESC
-    LIMIT 120
+    LIMIT 200
   `;
 
   const msgSql = `
     SELECT
       m.id,
       m.room_id,
-      COALESCE(r.room_title, m.room_title,
-        CASE WHEN CAST(m.room_id AS INTEGER) > 0 THEN '1:1' ELSE '알 수 없는 방' END
+      COALESCE(
+        CASE WHEN CAST(m.room_id AS INTEGER) < 0 THEN NULLIF(r.room_title, '') END,
+        CASE WHEN CAST(m.room_id AS INTEGER) < 0 THEN NULLIF(m.room_title, '1:1') END,
+        CASE WHEN CAST(m.room_id AS INTEGER) > 0 THEN '1:1' END,
+        m.room_title,
+        '알 수 없는 방'
       ) AS room_title,
       m.sender_name,
+      m.sender_id,
       m.content,
       m.created_at
     FROM messages m
-    LEFT JOIN rooms r ON r.room_id = m.room_id
+    LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(m.room_id AS TEXT)
     WHERE m.created_at >= datetime('now', '-14 days')
       AND m.content IS NOT NULL
       AND m.content != ''
       AND m.content NOT LIKE '/%'
       ${msgRoomFilter}
     ORDER BY m.created_at DESC
-    LIMIT 200
+    LIMIT 300
   `;
 
   const files = currentRoomOnly && currentRoomId
@@ -656,17 +671,28 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
   const currentRoomOnly = kohIsCurrentRoomOnly(text);
   const sendFile = kohIsFileSendRequest(text);
 
+  const groupPreferred = kohIsGroupRoomPreferred(text);
   const { files, messages } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly);
 
   const rankedFiles = files
-    .map(f => ({ ...f, _score: kohScoreRecord(f, terms) }))
+    .map(f => {
+      const score = kohScoreRecord(f, terms);
+      const isGroup = Number(f.room_id || 0) < 0;
+      const groupBonus = groupPreferred && isGroup ? 20 : (groupPreferred && !isGroup ? -15 : 0);
+      return { ...f, _score: score + groupBonus };
+    })
     .filter(f => terms.length ? f._score > 0 : true)
     .sort((a, b) => b._score - a._score)
     .slice(0, 5);
 
   const rankedMessages = messages
     .filter(m => !kohLooksLikeCommandOrRequestOnly(m.content))
-    .map(m => ({ ...m, _score: kohScoreRecord(m, terms) }))
+    .map(m => {
+      const score = kohScoreRecord(m, terms);
+      const isGroup = Number(m.room_id || 0) < 0;
+      const groupBonus = groupPreferred && isGroup ? 20 : (groupPreferred && !isGroup ? -15 : 0);
+      return { ...m, _score: score + groupBonus };
+    })
     .filter(m => terms.length ? m._score > 0 : true)
     .sort((a, b) => b._score - a._score)
     .slice(0, 8);
@@ -2014,31 +2040,125 @@ async function handleFilesCommand(env, chatId) {
   }
 }
 
+async function handleSetUserName(env, chatId, text) {
+  const match = String(text || "").match(/^\/set_user_name\s+(\S+)\s+(.+)$/);
+  if (!match) {
+    await sendMessage(env, chatId, "사용법: /set_user_name <user_id> <이름>\n예: /set_user_name 5965410906 동연 이");
+    return;
+  }
+  const userId = match[1].trim();
+  const name = match[2].trim();
+  if (!env.DB) { await sendMessage(env, chatId, "DB 없음"); return; }
+  const { hasCanonical } = await getUserNameColumnInfo(env);
+  if (!hasCanonical) {
+    await sendMessage(env, chatId, "canonical_name 컬럼 없음. migrations/0010_user_canonical_name.sql 실행 필요.");
+    return;
+  }
+  try {
+    await env.DB.prepare(`
+      INSERT INTO users (telegram_id, canonical_name, name, last_seen_at)
+      VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(telegram_id) DO UPDATE SET
+        canonical_name = excluded.canonical_name,
+        name = COALESCE(NULLIF(name, ''), excluded.name),
+        last_seen_at = CURRENT_TIMESTAMP
+    `).bind(userId, name, name).run();
+    await sendMessage(env, chatId, `사용자명 정규화 완료: ${userId} → ${name}`);
+  } catch (e) {
+    await sendMessage(env, chatId, `set_user_name 실패: ${String(e?.message || e).slice(0, 300)}`);
+  }
+}
+
+async function handleDebugUsers(env, chatId) {
+  if (!env.DB || !(await tableExists(env, "users"))) {
+    await sendMessage(env, chatId, "users 테이블 없음.");
+    return;
+  }
+  try {
+    const count = await env.DB.prepare(`SELECT COUNT(*) AS count FROM users`).first();
+    const { hasCanonical } = await getUserNameColumnInfo(env);
+    const cols = `telegram_id, name, ${hasCanonical ? "canonical_name," : ""} username, last_seen_at`;
+    const recent = await env.DB.prepare(`SELECT ${cols} FROM users ORDER BY last_seen_at DESC LIMIT 10`).all();
+    const lines = (recent.results || []).map(u =>
+      `id: ${u.telegram_id}\n  name: ${u.name || ""}\n  canonical: ${u.canonical_name || "없음"}\n  username: @${u.username || ""}\n  seen: ${String(u.last_seen_at || "").slice(0, 10)}`
+    ).join("\n\n");
+    await sendMessage(env, chatId, `users count: ${count?.count || 0}\n\n${lines || "없음"}`);
+  } catch (e) {
+    await sendMessage(env, chatId, `debug_users 실패: ${String(e?.message || e).slice(0, 300)}`);
+  }
+}
+
+async function handleDebugSearch(env, chatId, text) {
+  const keyword = String(text || "").replace(/^\/debug_search\s*/i, "").trim();
+  const like = `%${keyword}%`;
+  let out = `[debug_search: "${keyword || "(전체)"}"]\n\n`;
+  if (!env.DB) { await sendMessage(env, chatId, "DB 없음"); return; }
+  try {
+    const hasRooms = await tableExists(env, "rooms");
+    const roomJoin = hasRooms ? "LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(f.room_id AS TEXT)" : "";
+    const msgRoomJoin = hasRooms ? "LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(m.room_id AS TEXT)" : "";
+    const roomTitle = hasRooms
+      ? `COALESCE(CASE WHEN CAST(f.room_id AS INTEGER)<0 THEN NULLIF(r.room_title,'') END, CASE WHEN CAST(f.room_id AS INTEGER)>0 THEN '1:1' END, f.room_title, '?')`
+      : `COALESCE(f.room_title, '?')`;
+    const msgRoomTitle = hasRooms
+      ? `COALESCE(CASE WHEN CAST(m.room_id AS INTEGER)<0 THEN NULLIF(r.room_title,'') END, CASE WHEN CAST(m.room_id AS INTEGER)>0 THEN '1:1' END, m.room_title, '?')`
+      : `COALESCE(m.room_title, '?')`;
+
+    const fileWhere = keyword ? "(f.file_name LIKE ? OR f.summary LIKE ?)" : "1=1";
+    const files = await env.DB.prepare(
+      `SELECT f.room_id, ${roomTitle} AS resolved_room, f.file_name, f.uploader_name, f.telegram_file_id, f.created_at FROM files f ${roomJoin} WHERE ${fileWhere} ORDER BY f.created_at DESC LIMIT 5`
+    ).bind(...(keyword ? [like, like] : [])).all();
+    out += `files (${files.results?.length || 0}건):\n`;
+    for (const f of files.results || []) {
+      out += `  room_id=${f.room_id} room=${f.resolved_room} file=${f.file_name || ""} uploader=${f.uploader_name || ""} tg_file=${f.telegram_file_id ? "있음" : "없음"} ${String(f.created_at || "").slice(0, 10)}\n`;
+    }
+
+    const msgWhere = keyword ? "m.content LIKE ?" : "1=1";
+    const msgs = await env.DB.prepare(
+      `SELECT m.room_id, ${msgRoomTitle} AS resolved_room, m.sender_name, SUBSTR(m.content,1,80) AS snippet, m.created_at FROM messages m ${msgRoomJoin} WHERE ${msgWhere} ORDER BY m.created_at DESC LIMIT 5`
+    ).bind(...(keyword ? [like] : [])).all();
+    out += `\nmessages (${msgs.results?.length || 0}건):\n`;
+    for (const m of msgs.results || []) {
+      out += `  room_id=${m.room_id} room=${m.resolved_room} sender=${m.sender_name || ""} ${String(m.created_at || "").slice(0, 10)}\n  ${String(m.snippet || "").slice(0, 80)}\n`;
+    }
+    await sendMessage(env, chatId, out.slice(0, 3000));
+  } catch (e) {
+    await sendMessage(env, chatId, `debug_search 실패: ${String(e?.message || e).slice(0, 500)}`);
+  }
+}
+
 async function handleDebugFiles(env, chatId) {
   try {
     if (!env.DB || !(await tableExists(env, "files"))) {
       await sendMessage(env, chatId, "files 테이블 없음.");
       return;
     }
-    const table = await env.DB.prepare(`PRAGMA table_info(files)`).all();
-    const columns = (table.results || []).map((c) => c.name).join(", ");
     const count = await env.DB.prepare(`SELECT COUNT(*) AS count FROM files`).first();
-    const orderColumn = await columnExists(env, "files", "created_at") ? "created_at" : "id";
-    const recent = await env.DB.prepare(`SELECT * FROM files ORDER BY ${orderColumn} DESC LIMIT 5`).all();
-    const recentText = (recent.results || []).map((f) =>
-      `id=${f.id || ""} / ${f.file_name || ""}\n` +
-      `room=${f.room_id || ""} / ${f.room_title || ""}\n` +
-      `uploader=${f.uploader_id || ""} / ${f.uploader_name || ""}\n` +
-      `sender=${f.sender_name || ""} / mime=${f.mime_type || ""} / ${f.created_at || ""}`
-    ).join("\n\n") || "최근 파일 없음";
+    const hasRooms = await tableExists(env, "rooms");
+    const roomJoin = hasRooms ? "LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(f.room_id AS TEXT)" : "";
+    const resolvedRoom = hasRooms
+      ? `COALESCE(CASE WHEN CAST(f.room_id AS INTEGER)<0 THEN NULLIF(r.room_title,'') END, CASE WHEN CAST(f.room_id AS INTEGER)>0 THEN '1:1' END, f.room_title, '?')`
+      : `COALESCE(f.room_title, '?')`;
+    const { hasCanonical } = await getUserNameColumnInfo(env);
+    const hasUsers = await tableExists(env, "users");
+    const userJoin = hasUsers ? "LEFT JOIN users u ON CAST(u.telegram_id AS TEXT) = CAST(f.uploader_id AS TEXT)" : "";
+    const resolvedUploader = hasUsers
+      ? (hasCanonical ? `COALESCE(NULLIF(u.canonical_name,''), NULLIF(u.name,''), NULLIF(f.uploader_name,''), f.sender_name, '?')` : `COALESCE(NULLIF(u.name,''), NULLIF(f.uploader_name,''), f.sender_name, '?')`)
+      : `COALESCE(NULLIF(f.uploader_name,''), f.sender_name, '?')`;
+    const recent = await env.DB.prepare(`
+      SELECT f.id, f.room_id, ${resolvedRoom} AS resolved_room, f.file_name,
+        f.uploader_id, ${resolvedUploader} AS resolved_uploader,
+        f.telegram_file_id, f.created_at
+      FROM files f ${roomJoin} ${userJoin}
+      ORDER BY f.created_at DESC LIMIT 10
+    `).all();
+    const lines = (recent.results || []).map(f =>
+      `id=${f.id} room_id=${f.room_id}\n  room: ${f.resolved_room}\n  file: ${f.file_name || ""}\n  uploader_id: ${f.uploader_id || ""} → ${f.resolved_uploader}\n  tg_file_id: ${f.telegram_file_id ? "있음" : "없음"}\n  ${String(f.created_at || "").slice(0, 10)}`
+    ).join("\n\n") || "없음";
     const last = env.CONVERSATIONS ? await env.CONVERSATIONS.get("debug_files_last") : "";
-    await sendMessage(
-      env,
-      chatId,
-      `files count: ${count?.count || 0}\ncolumns: ${columns || "없음"}\nlast file save: ${last || "기록 없음"}\n\n${recentText}`
-    );
+    await sendMessage(env, chatId, `files: ${count?.count || 0}건\nlast_save: ${last || "없음"}\n\n${lines}`);
   } catch (e) {
-    await sendMessage(env, chatId, `debug files 실패\n${String(e?.stack || e?.message || e).slice(0, 1200)}`);
+    await sendMessage(env, chatId, `debug_files 실패\n${String(e?.stack || e?.message || e).slice(0, 1200)}`);
   }
 }
 
