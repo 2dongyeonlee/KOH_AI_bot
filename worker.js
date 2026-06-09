@@ -21,26 +21,28 @@ const SUMMARY_RULE = `
 [답변 형식 — 모든 요약·정리·브리핑에서 반드시 준수]
 
 안건별 형식:
-📌 안건명 (파일명 아닌 업무 내용 기반, 볼드 없이 일반 텍스트)
-· 핵심 내용 1~2줄
+📌 [카테고리] 안건명 (10~25자, 내용 기반 직접 작성)
+· 핵심 내용 1~2줄 (사실만, 추정 금지)
 · 위치: [방이름]
 · 공유자: <u>이름</u> (날짜)
-· 링크: URL (뉴스·외부 자료일 때만 표시)
-⚡ 마감: 날짜 (날짜·기한 있을 때만)
+· 링크: URL (뉴스·외부 자료일 때만)
+⚡ 마감: 날짜 (있을 때만)
+
+카테고리:
+[정부·정책] [노사·인사] [사내 보고] [대외 커뮤니케이션]
+[위기·이슈] [사업·전략] [글로벌·외신] [행사·이벤트]
 
 규칙:
+- 제목은 내용을 읽고 직접 작성 — 본문 문장 그대로 붙여쓰기 금지
+- "여겠습니다", "알겠습니다" 같은 응답 문장은 제목 불가
 - 하나의 자료에 여러 안건이 있으면 각각 별도 📌로 분리
-- "확인하겠습니다", "반영하겠습니다", "네 담당님" 등 응답 문장을 안건명으로 쓰지 말 것
 - 파일명(photo_xxx 등)을 안건명으로 절대 쓰지 말 것
 - 안건 사이 반드시 한 줄 띄기
 - 모든 방 자료 빠짐없이 포함 필수
 - 1:1 방 공유 자료도 실제 공유자 이름 표시
 - 사람 이름은 <u>이름</u> 형태
-- <b> 볼드 절대 금지
-- *, #, ** 마크다운 절대 금지
+- <b> 볼드 절대 금지 / *, #, ** 마크다운 절대 금지
 - 자료에 없는 내용 추정 금지
-- AI Agent 도입과 M15 화재는 다른 안건 — 절대 같이 묶지 말 것
-- 뉴스는 📰 아이콘 사용, 링크 포함
 `;
 const BOT_OWNER_NAME = "권오혁";
 const BOT_OWNER_ROLE = "6R전략담당";
@@ -48,7 +50,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-multi-agenda-news-format-20260608-1600";
+const BUILD_VERSION = "koh-6r-assistant-priority-roadmap-20260609-0330";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -962,12 +964,95 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
 
 // ── Intent constants ──────────────────────────────────────────────────────────
 const KOH_INTENT = {
-  FILE_LIST:       "FILE_LIST",
-  FILE_SUMMARY:    "FILE_SUMMARY",
-  FILE_RESEND:     "FILE_RESEND",
-  MESSAGE_SUMMARY: "MESSAGE_SUMMARY",
-  PRIORITY:        "PRIORITY",
+  FILE_LIST:              "FILE_LIST",
+  FILE_SUMMARY:           "FILE_SUMMARY",
+  FILE_RESEND:            "FILE_RESEND",
+  MESSAGE_SUMMARY:        "MESSAGE_SUMMARY",
+  PRIORITY:               "PRIORITY",
+  GENERAL_CHAT:           "GENERAL_CHAT",
+  ADMIN_COMMAND:          "ADMIN_COMMAND",
+  MATERIAL_FIND:          "MATERIAL_FIND",
+  MEETING_SUMMARY:        "MEETING_SUMMARY",
+  SCHEDULE_CHECK:         "SCHEDULE_CHECK",
+  ACTION_ITEM_CHECK:      "ACTION_ITEM_CHECK",
+  NEWS_SEARCH:            "NEWS_SEARCH",
+  STRATEGIC_6R_JUDGMENT:  "STRATEGIC_6R_JUDGMENT",
 };
+
+// ── 6R 프레임워크 ─────────────────────────────────────────────────────────────
+const SIX_R_FRAMEWORK = {
+  GR: { label: "정부관계(GR)", keywords: ["정부", "정책", "규제", "국회", "법", "지자체", "adr", "ipo", "sec", "상장", "지방선거"] },
+  PR: { label: "언론홍보(PR)", keywords: ["언론", "보도", "pr", "커뮤니케이션", "대외", "기자", "입장문", "성명", "인터뷰"] },
+  IR: { label: "투자자관계(IR)", keywords: ["투자자", "주주", "실적", "ir", "기업가치", "경영설명회"] },
+  CR: { label: "고객관계(CR)", keywords: ["고객", "cr", "고객사", "제품", "납품", "공급"] },
+  BR: { label: "협력사관계(BR)", keywords: ["협력사", "br", "파트너", "공급망", "mou", "상생"] },
+  ER: { label: "구성원관계(ER)", keywords: ["직원", "구성원", "er", "노사", "노조", "성과급", "임직원", "the소통"] },
+};
+
+function detect6R(text) {
+  const t = String(text || "").toLowerCase();
+  const result = [];
+  for (const [key, r] of Object.entries(SIX_R_FRAMEWORK)) {
+    if (r.keywords.some(kw => t.includes(kw))) result.push(key);
+  }
+  return result.length ? result : [];
+}
+
+function buildAnswerPlan(text) {
+  const t = String(text || "").trim();
+  const intent = kohDetectIntent(t);
+  const terms = kohExtractSearchTerms(t);
+  const isInternal = kohIsInternalKnowledgeRequest(t);
+  const six_r = detect6R(t);
+  const RETRIEVAL_MAP = {
+    [KOH_INTENT.GENERAL_CHAT]:          "NONE",
+    [KOH_INTENT.ADMIN_COMMAND]:         "NONE",
+    [KOH_INTENT.FILE_LIST]:             "FILES",
+    [KOH_INTENT.FILE_SUMMARY]:          "FILES",
+    [KOH_INTENT.FILE_RESEND]:           "FILES",
+    [KOH_INTENT.MATERIAL_FIND]:         "FILES_AND_MESSAGES",
+    [KOH_INTENT.MESSAGE_SUMMARY]:       "MESSAGES",
+    [KOH_INTENT.MEETING_SUMMARY]:       "MESSAGES",
+    [KOH_INTENT.SCHEDULE_CHECK]:        "FILES_AND_MESSAGES",
+    [KOH_INTENT.ACTION_ITEM_CHECK]:     "FILES_AND_MESSAGES",
+    [KOH_INTENT.PRIORITY]:              "FILES_AND_MESSAGES",
+    [KOH_INTENT.NEWS_SEARCH]:           "EXTERNAL_SEARCH",
+    [KOH_INTENT.STRATEGIC_6R_JUDGMENT]: "FILES_AND_MESSAGES",
+  };
+  const retrieval_needed = RETRIEVAL_MAP[intent] || (isInternal ? "FILES_AND_MESSAGES" : "NONE");
+  return {
+    intent: intent || "null",
+    user_goal: t.slice(0, 100),
+    retrieval_needed,
+    answer_mode: intent?.toLowerCase() || "general",
+    search_terms: terms,
+    room_scope: kohIsCurrentRoomOnly(t) ? "current_room_only" : "all_accessible_sources",
+    cross_room_allowed: !kohIsCurrentRoomOnly(t),
+    six_r_needed: intent === KOH_INTENT.STRATEGIC_6R_JUDGMENT || six_r.length > 0,
+    six_r_classification: six_r,
+    confidence: intent ? "high" : isInternal ? "medium" : "low",
+    reason: intent ? `${intent} 패턴 감지` : isInternal ? "내부 지식 요청" : "일반 대화",
+  };
+}
+
+function kohFormatIssueCard({ title, summary, six_r, source_room, source_file, uploader, date, action_items, risk } = {}) {
+  const sixRLabel = (six_r || []).join("/");
+  let out = `<b>${String(title || "업무 안건").slice(0, 60)}</b>`;
+  if (sixRLabel) out += ` <code>[${sixRLabel}]</code>`;
+  out += "\n";
+  if (summary) out += `- 🧩 <b>내용</b>: ${String(summary).slice(0, 200)}\n`;
+  if (source_room || source_file) out += `- 📎 <b>자료 위치</b>: ${[source_room, source_file].filter(Boolean).join(" > ")}\n`;
+  if (uploader || date) out += `- 👤 <b>공유자/일자</b>: ${[uploader, date].filter(Boolean).join(" / ")}\n`;
+  if (action_items?.length) out += `- 📋 <b>액션</b>: ${action_items.join(", ")}\n`;
+  if (risk) out += `- ⚠️ <b>리스크</b>: ${risk}\n`;
+  return out.trim();
+}
+
+function kohRelevanceGate(items, terms, threshold = 8) {
+  if (!terms?.length) return items;
+  const filtered = items.filter(item => (item._score || 0) >= threshold);
+  return filtered.length > 0 ? filtered : [];
+}
 
 function kohDetectIntent(text = "") {
   const t = String(text || "").replace(/\s+/g, " ").trim();
@@ -976,6 +1061,34 @@ function kohDetectIntent(text = "") {
     .replace(/됫/g, "됐").replace(/됬/g, "됐").replace(/공유됫/g, "공유됐")
     .replace(/보내조/g, "보내줘").replace(/줘라/g, "줘").replace(/좀$/g, "줘")
     .replace(/알려조/g, "알려줘").replace(/정리좀/g, "정리해줘").replace(/요약좀/g, "요약해줘");
+
+  // GENERAL_CHAT: clearly conversational, no internal data retrieval
+  if (/^(날씨.*어때|오늘\s*날씨|점심.*뭐|밥.*뭐\s*먹|이거.*왜\s*안\s*돼|어떻게.*테스트|문장.*바꿔|번역해줘|설명해줘|정의가\s*뭐야|차이.*뭐야|예시.*들어|안녕하세요|반갑습니다)/.test(n) &&
+      !/(파일|자료|문서|방|공유|저장|보고|안건|회의|일정|업무|kpi|보내|요약|정리|올라온|첨부|공유됐|공유된|진행|확인해야)/.test(n)) return KOH_INTENT.GENERAL_CHAT;
+
+  // ADMIN_COMMAND: user name registration
+  if (/\/set_user_name\b/.test(n) ||
+      (/(id|아이디)\s*(등록|추가|입력)/.test(n) && /(해줘|해라|해줘라)/.test(n)) ||
+      /이름\s*(정규화|수정|변경|바꿔|등록)/.test(n)) return KOH_INTENT.ADMIN_COMMAND;
+
+  // NEWS_SEARCH: external news query
+  if (/(뉴스.*확인|기사.*찾아|최신.*동향|외신.*확인|bloomberg|reuters|nikkei.*뉴스|언론.*보도.*어때|sk하이닉스.*뉴스|hbm.*기사)/.test(n) &&
+      !/(방|대화|공유|자료|파일|보고된|내가)/.test(n)) return KOH_INTENT.NEWS_SEARCH;
+
+  // STRATEGIC_6R_JUDGMENT: 6R analysis
+  if (/(어느\s*[rR]에서|[gGpPiIcCbBeE][rR]\s*(이야|야|인가|관련|해당|맞아|담당)|6r.*분류|6r.*판단|이해관계자.*정리|커뮤니케이션.*전략|어디서.*대응|입장.*정리해줘)/.test(n)) return KOH_INTENT.STRATEGIC_6R_JUDGMENT;
+
+  // MEETING_SUMMARY: meeting-specific
+  if (/(회의\s*(내용|결과|정리|요약|안건)|아까\s*회의|오늘\s*회의|회의록|미팅\s*내용|간담회\s*내용|회의에서\s*(나온|정해진|결정))/.test(n)) return KOH_INTENT.MEETING_SUMMARY;
+
+  // ACTION_ITEM_CHECK: action items
+  if (/(액션\s*아이템|해야\s*할\s*(일|것|과제)|챙겨야\s*할|다음\s*단계|확인\s*필요\s*사항|내가\s*해야|마감.*언제|담당\s*(확인|정리))/.test(n)) return KOH_INTENT.ACTION_ITEM_CHECK;
+
+  // SCHEDULE_CHECK: schedule
+  if (/(이번주\s*(일정|챙겨야|할\s*것)|오늘\s*(일정|해야)|일정.*어때|일정.*어떻게|보고\s*일정|회의\s*일정|마감\s*일정)/.test(n)) return KOH_INTENT.SCHEDULE_CHECK;
+
+  // MATERIAL_FIND: locating specific material
+  if (/(자료\s*어디|파일\s*어디|어디\s*있어|어느\s*방에|그\s*문서|그\s*발표자료|어느\s*파일|찾아줘.*자료|자료.*찾아줘)/.test(n)) return KOH_INTENT.MATERIAL_FIND;
 
   // FILE_RESEND: explicit send/transfer/share of a file
   if (/(보내줘|전달해줘|전달\s*요청|첨부해줘|올려줘|파일\s*줘|자료\s*줘|원본\s*보내|다시\s*보내|공유해줘|파일\s*전달|자료\s*공유|다시\s*올려|그\s*파일\s*줘|그\s*자료\s*보내)/.test(n)) return KOH_INTENT.FILE_RESEND;
@@ -1241,6 +1354,47 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
       : "";
   }
 
+  // GENERAL_CHAT: skip file retrieval, answer directly
+  if (intent === KOH_INTENT.GENERAL_CHAT) {
+    try {
+      const query = TONE_RULE +
+        `당신은 권오혁 담당의 AI 비서입니다.\n` +
+        `아래 요청에 내부 자료 검색 없이 직접 답변해주세요.\n\n` +
+        `요청: ${text}\n\n` +
+        `간결하고 실용적으로 답변. 최신 정보가 필요하면 외부 검색 기능 연결 필요를 짧게 안내.`;
+      const result = await difyChat(env, { query, user: "koh", conversationId: "" });
+      if (result.answer) { await kohSendHtml(env, chatId, result.answer); return true; }
+    } catch (e) { console.error("GENERAL_CHAT:", e); }
+    await kohSendHtml(env, chatId, "답변 생성 실패. 다시 시도해주세요.");
+    return true;
+  }
+
+  // ADMIN_COMMAND: handle user registration via natural language
+  if (intent === KOH_INTENT.ADMIN_COMMAND) {
+    const nameMatch = text.match(/([가-힣]{2,4})\s*(이름|id|아이디)\s*(등록|정규화|수정|변경)/);
+    if (nameMatch && env.DB) {
+      const targetName = nameMatch[1];
+      try {
+        const existing = await env.DB.prepare(`SELECT telegram_id, name, canonical_name FROM users WHERE name LIKE ? OR canonical_name LIKE ? LIMIT 3`).bind(`%${targetName}%`, `%${targetName}%`).all();
+        const rows = existing.results || [];
+        if (rows.length === 1) {
+          await env.DB.prepare(`UPDATE users SET canonical_name = ? WHERE telegram_id = ?`).bind(targetName, rows[0].telegram_id).run();
+          await kohSendHtml(env, chatId, `사용자명 정규화 완료: ${rows[0].telegram_id} → ${targetName}`);
+        } else if (rows.length > 1) {
+          const list = rows.map(r => `· ${r.name || r.canonical_name} (ID: ${r.telegram_id})`).join("\n");
+          await kohSendHtml(env, chatId, `이름이 유사한 사용자가 여러 명입니다:\n${list}\n\n정확한 user_id로 /set_user_name 명령을 사용해주세요.`);
+        } else {
+          await kohSendHtml(env, chatId, `"${targetName}" 이름의 사용자를 찾지 못했습니다.\n/set_user_name <user_id> <이름> 으로 직접 등록해주세요.`);
+        }
+      } catch (e) {
+        await kohSendHtml(env, chatId, `사용자 조회 실패: ${String(e?.message || e).slice(0, 200)}`);
+      }
+    } else {
+      await kohSendHtml(env, chatId, `사용자명 등록 방법:\n/set_user_name <user_id> <이름>\n예: /set_user_name 5965410906 이동연`);
+    }
+    return true;
+  }
+
   // Initial fetch: 30-day window (or 7-day for FILE_LIST)
   const initDays = (intent === KOH_INTENT.FILE_LIST && !hasTerms) ? 7 : 30;
   const { files: rawFiles, messages } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, initDays, roomAliasTitle);
@@ -1448,6 +1602,104 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
       date: kohFormatDate(f.created_at),
     })).join("\n\n");
     await kohSendHtml(env, chatId, `<b>관련 파일 ${candidates.length}건 확인됩니다. 번호를 선택해주세요.</b>\n\n${body}`);
+    return true;
+  }
+
+  // ── MEETING_SUMMARY ───────────────────────────────────────────────────────
+  if (intent === KOH_INTENT.MEETING_SUMMARY) {
+    const meetingMsgs = filteredMsgs.slice(0, 20);
+    if (!meetingMsgs.length && !scoredFiles.length) {
+      await kohSendHtml(env, chatId, "회의 기록을 찾지 못했습니다.");
+      return true;
+    }
+    const corpus = meetingMsgs.map(m =>
+      `[${kohFormatDate(m.created_at)}] ${m._resolvedRoom || m.room_title || ""} | ${m.sender_name || ""}: ${String(m.content || "").slice(0, 300)}`
+    ).join("\n");
+    try {
+      const q = TONE_RULE + SUMMARY_RULE +
+        `다음은 회의/논의 기록입니다. 회의 결과를 정리해줘.\n\n` +
+        `[정리 항목]\n· 논의된 안건\n· 결정사항\n· 액션아이템 (담당자, 기한)\n· 확인 필요 사항\n\n` +
+        `[회의 기록]\n${corpus.slice(0, 6000)}\n\n요청: ${text}`;
+      const r = await difyChat(env, { query: q, user: "koh", conversationId: "" });
+      if (r.answer) { await kohSendHtml(env, chatId, r.answer); return true; }
+    } catch (e) { console.error("MEETING_SUMMARY:", e); }
+    await kohSendHtml(env, chatId, "회의 내용 요약 생성 실패. 다시 시도해주세요.");
+    return true;
+  }
+
+  // ── SCHEDULE_CHECK / ACTION_ITEM_CHECK ────────────────────────────────────
+  if (intent === KOH_INTENT.SCHEDULE_CHECK || intent === KOH_INTENT.ACTION_ITEM_CHECK) {
+    const allItems = [...scoredFiles.slice(0, 10), ...filteredMsgs.slice(0, 20)];
+    if (!allItems.length) {
+      await kohSendHtml(env, chatId, "관련 일정·액션아이템을 찾지 못했습니다.");
+      return true;
+    }
+    const corpus = [
+      ...scoredFiles.slice(0, 10).map(f => `[파일] ${f._resolvedRoom || f.room_title || ""} | ${f.file_name || ""}: ${String(f.summary || f.content || "").slice(0, 300)}`),
+      ...filteredMsgs.slice(0, 20).map(m => `[대화] ${m._resolvedRoom || m.room_title || ""} | ${m.sender_name || ""}: ${String(m.content || "").slice(0, 200)}`),
+    ].join("\n");
+    try {
+      const q = TONE_RULE +
+        `아래 자료에서 ${intent === KOH_INTENT.SCHEDULE_CHECK ? "일정과 회의 일정" : "액션아이템과 해야 할 일"}을 추출해줘.\n\n` +
+        `[추출 형식]\n⏰ 일정/마감: 날짜 | 내용 | 담당자\n📋 액션: 할 일 | 담당자 (불명확하면 "확인 필요")\n\n` +
+        `[자료]\n${corpus.slice(0, 6000)}\n\n요청: ${text}`;
+      const r = await difyChat(env, { query: q, user: "koh", conversationId: "" });
+      if (r.answer) { await kohSendHtml(env, chatId, r.answer); return true; }
+    } catch (e) { console.error("SCHEDULE/ACTION:", e); }
+    await kohSendHtml(env, chatId, "일정·액션아이템 추출 실패. 다시 시도해주세요.");
+    return true;
+  }
+
+  // ── STRATEGIC_6R_JUDGMENT ─────────────────────────────────────────────────
+  if (intent === KOH_INTENT.STRATEGIC_6R_JUDGMENT) {
+    const six_r = detect6R(text);
+    const corpus = [...scoredFiles.slice(0, 5), ...filteredMsgs.slice(0, 10)].map(r =>
+      `[${r._resolvedRoom || r.room_title || ""}] ${r.file_name || r.sender_name || ""}: ${String(r.summary || r.content || "").slice(0, 300)}`
+    ).join("\n");
+    try {
+      const sixRDefs = Object.entries(SIX_R_FRAMEWORK).map(([k, v]) => `${k}(${v.label}): ${v.keywords.slice(0, 4).join(", ")}`).join(" | ");
+      const q = TONE_RULE +
+        `[6R 프레임워크]\n${sixRDefs}\n\n` +
+        `위 6R 프레임워크 기준으로 아래 요청을 분류하고 대응 방향을 제시해줘.\n\n` +
+        `[관련 자료]\n${corpus.slice(0, 4000) || "관련 자료 없음"}\n\n` +
+        `[요청]\n${text}\n\n` +
+        `[답변 형식]\n분류: GR/PR/IR/CR/BR/ER 중 해당\n이유: 왜 이 R인지\n이해관계자: 핵심 관계자\n대응 방향: 구체적 액션`;
+      const r = await difyChat(env, { query: q, user: "koh", conversationId: "" });
+      if (r.answer) { await kohSendHtml(env, chatId, r.answer); return true; }
+    } catch (e) { console.error("STRATEGIC_6R:", e); }
+    await kohSendHtml(env, chatId, "6R 판단 생성 실패. 다시 시도해주세요.");
+    return true;
+  }
+
+  // ── MATERIAL_FIND ─────────────────────────────────────────────────────────
+  if (intent === KOH_INTENT.MATERIAL_FIND) {
+    const gated = kohRelevanceGate(scoredFiles, terms, 8);
+    if (!gated.length && !filteredMsgs.length) {
+      await kohSendHtml(env, chatId, `"${terms.join(", ")}" 관련 자료를 찾지 못했습니다.`);
+      return true;
+    }
+    const items = await kohResolveItems(env, gated.slice(0, 5), "uploader_id", "uploader_name");
+    const body = items.map((f, i) => kohFormatIssueCard({
+      title: `${i + 1}. ${inferTitle(f)}`,
+      summary: fileSummaryText(f) || "내용 확인 필요",
+      six_r: detect6R(String(f.summary || f.content || "")),
+      source_room: f._resolvedRoom,
+      source_file: f.file_name,
+      uploader: f._resolvedName,
+      date: kohFormatDate(f.created_at),
+    })).join("\n\n");
+    const canSend = items.some(f => f.telegram_file_id);
+    await kohSendHtml(env, chatId, `${body}${canSend ? "\n\n파일을 받으려면 파일명 언급 후 '보내줘'라고 해주세요." : ""}`);
+    return true;
+  }
+
+  // ── NEWS_SEARCH ───────────────────────────────────────────────────────────
+  if (intent === KOH_INTENT.NEWS_SEARCH) {
+    if (isExternalSearchEnabled && isExternalSearchEnabled(env)) {
+      // 외부 검색으로 위임
+      return false;
+    }
+    await kohSendHtml(env, chatId, `뉴스 검색 기능이 비활성화되어 있습니다.\nTAVILY_API_KEY 및 EXTERNAL_SEARCH_ENABLED 설정이 필요합니다.`);
     return true;
   }
 
@@ -2534,6 +2786,29 @@ async function routeSlashCommand(env, message, text, chatId) {
     await handleDebugBriefing(env, chatId);
     return true;
   }
+  if (/^\/debug_plan\b/.test(t)) {
+    const query = t.replace(/^\/debug_plan\s*/i, "").trim();
+    if (!query) {
+      await sendMessage(env, chatId, "사용법: /debug_plan <분석할 문장>");
+      return true;
+    }
+    const plan = buildAnswerPlan(query);
+    await sendMessage(env, chatId,
+      `[debug_plan]\n` +
+      `입력: ${query}\n\n` +
+      `intent: ${plan.intent}\n` +
+      `user_goal: ${plan.user_goal}\n` +
+      `retrieval_needed: ${plan.retrieval_needed}\n` +
+      `answer_mode: ${plan.answer_mode}\n` +
+      `search_terms: [${plan.search_terms.join(", ") || "없음"}]\n` +
+      `room_scope: ${plan.room_scope}\n` +
+      `cross_room_allowed: ${plan.cross_room_allowed}\n` +
+      `six_r_classification: [${plan.six_r_classification.join(", ") || "없음"}]\n` +
+      `confidence: ${plan.confidence}\n` +
+      `reason: ${plan.reason}`
+    );
+    return true;
+  }
   if (/^\/debug_intent\b/.test(t)) {
     await handleDebugIntent(env, chatId, t);
     return true;
@@ -3028,14 +3303,18 @@ async function handleDebugIntent(env, chatId, text) {
   const currentRoomOnly = kohIsCurrentRoomOnly(query);
   const groupPreferred  = kohIsGroupRoomPreferred(query);
   const isInternal = kohIsInternalKnowledgeRequest(query);
+  const six_r = detect6R(query);
   const out =
     `[debug_intent]\n` +
     `입력: ${query}\n\n` +
     `intent: ${kohIntentLabel(intent)}\n` +
     `terms: [${terms.join(", ") || "(없음)"}]\n` +
+    `retrieval_needed: ${buildAnswerPlan(query).retrieval_needed}\n` +
+    `six_r_classification: [${six_r.join(", ") || "없음"}]\n` +
     `currentRoomOnly: ${currentRoomOnly}\n` +
     `groupPreferred: ${groupPreferred}\n` +
-    `isInternalKnowledge: ${isInternal}`;
+    `isInternalKnowledge: ${isInternal}\n` +
+    `confidence: ${buildAnswerPlan(query).confidence}`;
   await sendMessage(env, chatId, out);
 }
 
@@ -4759,23 +5038,27 @@ async function analyzeAndStructureFile(env, fileId, content) {
   if (!env.DIFY_API_KEY) return null;
 
   const query = TONE_RULE +
-    `다음 문서/대화를 분석해서 포함된 모든 안건을 각각 추출해줘.\n\n` +
-    `[핵심 규칙]\n` +
-    `- 문서에 여러 안건이 있으면 반드시 각각 별도로 추출 (합치지 말 것)\n` +
-    `- 예: IPO 관련 + 개발 착수 → 2개 안건으로 분리\n` +
-    `- "확인하겠습니다", "반영하겠습니다", "네 담당님" 같은 응답/인사말은 안건 아님\n` +
-    `- 실질적인 업무 내용(보고·결정·요청·이슈)만 안건으로 추출\n\n` +
-    `[추출 형식 — 안건이 여러 개면 이 형식을 반복]\n` +
+    `다음 문서/대화를 분석해서 포함된 모든 업무 안건을 각각 추출해줘.\n\n` +
+    `[카테고리 분류]\n` +
+    `내용을 읽고 아래 중 하나로 분류:\n` +
+    `정부·정책 / 노사·인사 / 사내 보고 / 대외 커뮤니케이션\n` +
+    `위기·이슈 / 사업·전략 / 글로벌·외신 / 행사·이벤트\n\n` +
+    `[추출 규칙]\n` +
+    `- 여러 안건이 있으면 반드시 각각 분리 (합치지 말 것)\n` +
+    `- "확인하겠습니다", "반영하겠습니다" 같은 응답 문장은 안건 아님\n` +
+    `- 실질적 업무 내용(보고·결정·요청·이슈)만 추출\n` +
+    `- 제목은 내용 읽고 직접 작성 (본문 문장 그대로 붙여넣기 금지)\n\n` +
+    `[추출 형식]\n` +
     `안건1:\n` +
-    `  제목: (업무 안건명 10~25자, 핵심 주제 기반)\n` +
-    `  배경: (왜 이 안건이 나왔는지 1~2줄)\n` +
-    `  액션: (다음에 해야 할 일)\n` +
-    `  마감: (날짜·기한, 없으면 생략)\n` +
-    `  담당자: (이름 언급된 사람)\n\n` +
+    `  카테고리: (위 목록 중 하나)\n` +
+    `  제목: [카테고리] 안건명 (10~25자)\n` +
+    `  배경: 왜 이 안건이 나왔는지 1~2줄\n` +
+    `  액션: 다음에 해야 할 일\n` +
+    `  마감: 날짜·기한 (없으면 생략)\n` +
+    `  담당자: 이름 언급된 사람\n\n` +
     `안건2:\n` +
-    `  제목: ...\n` +
     `  ...\n\n` +
-    `(안건 없으면 "안건없음" 으로)\n\n` +
+    `(안건 없으면 "안건없음")\n\n` +
     `문서 내용:\n${content.slice(0, 7000)}`;
 
   try {
