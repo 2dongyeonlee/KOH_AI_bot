@@ -255,7 +255,7 @@ function processRoom(dbName, exportDir, originalRoom, messageCols, fileCols, dry
   const roomId = data.id ? String(data.id) : `export:${hashText(originalRoom)}`;
   const roomTitle = data.name || originalRoom;
   const statements = [];
-  let importedMessages = 0, importedFiles = 0, skipped = 0;
+  let importedMessages = 0, importedFiles = 0, importedPhotos = 0, skipped = 0;
   const seenMessages = new Set(), seenFiles = new Set();
 
   for (let idx = 0; idx < messages.length; idx++) {
@@ -280,6 +280,7 @@ function processRoom(dbName, exportDir, originalRoom, messageCols, fileCols, dry
       if (contentForMsg) {
         const whereMsg = `source_type = 'telegram_export' AND original_room = ${sql(originalRoom)} AND telegram_message_id = ${sql(msgId)}`;
         const msgCols = ["telegram_message_id", "room_id", "room_title", "sender_id", "sender_name",
+          "from_id", "from_name",
           "content", "saved_by", "source_type", "source_status", "original_room",
           "reply_to_message_id", "created_at", "raw_json"]
           .filter(c => messageCols.has(c));
@@ -289,6 +290,8 @@ function processRoom(dbName, exportDir, originalRoom, messageCols, fileCols, dry
           room_title: roomTitle,
           sender_id: user?.id || "",
           sender_name: user?.name || "",
+          from_id: String(msg.from_id || msg.actor_id || user?.id || ""),
+          from_name: String(msg.from || msg.actor || user?.name || ""),
           content: contentForMsg.slice(0, 4000),
           saved_by: "telegram_export_importer",
           source_type: "telegram_export",
@@ -312,6 +315,7 @@ function processRoom(dbName, exportDir, originalRoom, messageCols, fileCols, dry
         const mgKey = mediaGroupKey(roomId, user?.id || "", msg.date || "");
         const whereFile = `source_type = 'telegram_export' AND original_room = ${sql(originalRoom)} AND telegram_message_id = ${sql(msgId)} AND file_name = ${sql(file.fileName)}`;
         const fCols = ["uploader_id", "uploader_name", "sender_id", "sender_name",
+          "from_id", "from_name",
           "file_name", "file_type", "mime_type", "file_size",
           "content", "summary", "extracted_text",
           "room_id", "room_title",
@@ -321,11 +325,14 @@ function processRoom(dbName, exportDir, originalRoom, messageCols, fileCols, dry
           "original_room", "telegram_message_id", "media_group_key",
           "created_at"]
           .filter(c => fileCols.has(c));
+        if (file.fileType === "photo" || /^image\//i.test(file.mimeType)) importedPhotos++;
         const fVals = fCols.map(c => ({
           uploader_id: user?.id || "",
           uploader_name: user?.name || "",
           sender_id: user?.id || "",
           sender_name: user?.name || "",
+          from_id: String(msg.from_id || msg.actor_id || user?.id || ""),
+          from_name: String(msg.from || msg.actor || user?.name || ""),
           file_name: file.fileName,
           file_type: file.fileType,
           mime_type: file.mimeType,
@@ -361,12 +368,12 @@ function processRoom(dbName, exportDir, originalRoom, messageCols, fileCols, dry
   }
 
   const filtered = statements.filter(Boolean);
-  if (!filtered.length) return { messages: importedMessages, files: importedFiles, skipped };
+  if (!filtered.length) return { messages: importedMessages, files: importedFiles, photos: importedPhotos, skipped };
 
   if (dryRun) {
     console.log(`  [DRY-RUN] Would execute ${filtered.length} SQL statements`);
     console.log(`  [DRY-RUN] Sample:\n${filtered.slice(0, 2).join("\n").slice(0, 500)}`);
-    return { messages: importedMessages, files: importedFiles, skipped };
+    return { messages: importedMessages, files: importedFiles, photos: importedPhotos, skipped };
   }
 
   const tmpFile = path.join(os.tmpdir(), `koh_ingest_${Date.now()}_${hashText(originalRoom)}.sql`);
@@ -377,7 +384,7 @@ function processRoom(dbName, exportDir, originalRoom, messageCols, fileCols, dry
     try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
   }
 
-  return { messages: importedMessages, files: importedFiles, skipped };
+  return { messages: importedMessages, files: importedFiles, photos: importedPhotos, skipped };
 }
 
 // ── 메인 ─────────────────────────────────────────────────────────────────────
@@ -426,23 +433,35 @@ function main() {
   // 필요한 컬럼 추가 (없으면 ALTER TABLE)
   console.log("신규 컬럼 추가 (이미 있으면 skip)...");
   ensureColumns(dbName, "messages", {
-    source_status: "TEXT DEFAULT 'legacy'",
-    original_room: "TEXT DEFAULT ''",
+    source_type:          "TEXT DEFAULT ''",
+    source_status:        "TEXT DEFAULT 'legacy'",
+    original_room:        "TEXT DEFAULT ''",
+    from_name:            "TEXT DEFAULT ''",
+    from_id:              "TEXT DEFAULT ''",
+    reply_to_message_id:  "TEXT DEFAULT ''",
+    telegram_message_id:  "TEXT DEFAULT ''",
   }, messageCols, dryRun);
 
   ensureColumns(dbName, "files", {
-    source_status: "TEXT DEFAULT 'legacy'",
-    original_room: "TEXT DEFAULT ''",
-    source_path: "TEXT DEFAULT ''",
-    media_group_key: "TEXT DEFAULT ''",
-    telegram_message_id: "TEXT DEFAULT ''",
+    source_type:          "TEXT DEFAULT ''",
+    source_status:        "TEXT DEFAULT 'legacy'",
+    original_room:        "TEXT DEFAULT ''",
+    source_path:          "TEXT DEFAULT ''",
+    media_group_key:      "TEXT DEFAULT ''",
+    from_name:            "TEXT DEFAULT ''",
+    from_id:              "TEXT DEFAULT ''",
+    telegram_message_id:  "TEXT DEFAULT ''",
   }, fileCols, dryRun);
 
   // 컬럼 목록 다시 조회 (ALTER 이후)
   const msgColsFinal = dryRun ? new Set([...messageCols,
-    "source_status", "original_room"]) : columnsFor(dbName, "messages");
+    "source_type", "source_status", "original_room",
+    "from_name", "from_id", "reply_to_message_id", "telegram_message_id",
+  ]) : columnsFor(dbName, "messages");
   const fileColsFinal = dryRun ? new Set([...fileCols,
-    "source_status", "original_room", "source_path", "media_group_key", "telegram_message_id"]) : columnsFor(dbName, "files");
+    "source_type", "source_status", "original_room",
+    "source_path", "media_group_key", "from_name", "from_id", "telegram_message_id",
+  ]) : columnsFor(dbName, "files");
 
   // export 하위 폴더 탐색
   const entries = fs.readdirSync(rootPath, { withFileTypes: true });
@@ -463,20 +482,21 @@ function main() {
 
   console.log(`발견된 export 방: ${roomDirs.length}개\n`);
 
-  let totalMessages = 0, totalFiles = 0, totalSkipped = 0;
+  let totalMessages = 0, totalFiles = 0, totalPhotos = 0, totalSkipped = 0;
   const results = [];
 
   for (const { name, dir } of roomDirs) {
     process.stdout.write(`[${name}] 처리 중... `);
     try {
-      const { messages, files, skipped } = processRoom(
+      const { messages, files, photos, skipped } = processRoom(
         dbName, dir, name, msgColsFinal, fileColsFinal, dryRun
       );
       totalMessages += messages;
       totalFiles += files;
+      totalPhotos += (photos || 0);
       totalSkipped += skipped;
-      results.push({ room: name, messages, files, skipped, ok: true });
-      console.log(`메시지 ${messages}건, 파일 ${files}건, 중복skip ${skipped}건`);
+      results.push({ room: name, messages, files, photos: photos || 0, skipped, ok: true });
+      console.log(`메시지 ${messages}건, 파일 ${files}건 (사진 ${photos || 0}건), 중복skip ${skipped}건`);
     } catch (e) {
       results.push({ room: name, ok: false, error: e.message });
       console.log(`실패: ${e.message.slice(0, 120)}`);
@@ -484,9 +504,11 @@ function main() {
   }
 
   console.log("\n=== 완료 ===");
-  console.log(`총 메시지: ${totalMessages}건`);
-  console.log(`총 파일:   ${totalFiles}건`);
-  console.log(`중복 skip: ${totalSkipped}건`);
+  console.log(`source root: ${rootPath}`);
+  console.log(`총 메시지:   ${totalMessages}건`);
+  console.log(`총 파일:     ${totalFiles}건`);
+  console.log(`총 사진:     ${totalPhotos}건`);
+  console.log(`중복 skip:   ${totalSkipped}건`);
 
   const failed = results.filter(r => !r.ok);
   if (failed.length) {

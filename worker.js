@@ -50,7 +50,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-export-ingest-202605-202606-final";
+const BUILD_VERSION = "koh-export-ingest-schema-run-fix";
 
 function readBoolEnv(env, key, defaultValue = false) {
   const val = String(env[key] || "").trim().toLowerCase();
@@ -4184,15 +4184,20 @@ async function handleDebugRoomIngest(env, chatId, message) {
 async function handleDebugExportIngest(env, chatId) {
   if (!env.DB) { await sendMessage(env, chatId, "DB 없음"); return; }
   try {
-    const hasSourceStatus = await columnExists(env, "files", "source_status");
-    const hasOriginalRoom = await columnExists(env, "files", "original_room");
-    const hasMsgSourceStatus = await columnExists(env, "messages", "source_status");
+    const requiredFileCols = ["source_type", "source_status", "original_room", "source_path", "media_group_key", "from_name", "from_id"];
+    const requiredMsgCols  = ["source_type", "source_status", "original_room", "from_name", "from_id", "reply_to_message_id", "telegram_message_id"];
 
-    if (!hasSourceStatus || !hasMsgSourceStatus) {
-      await sendMessage(env, chatId,
-        "source_status 컬럼이 없습니다.\n" +
-        "node scripts/ingest_export.js <export-root> 를 먼저 실행하세요."
-      );
+    const missingFile = [];
+    const missingMsg  = [];
+    for (const c of requiredFileCols) { if (!(await columnExists(env, "files", c))) missingFile.push(c); }
+    for (const c of requiredMsgCols)  { if (!(await columnExists(env, "messages", c))) missingMsg.push(c); }
+
+    if (missingFile.length || missingMsg.length) {
+      const lines = ["[스키마 미반영 — ingest_export.js 실행 필요]", ""];
+      if (missingFile.length) lines.push(`files 누락: ${missingFile.join(", ")}`);
+      if (missingMsg.length)  lines.push(`messages 누락: ${missingMsg.join(", ")}`);
+      lines.push("", "실행: node scripts/ingest_export.js \"<export-root>\"");
+      await sendMessage(env, chatId, lines.join("\n"));
       return;
     }
 
@@ -4212,8 +4217,14 @@ async function handleDebugExportIngest(env, chatId) {
        ORDER BY original_room`
     ).all()).results || [];
 
+    const photoRow = (await env.DB.prepare(
+      `SELECT COUNT(*) AS cnt FROM files
+       WHERE source_type = 'telegram_export' AND source_status = 'active'
+         AND (file_type = 'photo' OR mime_type LIKE 'image/%')`
+    ).first()) || {};
+
     if (!fileRows.length && !msgRows.length) {
-      await sendMessage(env, chatId, "telegram_export 데이터가 없습니다. 적재가 필요합니다.");
+      await sendMessage(env, chatId, "telegram_export 데이터 없음. 적재 필요:\nnode scripts/ingest_export.js \"<export-root>\"");
       return;
     }
 
@@ -4226,7 +4237,8 @@ async function handleDebugExportIngest(env, chatId) {
 
     await sendMessage(env, chatId,
       `[Export 적재 현황]\n\n` +
-      `[파일]\n${fileLines.join("\n") || "없음"}\n\n` +
+      `[파일]\n${fileLines.join("\n") || "없음"}\n` +
+      `(active 사진: ${photoRow.cnt || 0}건)\n\n` +
       `[메시지]\n${msgLines.join("\n") || "없음"}`
     );
   } catch (e) {
@@ -4237,34 +4249,38 @@ async function handleDebugExportIngest(env, chatId) {
 async function handleDebugActiveLegacy(env, chatId) {
   if (!env.DB) { await sendMessage(env, chatId, "DB 없음"); return; }
   try {
-    const hasStatus = await columnExists(env, "files", "source_status");
-    const hasMsgStatus = await columnExists(env, "messages", "source_status");
+    const checkCols = ["source_type", "source_status", "original_room"];
+    const missingFile = [];
+    const missingMsg  = [];
+    for (const c of checkCols) {
+      if (!(await columnExists(env, "files", c)))    missingFile.push(c);
+      if (!(await columnExists(env, "messages", c))) missingMsg.push(c);
+    }
 
-    const fileActive = hasStatus
-      ? (await env.DB.prepare(`SELECT COUNT(*) AS c FROM files WHERE source_status = 'active'`).first())?.c || 0
-      : 0;
-    const fileLegacy = hasStatus
-      ? (await env.DB.prepare(`SELECT COUNT(*) AS c FROM files WHERE source_status != 'active' OR source_status IS NULL`).first())?.c || 0
-      : (await env.DB.prepare(`SELECT COUNT(*) AS c FROM files`).first())?.c || 0;
-    const msgActive = hasMsgStatus
-      ? (await env.DB.prepare(`SELECT COUNT(*) AS c FROM messages WHERE source_status = 'active'`).first())?.c || 0
-      : 0;
-    const msgLegacy = hasMsgStatus
-      ? (await env.DB.prepare(`SELECT COUNT(*) AS c FROM messages WHERE source_status != 'active' OR source_status IS NULL`).first())?.c || 0
-      : (await env.DB.prepare(`SELECT COUNT(*) AS c FROM messages`).first())?.c || 0;
+    if (missingFile.length || missingMsg.length) {
+      const lines = ["[스키마 미반영]", ""];
+      if (missingFile.length) lines.push(`files 누락 컬럼: ${missingFile.join(", ")}`);
+      if (missingMsg.length)  lines.push(`messages 누락 컬럼: ${missingMsg.join(", ")}`);
+      lines.push("", "✅ 해결: node scripts/ingest_export.js \"<export-root>\"",
+        "   → ALTER TABLE 자동 실행 후 데이터 적재");
+      await sendMessage(env, chatId, lines.join("\n"));
+      return;
+    }
 
-    const totalFiles = fileActive + fileLegacy;
-    const totalMsgs = msgActive + msgLegacy;
+    const fileActive  = (await env.DB.prepare(`SELECT COUNT(*) AS c FROM files WHERE source_status = 'active'`).first())?.c || 0;
+    const fileLegacy  = (await env.DB.prepare(`SELECT COUNT(*) AS c FROM files WHERE COALESCE(source_status,'legacy') != 'active'`).first())?.c || 0;
+    const photoActive = (await env.DB.prepare(`SELECT COUNT(*) AS c FROM files WHERE source_status = 'active' AND (file_type = 'photo' OR mime_type LIKE 'image/%')`).first())?.c || 0;
+    const msgActive   = (await env.DB.prepare(`SELECT COUNT(*) AS c FROM messages WHERE source_status = 'active'`).first())?.c || 0;
+    const msgLegacy   = (await env.DB.prepare(`SELECT COUNT(*) AS c FROM messages WHERE COALESCE(source_status,'legacy') != 'active'`).first())?.c || 0;
 
     await sendMessage(env, chatId,
       `[source_status 현황]\n\n` +
-      `[파일] 전체 ${totalFiles}건\n` +
-      `· active:  ${fileActive}건\n` +
+      `[파일] 전체 ${fileActive + fileLegacy}건\n` +
+      `· active:  ${fileActive}건 (사진 ${photoActive}건)\n` +
       `· legacy:  ${fileLegacy}건\n\n` +
-      `[메시지] 전체 ${totalMsgs}건\n` +
+      `[메시지] 전체 ${msgActive + msgLegacy}건\n` +
       `· active:  ${msgActive}건\n` +
-      `· legacy:  ${msgLegacy}건\n\n` +
-      (hasStatus ? "" : "⚠️ source_status 컬럼 없음 — ingest_export.js 실행 후 재확인")
+      `· legacy:  ${msgLegacy}건`
     );
   } catch (e) {
     await sendMessage(env, chatId, `debug_active_legacy 오류: ${String(e?.message || e).slice(0, 300)}`);
