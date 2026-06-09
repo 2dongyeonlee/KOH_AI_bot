@@ -50,7 +50,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-advanced-parser-before-chunking-20260609-1300";
+const BUILD_VERSION = "koh-ingest-fileid-send-briefing-fix-20260609-1500";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -787,6 +787,16 @@ function escapeHtml(text = "") {
     .replace(/>/g, "&gt;");
 }
 
+function sanitizeDisplayFileName(name) {
+  const s = String(name || "")
+    .replace(/@/g, "＠")
+    .replace(/\s+/g, " ")
+    .trim();
+  // Never expose raw photo/image filenames
+  if (/^photo[_@.-]|^image[_@.-]/i.test(s)) return "";
+  return s;
+}
+
 function extractScheduleFromText(text = "") {
   const patterns = [
     /(\d{1,2}월\s*\d{1,2}일[^\n,。.]{0,30})/g,
@@ -1313,8 +1323,10 @@ function getBestTextForIssueCard(source, parsed) {
   if (source.extracted_text && source.extracted_text.trim().length >= 20) return source.extracted_text;
   if (source.summary && source.summary.trim().length >= 20) return source.summary;
   if (source.content && source.content.trim().length >= 20) return source.content;
+  if (source.caption && source.caption.trim().length >= 10) return source.caption;
   if (docType === "image") return "";
-  return source.file_name || "";
+  const fn = source.file_name || "";
+  return /^photo[_@.-]|^image[_@.-]/i.test(fn) ? "" : fn;
 }
 
 function splitTextByDocumentType(fullText, documentType) {
@@ -1566,6 +1578,58 @@ async function handleRecentMaterialBrief(items, chatId, env) {
   const output = cards.map(formatIssueCard).join("\n\n");
   const suffix = filtered.length > 5 ? `\n\n더 보고 싶으면 "더 보여줘"라고 입력해주세요.` : "";
   await kohSendHtml(env, chatId, output + suffix);
+}
+
+async function handleBriefingSummary(env, chatId, text, currentRoomId = "") {
+  const { files: rawFiles, messages: rawMessages } =
+    await kohFetchRecentFilesAndMessages(env, String(currentRoomId || ""), false, 2, "");
+  const files = kohDedupFiles(rawFiles || []);
+  const allItems = await kohResolveItems(env, files, "uploader_id", "uploader_name");
+
+  const candidates = allItems
+    .filter(c => !isBotGeneratedOutput(
+      c.summary || c.extracted_text || c.content || c.text || "",
+      c._resolvedName || c.uploader_name || ""
+    ))
+    .slice(0, 5);
+
+  if (!candidates.length) {
+    await kohSendHtml(env, chatId, "최근 2일간 공유된 자료를 찾지 못했습니다.\n오늘 자료가 있으면 /debug_today 로 적재 상태를 확인해주세요.");
+    return;
+  }
+
+  const cards = [];
+  for (const c of candidates) {
+    try {
+      const card = await buildIssueCardFromCandidate(c, env);
+      if (card) cards.push(card);
+    } catch (e) {
+      console.error("handleBriefingSummary card:", e);
+    }
+  }
+
+  if (!cards.length) {
+    await kohSendHtml(env, chatId, "최근 공유 자료가 있지만 요약 가능한 본문을 찾지 못했습니다. 파서/OCR 확인이 필요합니다.");
+    return;
+  }
+
+  const header = `📌 <b>내일 오전 브리핑 후보</b>\n`;
+  const items = cards.map((card, i) => {
+    const sixRStr = Array.isArray(card.six_r) && card.six_r.length ? `[${card.six_r.join("/")}] ` : "";
+    const cat = card.agenda_category ? `[${card.agenda_category}] ` : "";
+    const title = escapeHtml(card.issue_title || "안건");
+    const summary = escapeHtml(card.summary || "");
+    const room = escapeHtml(card.source_room || "");
+    const actor = escapeHtml(card.actor || card.shared_by || "");
+    const date = card.date || "";
+    let line = `${i + 1}. <b>${sixRStr}${cat}${title}</b>`;
+    if (summary) line += `\n· 핵심: ${summary}`;
+    const confirmParts = [room ? `[${room}]` : "", actor ? `<u>${actor}</u>` : "", date].filter(Boolean).join(" / ");
+    if (confirmParts) line += `\n· 확인: ${confirmParts}`;
+    return line;
+  }).join("\n\n");
+
+  await kohSendHtml(env, chatId, header + items);
 }
 
 async function extractIssueCardsFromLongText(text, env, baseMeta = {}) {
@@ -1948,6 +2012,7 @@ const KOH_INTENT = {
   ACTION_ITEM_CHECK:      "ACTION_ITEM_CHECK",
   NEWS_SEARCH:            "NEWS_SEARCH",
   STRATEGIC_6R_JUDGMENT:  "STRATEGIC_6R_JUDGMENT",
+  BRIEFING_SUMMARY:       "BRIEFING_SUMMARY",
 };
 
 // ── 6R 프레임워크 ─────────────────────────────────────────────────────────────
@@ -1989,6 +2054,7 @@ function buildAnswerPlan(text) {
     [KOH_INTENT.PRIORITY]:              "FILES_AND_MESSAGES",
     [KOH_INTENT.NEWS_SEARCH]:           "EXTERNAL_SEARCH",
     [KOH_INTENT.STRATEGIC_6R_JUDGMENT]: "FILES_AND_MESSAGES",
+    [KOH_INTENT.BRIEFING_SUMMARY]:      "FILES_AND_MESSAGES",
   };
   const retrieval_needed = RETRIEVAL_MAP[intent] || (isInternal ? "FILES_AND_MESSAGES" : "NONE");
   return {
@@ -2066,6 +2132,9 @@ function kohDetectIntent(text = "") {
 
   // FILE_SUMMARY: asking for content/summary of a specific file
   if (/(파일\s*(내용|요약|정리|상세|핵심|안에|뭐야)|자료\s*(내용|요약|정리|상세|기반|핵심|알려줘)|문서\s*(내용|요약|정리|안에|뭐야|뭐였)|보고자료.*요약|자료.*요약해|내용.*알려|내용.*정리|핵심만|자세히\s*알려|보고용.*요약|이\s*자료.*정리|자료.*내용|이\s*내용|이\s*문서|보고\s*내용.*요약|보고\s*된\s*거.*정리|보고된\s*거.*정리|자료\s*기반|파일\s*안에)/.test(n)) return KOH_INTENT.FILE_SUMMARY;
+
+  // BRIEFING_SUMMARY: on-demand briefing from recent shared content
+  if (/(브리핑|내일\s*오전\s*(브리핑|내용|공유)|오늘\s*공유된\s*내용.*브리핑|브리핑\s*(내용|후보|공유|준비)|오늘\s*(브리핑|공유\s*내용\s*정리)|내일\s*(챙겨야|보고)|아침\s*브리핑|오늘\s*아침\s*(정리|공유)|브리핑\s*뭐|내일\s*보고\s*(뭐|준비)|최근\s*공유.*브리핑)/.test(n)) return KOH_INTENT.BRIEFING_SUMMARY;
 
   // FILE_LIST: list of shared files (no specific content required)
   if (/(파일\s*(목록|뭐야|뭐가|어떤|있어|있지|공유됐|공유된|뭐있어|뭐있었|올라온|리스트|정리|올라왔|있었)|자료\s*(목록|뭐야|뭐있어|뭐있었어|있어|있지|공유됐|공유된|올라온|어떤|리스트|올라왔|있었)|공유된\s*(파일|자료|거|것)|저장된\s*(파일|자료)|올라온\s*(자료|문서|파일)|첨부된\s*(자료|파일)|전부\s*(보여|확인|알려)|전체\s*(보여|확인)|자료\s*전부|파일\s*전부|자료.*보여줘|보여줘.*자료|자료\s*뭐|파일\s*뭐|공유됐던\s*(거|것)|방에\s*올라온|최근.*자료.*확인|일주일.*자료)/.test(n)) return KOH_INTENT.FILE_LIST;
@@ -2324,6 +2393,12 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
     return !f.telegram_file_id && (f.source_type === "telegram_export" || f.saved_by === "telegram_export_importer")
       ? "\n원본은 export 자료 기준으로 확인됨. Telegram 재전송은 불가할 수 있음."
       : "";
+  }
+
+  // BRIEFING_SUMMARY: on-demand briefing from recent shared content
+  if (intent === KOH_INTENT.BRIEFING_SUMMARY) {
+    await handleBriefingSummary(env, chatId, text, currentRoomId);
+    return true;
   }
 
   // GENERAL_CHAT: skip file retrieval, answer directly
@@ -3776,11 +3851,71 @@ async function routeSlashCommand(env, message, text, chatId) {
     await handleDebugIntent(env, chatId, t);
     return true;
   }
+  if (/^\/debug_today\b/.test(t)) {
+    await handleDebugToday(env, chatId);
+    return true;
+  }
+  if (/^\/debug_file_ids\b/.test(t)) {
+    await handleDebugFileIds(env, chatId);
+    return true;
+  }
   if (/^\/help\b/.test(t)) {
     await sendMessage(env, chatId, getHelpText());
     return true;
   }
   return false;
+}
+
+async function handleDebugToday(env, chatId) {
+  if (!env.DB) { await sendMessage(env, chatId, "DB 없음"); return; }
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const msgCount = (await env.DB.prepare(
+      `SELECT COUNT(*) AS c FROM messages WHERE created_at >= ?`
+    ).bind(today + " 00:00:00").first())?.c || 0;
+    const fileCount = (await env.DB.prepare(
+      `SELECT COUNT(*) AS c FROM files WHERE created_at >= ?`
+    ).bind(today + " 00:00:00").first())?.c || 0;
+    const fileWithId = (await env.DB.prepare(
+      `SELECT COUNT(*) AS c FROM files WHERE created_at >= ? AND COALESCE(telegram_file_id,'') != ''`
+    ).bind(today + " 00:00:00").first())?.c || 0;
+    const latestMsg = await env.DB.prepare(
+      `SELECT sender_name, SUBSTR(content,1,60) AS content, created_at FROM messages ORDER BY created_at DESC LIMIT 1`
+    ).first();
+    const latestFile = await env.DB.prepare(
+      `SELECT file_name, created_at FROM files ORDER BY created_at DESC LIMIT 1`
+    ).first();
+    await sendMessage(env, chatId,
+      `오늘 적재 현황 (${today})\n` +
+      `- messages: ${msgCount}건\n` +
+      `- files: ${fileCount}건\n` +
+      `- files with telegram_file_id: ${fileWithId}건\n` +
+      `- files missing telegram_file_id: ${fileCount - fileWithId}건\n` +
+      `- latest message: ${latestMsg ? `${latestMsg.sender_name} / ${latestMsg.content} / ${String(latestMsg.created_at || "").slice(0, 16)}` : "없음"}\n` +
+      `- latest file: ${latestFile ? `${latestFile.file_name} / ${String(latestFile.created_at || "").slice(0, 16)}` : "없음"}`
+    );
+  } catch (e) {
+    await sendMessage(env, chatId, `debug_today 오류: ${String(e?.message || e).slice(0, 200)}`);
+  }
+}
+
+async function handleDebugFileIds(env, chatId) {
+  if (!env.DB) { await sendMessage(env, chatId, "DB 없음"); return; }
+  try {
+    const rows = (await env.DB.prepare(
+      `SELECT id, file_name, file_type, telegram_file_id, telegram_file_unique_id, r2_key, room_title, uploader_name, created_at
+       FROM files ORDER BY created_at DESC LIMIT 10`
+    ).all()).results || [];
+    if (!rows.length) { await sendMessage(env, chatId, "최근 파일 없음"); return; }
+    const lines = rows.map(f =>
+      `id=${f.id} ${f.file_name || "(없음)"} | ${f.file_type || "-"}\n` +
+      `  file_id: ${f.telegram_file_id ? "있음" : "없음"} | uniq: ${f.telegram_file_unique_id ? "있음" : "없음"} | r2: ${f.r2_key ? "있음" : "없음"}\n` +
+      `  방: ${f.room_title || "-"} / ${f.uploader_name || "-"} / ${String(f.created_at || "").slice(0, 10)}`
+    );
+    await sendMessage(env, chatId, `최근 파일 ${rows.length}건\n\n${lines.join("\n\n")}`);
+  } catch (e) {
+    await sendMessage(env, chatId, `debug_file_ids 오류: ${String(e?.message || e).slice(0, 200)}`);
+  }
 }
 
 async function summarizeAllRooms(env, userId, { summaryType, days, keyword }) {
@@ -4778,20 +4913,43 @@ async function searchFilesForResend(env, text) {
 }
 
 async function sendFileRow(env, chatId, row) {
-  const document = row._sendTelegramFileId || row.telegram_file_id || "";
-  if (!document) {
-    const room = row.joined_room_title || normalizeRoomTitle(row) || "알 수 없는 방";
-    const actor = row.actor || row.uploader_name || row.sender_name || "공유자 미상";
-    await kohSendHtml(env, chatId, kohFormatThreeLineItem({
-      title: "자료 확인 (원본 전송 불가)",
-      content: "파일은 확인됐지만 telegram_file_id가 없어 원본을 보낼 수 없음.",
-      location: `${room} > ${row.file_name || "파일명 없음"}`,
-      person: actor,
-      date: formatShortDate(row.created_at),
-    }));
+  const fileId = row._sendTelegramFileId || row.telegram_file_id || "";
+  const room = row.joined_room_title || normalizeRoomTitle(row) || "알 수 없는 방";
+  const actor = row.actor || row.uploader_name || row.sender_name || "공유자 미상";
+  const displayName = sanitizeDisplayFileName(row.file_name) || "";
+
+  if (!fileId) {
+    // r2_key fallback TODO — for now inform user clearly
+    const loc = displayName
+      ? `[${room}] &gt; ${escapeHtml(displayName)}`
+      : `[${room}]`;
+    await kohSendHtml(env, chatId,
+      `원본 전송용 file_id가 저장되어 있지 않아 바로 전송할 수 없습니다.\n` +
+      `해당 자료는 위치/요약은 확인되며, 원본은 재업로드 후부터 전송 가능합니다.\n\n` +
+      `· <b>자료 위치</b>: ${loc}\n` +
+      `· <b>공유/전달</b>: <u>${escapeHtml(actor)}</u> / ${formatShortDate(row.created_at)}`
+    );
     return;
   }
-  await sendDocument(env, chatId, document, fileCaption(row));
+
+  const caption = fileCaption(row);
+  const isPhoto = /^image\/|^photo$/i.test(row.file_type || row.mime_type || "") ||
+    /\.(jpg|jpeg|png|gif|webp)$/i.test(row.file_name || "");
+  try {
+    if (isPhoto) {
+      await sendPhoto(env, chatId, fileId, caption);
+    } else {
+      await sendDocument(env, chatId, fileId, caption);
+    }
+  } catch (e) {
+    // If Telegram rejects the file_id (e.g. expired), fall back to info card
+    console.error("sendFileRow Telegram error:", e.message);
+    await kohSendHtml(env, chatId,
+      `파일 전송 중 오류가 발생했습니다. Telegram file_id가 만료되었을 수 있습니다.\n` +
+      `· <b>자료 위치</b>: [${escapeHtml(room)}] &gt; ${escapeHtml(displayName || "파일")}\n` +
+      `· <b>공유/전달</b>: <u>${escapeHtml(actor)}</u> / ${formatShortDate(row.created_at)}`
+    );
+  }
 }
 
 async function handleFileResendSelection(env, message, text) {
@@ -4824,16 +4982,15 @@ async function handleFileResendRequest(env, message, text, chatId) {
     if (env.CONVERSATIONS && message.from?.id) {
       await env.CONVERSATIONS.put(`file_resend_${message.from.id}`, JSON.stringify({ files: candidates, createdAt: new Date().toISOString() }), { expirationTtl: 600 });
     }
-    const lines = candidates.map((f, idx) =>
-      kohFormatThreeLineItem({
-        title: `${idx + 1}. ${f.file_name || "파일명 없음"}`,
-        content: f.summary || f.extracted_text || "요약 없음",
-        location: fileLocation(f),
-        person: f.actor || f.uploader_name || f.sender_name || "공유자 미상",
-        date: formatShortDate(f.created_at),
-      })
-    );
-    await kohSendHtml(env, chatId, `${prefix}자료 후보 ${candidates.length}건입니다.\n\n${lines.join("\n\n")}\n\n원하는 번호를 입력해주세요.`);
+    const lines = candidates.map((f, idx) => {
+      const room = escapeHtml(f._resolvedRoom || normalizeRoomTitle(f) || "알 수 없는 방");
+      const actor = escapeHtml(f.actor || f.uploader_name || f.sender_name || "공유자 미상");
+      const date = formatShortDate(f.created_at);
+      const displayName = sanitizeDisplayFileName(f.file_name) || "(파일명 없음)";
+      const sendable = f.telegram_file_id ? "전송 가능" : "전송 불가";
+      return `${idx + 1}. ${escapeHtml(displayName)} — [${room}] / <u>${actor}</u> / ${date} / ${sendable}`;
+    });
+    await kohSendHtml(env, chatId, `${prefix}관련 원본 후보 ${candidates.length}건입니다. 보낼 번호를 선택해주세요.\n\n${lines.join("\n")}`);
     return true;
   }
   if (result.messages.length) {
@@ -6105,9 +6262,48 @@ async function updateFileStructure(env, fileId, structured) {
   }
 }
 
+function extractTelegramFileMeta(message) {
+  if (!message) return null;
+  if (message.document) {
+    return {
+      kind: "document",
+      telegram_file_id: message.document.file_id || null,
+      telegram_file_unique_id: message.document.file_unique_id || null,
+      file_name: message.document.file_name || "document",
+      mime_type: message.document.mime_type || "application/octet-stream",
+      file_size: message.document.file_size || 0,
+    };
+  }
+  if (Array.isArray(message.photo) && message.photo.length) {
+    const p = message.photo[message.photo.length - 1]; // largest resolution
+    return {
+      kind: "photo",
+      telegram_file_id: p.file_id || null,
+      telegram_file_unique_id: p.file_unique_id || null,
+      file_name: `image_${message.message_id || Date.now()}.jpg`,
+      mime_type: "image/jpeg",
+      file_size: p.file_size || 0,
+    };
+  }
+  if (message.video) {
+    return {
+      kind: "video",
+      telegram_file_id: message.video.file_id || null,
+      telegram_file_unique_id: message.video.file_unique_id || null,
+      file_name: message.video.file_name || `video_${message.message_id || Date.now()}.mp4`,
+      mime_type: message.video.mime_type || "video/mp4",
+      file_size: message.video.file_size || 0,
+    };
+  }
+  return null;
+}
+
 async function persistIncomingFile(env, message) {
-  if (!env.DB || !message?.document || message.from?.is_bot || message._filePersisted) return;
-  if (!isSupportedDocument(message)) return;
+  if (!env.DB || message.from?.is_bot || message._filePersisted) return;
+  const meta = extractTelegramFileMeta(message);
+  if (!meta) return;
+  // Documents: require isSupportedDocument check; photos/videos: always persist
+  if (meta.kind === "document" && !isSupportedDocument(message)) return;
   try {
     const room = resolveFileRoomInfo(message);
     if (room.sourceType === "telegram_group") {
@@ -6116,33 +6312,33 @@ async function persistIncomingFile(env, message) {
     const canonicalName = await getCanonicalUserName(env, message.from);
 
     await dbSaveFile(env, {
-      telegram_file_id: message.document.file_id || "",
-      telegram_file_unique_id: message.document.file_unique_id || "",
+      telegram_file_id: meta.telegram_file_id || "",
+      telegram_file_unique_id: meta.telegram_file_unique_id || "",
       roomId: room.roomId,
       roomTitle: room.roomTitle,
       senderId: message.from?.id || "",
       senderName: canonicalName,
       uploaderId: message.from?.id || "",
       uploaderName: canonicalName,
-      fileName: message.document.file_name || "document",
-      fileType: getDocumentFileType(message.document.file_name || "", message.document.mime_type || ""),
-      mimeType: message.document.mime_type || "",
-      fileSize: message.document.file_size || 0,
+      fileName: meta.file_name,
+      fileType: meta.kind,
+      mimeType: meta.mime_type,
+      fileSize: meta.file_size,
       sourceType: room.sourceType,
       extracted_text: "",
-      summary: "분석 중...",
-      tags: ["document", ...room.tags],
+      summary: meta.kind === "photo" ? "" : "분석 중...",
+      tags: [meta.kind, ...room.tags],
     }, { throwOnError: true });
     message._filePersisted = true;
 
     // 캡션이 있으면 비동기로 내용 분석
     const caption = message.caption || "";
-    if (caption.length >= 20) {
+    if (caption.length >= 20 && meta.kind === "document") {
       const saved = await env.DB.prepare(`
         SELECT id FROM files
         WHERE telegram_file_unique_id = ?
         ORDER BY id DESC LIMIT 1
-      `).bind(message.document.file_unique_id || "").first();
+      `).bind(meta.telegram_file_unique_id || "").first();
 
       if (saved?.id) {
         analyzeAndStructureFile(env, saved.id, caption).then((structured) => {
@@ -6674,7 +6870,12 @@ async function handleUserMessage(userId, chatId, text, sendReply, env, userName 
   } catch (e) {
     console.error("handleUserMessage error:", e);
     if (sendReply) {
-      await sendMessage(env, chatId, `❌ 오류 발생\n${e.message}`);
+      const msg = String(e?.message || "");
+      const isProviderError = msg.includes("provider_not_initialize") || msg.includes("credentials is not initialized");
+      await sendMessage(env, chatId, isProviderError
+        ? "현재 AI 요약 모델 연결이 불안정합니다. 잠시 후 다시 시도해주세요."
+        : "응답 생성 중 오류가 발생했습니다. 다시 시도해주세요."
+      );
     }
   }
 }
@@ -7486,6 +7687,41 @@ async function sendDocument(env, chatId, document, caption = "") {
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.ok === false) throw new Error(data.description || `sendDocument failed: ${res.status}`);
   return data;
+}
+
+async function sendPhoto(env, chatId, photo, caption = "") {
+  const body = {
+    chat_id: chatId,
+    photo,
+    caption: String(caption || "").slice(0, 1000),
+    parse_mode: "HTML",
+  };
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok === false) throw new Error(data.description || `sendPhoto failed: ${res.status}`);
+  return data;
+}
+
+async function safeDifyCall(env, params) {
+  try {
+    return await difyChat(env, params);
+  } catch (e) {
+    const msg = String(e?.message || e || "");
+    if (
+      msg.includes("provider_not_initialize") ||
+      msg.includes("credentials is not initialized") ||
+      msg.includes("Model") && msg.includes("not initialized")
+    ) {
+      console.warn("LLM_PROVIDER_NOT_INITIALIZED:", msg.slice(0, 200));
+      return null;
+    }
+    console.warn("LLM_CALL_FAILED:", msg.slice(0, 200));
+    return null;
+  }
 }
 
 function stripMarkdown(text) {
