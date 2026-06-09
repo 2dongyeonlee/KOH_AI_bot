@@ -50,7 +50,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-general-chat-hard-guard-20260609-0630";
+const BUILD_VERSION = "koh-current-reply-summary-6r-issuecard-20260609-0700";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -696,7 +696,246 @@ function isBotGeneratedSummary(text, senderName = "") {
   if (t.includes("📌 [") && t.includes("· 위치:")) return true;
   if (t.includes("· 공유자:") && t.includes("· 핵심")) return true;
   if (t.includes("관련 파일은 아래와 같습니다")) return true;
+  if (t.includes("📌") && t.includes("자료 위치:")) return true;
+  if (t.includes("공유/전달:") && t.includes("📌")) return true;
+  if (/저장된 파일\s*\d+건입니다/.test(t)) return true;
   return false;
+}
+
+// ── 현재 입력 번들 추출 ────────────────────────────────────────────────────
+function getCurrentInputBundle(message) {
+  const bundle = { type: null, text: "", meta: {} };
+  if (!message) return bundle;
+
+  const reply = message.reply_to_message;
+  const forward = message.forward_origin || message.forward_from;
+  const text = message.text || message.caption || "";
+
+  if (reply) {
+    bundle.type = "reply";
+    bundle.text = reply.text || reply.caption || "";
+    bundle.meta.sharedBy = reply.from ? (reply.from.first_name || "") + (reply.from.last_name ? " " + reply.from.last_name : "") : "";
+    bundle.meta.messageId = reply.message_id;
+    bundle.meta.date = reply.date ? new Date(reply.date * 1000).toISOString() : "";
+    return bundle;
+  }
+
+  if (forward) {
+    bundle.type = "forward";
+    bundle.text = text;
+    if (message.forward_origin) {
+      const origin = message.forward_origin;
+      if (origin.type === "user" && origin.sender_user) {
+        bundle.meta.originalAuthor = (origin.sender_user.first_name || "") + (origin.sender_user.last_name ? " " + origin.sender_user.last_name : "");
+      } else if (origin.type === "channel" && origin.chat) {
+        bundle.meta.originalAuthor = origin.chat.title || "";
+      } else if (origin.type === "hidden_user") {
+        bundle.meta.originalAuthor = origin.sender_user_name || "알 수 없음";
+      }
+    }
+    return bundle;
+  }
+
+  if (text && text.length > 30) {
+    bundle.type = "direct";
+    bundle.text = text;
+    return bundle;
+  }
+
+  return bundle;
+}
+
+function hasCurrentContentForSummary(message, cleanedQuery = "") {
+  if (!message) return false;
+  if (message.reply_to_message) {
+    const rt = message.reply_to_message.text || message.reply_to_message.caption || "";
+    if (rt.trim().length > 20) return true;
+  }
+  if (message.forward_origin || message.forward_from) {
+    const ft = message.text || message.caption || "";
+    if (ft.trim().length > 10) return true;
+  }
+  return false;
+}
+
+function formatShortDate(isoOrUnix) {
+  if (!isoOrUnix) return "";
+  let d;
+  if (typeof isoOrUnix === "number") d = new Date(isoOrUnix * 1000);
+  else d = new Date(isoOrUnix);
+  if (isNaN(d.getTime())) return "";
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+function cleanOneLine(text = "") {
+  return String(text || "")
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function cleanTitle(text = "") {
+  return cleanOneLine(text)
+    .replace(/^[\s\-·•:：]+/, "")
+    .slice(0, 40);
+}
+
+function escapeHtml(text = "") {
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function extractScheduleFromText(text = "") {
+  const patterns = [
+    /(\d{1,2}월\s*\d{1,2}일[^\n,。.]{0,30})/g,
+    /(\d{4}[-\/]\d{1,2}[-\/]\d{1,2}[^\n,。.]{0,20})/g,
+    /(오늘|내일|모레|이번\s*주|다음\s*주)[^\n,。.]{0,20}/g,
+    /(마감|데드라인|제출|발표|보고)[^\n,。.]{0,20}/g,
+  ];
+  const found = [];
+  for (const p of patterns) {
+    let m;
+    while ((m = p.exec(text)) !== null) {
+      const s = m[1] || m[0];
+      if (s) found.push(cleanOneLine(s).slice(0, 30));
+      if (found.length >= 2) break;
+    }
+    if (found.length >= 2) break;
+  }
+  return found.length ? found[0] : "";
+}
+
+function inferSixRByRule(text = "") {
+  if (!text) return "";
+  const t = text.toLowerCase();
+  if (/(위기|사고|긴급|리콜|클레임|민원|대응|사과)/.test(t)) return "CR";
+  if (/(정부|규제|법령|국회|정책|허가|승인|공문|행정)/.test(t)) return "GR";
+  if (/(노조|노사|인사|채용|징계|직원|인력|조합)/.test(t)) return "PR";
+  if (/(투자자|주주|ir|공시|실적|재무|배당)/.test(t)) return "IR";
+  if (/(미디어|기자|언론|보도|인터뷰|취재|기사)/.test(t)) return "ER";
+  if (/(전략|사업|계획|목표|성과|추진|협력|파트너)/.test(t)) return "BR";
+  return "";
+}
+
+function extractActionItemsByRule(text = "") {
+  const lines = text.split(/\n/).map(l => l.trim()).filter(Boolean);
+  const actions = [];
+  const actionPatterns = [
+    /^[-·•]\s*(.+(?:해야|할 것|검토|확인|제출|보고|전달|조치|결정)[^.。\n]*)/,
+    /^(\d+[.)]\s*.+(?:해야|할 것|검토|확인|제출|보고|전달)[^.。\n]*)/,
+    /(.+(?:요청|지시|지시사항|담당|책임자)[^.。\n]*(?:해야|할 것|필요))/,
+  ];
+  for (const line of lines) {
+    for (const p of actionPatterns) {
+      const m = p.exec(line);
+      if (m) {
+        actions.push(cleanOneLine(m[1] || m[0]).slice(0, 60));
+        break;
+      }
+    }
+    if (actions.length >= 3) break;
+  }
+  return actions;
+}
+
+async function summarizeCurrentContent(env, text, userId) {
+  if (!text || text.trim().length < 20) return text;
+  const prompt = `다음 내용을 핵심만 2~3줄로 요약하라. 사실만, 추정 금지, 원문 문장 그대로 복붙 금지.\n\n${text.slice(0, 3000)}`;
+  try {
+    const r = await difyChat(env, { query: prompt, user: userId || "koh", conversationId: "" });
+    return (r.answer || "").trim();
+  } catch (e) {
+    return text.slice(0, 200);
+  }
+}
+
+async function generateSmartIssueTitle(env, text, userId) {
+  if (!text || text.trim().length < 10) return "";
+  const prompt = `다음 내용을 보고 업무 안건 제목을 10~25자로 직접 작성하라. 파일명·응답 문장 금지. 내용 기반으로만 작성.\n\n내용: ${text.slice(0, 800)}\n\n제목만 출력:`;
+  try {
+    const r = await difyChat(env, { query: prompt, user: userId || "koh", conversationId: "" });
+    return cleanTitle(r.answer || "");
+  } catch (e) {
+    return "";
+  }
+}
+
+async function extractActionItemsFromText(env, text, userId) {
+  const rulebased = extractActionItemsByRule(text);
+  if (rulebased.length > 0) return rulebased;
+  const prompt = `다음 내용에서 즉각 조치·확인이 필요한 액션아이템만 최대 3개 추출. 없으면 빈 줄만. 항목당 한 줄.\n\n${text.slice(0, 2000)}`;
+  try {
+    const r = await difyChat(env, { query: prompt, user: userId || "koh", conversationId: "" });
+    return (r.answer || "").split("\n").map(l => l.trim()).filter(l => l.length > 3).slice(0, 3);
+  } catch (e) {
+    return [];
+  }
+}
+
+async function buildIssueCardFromCurrentText(env, bundle, query, userId) {
+  const rawText = bundle.text;
+  if (!rawText || rawText.trim().length < 20) return null;
+
+  const sixR = inferSixRByRule(rawText);
+  const category = sixR ? `[${sixR}]` : "";
+  const title = await generateSmartIssueTitle(env, rawText, userId);
+  if (!title) return null;
+
+  const summary = await summarizeCurrentContent(env, rawText, userId);
+  const schedule = extractScheduleFromText(rawText);
+  const actions = await extractActionItemsFromText(env, rawText, userId);
+
+  const actor = bundle.meta.sharedBy || bundle.meta.originalAuthor || "";
+  const dateStr = formatShortDate(bundle.meta.date);
+
+  return { category, title, summary, schedule, actions, actor, dateStr, sixR };
+}
+
+function formatIssueCard(card) {
+  if (!card) return "";
+  const lines = [];
+  const heading = card.category ? `📌 ${card.category} ${escapeHtml(card.title)}` : `📌 ${escapeHtml(card.title)}`;
+  lines.push(heading);
+  if (card.summary) {
+    const summaryLines = card.summary.split(/\n/).map(l => l.trim()).filter(Boolean);
+    for (const sl of summaryLines.slice(0, 3)) {
+      lines.push(`· ${escapeHtml(sl)}`);
+    }
+  }
+  if (card.actor) {
+    const dateTag = card.dateStr ? ` (${card.dateStr})` : "";
+    lines.push(`· 공유/전달: <u>${escapeHtml(card.actor)}</u>${dateTag}`);
+  }
+  if (card.schedule) {
+    lines.push(`⚡ 마감/일정: ${escapeHtml(card.schedule)}`);
+  }
+  if (card.actions && card.actions.length > 0) {
+    lines.push(`\n▸ 액션아이템`);
+    for (const a of card.actions) {
+      lines.push(`  · ${escapeHtml(a)}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+async function handleCurrentContentSummary(env, message, query, chatId, userId) {
+  const bundle = getCurrentInputBundle(message);
+  if (!bundle.text || bundle.text.trim().length < 20) {
+    await sendMessage(env, chatId, "요약할 내용이 없습니다. 메시지를 답장하거나 전달해주세요.");
+    return true;
+  }
+
+  const card = await buildIssueCardFromCurrentText(env, bundle, query, userId);
+  if (card) {
+    const formatted = formatIssueCard(card);
+    await kohSendHtml(env, chatId, formatted);
+  } else {
+    const summary = await summarizeCurrentContent(env, bundle.text, userId);
+    await sendMessage(env, chatId, summary || "요약 결과를 생성할 수 없습니다.");
+  }
+  return true;
 }
 
 function kohIsFileSendRequest(text = "") {
@@ -1554,14 +1793,20 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
     if (aiResult) {
       await sendMessage(env, chatId, `최근 공유 자료 ${items.length}건\n\n${aiResult}`);
     } else {
-      const body = items.map((f, i) => kohFormatThreeLineItem({
-        title: `${i + 1}. ${inferTitle(f)}`,
-        content: String(f.summary || f.content || "내용 없음").replace(/Telegram export file[^\n]*/g, "").trim().slice(0, 200),
-        location: `${f._resolvedRoom}`,
-        person: f._resolvedName,
-        date: kohFormatDate(f.created_at),
-      })).join("\n\n");
-      await kohSendHtml(env, chatId, `<b>저장된 파일 ${items.length}건입니다.</b>\n\n${body}`);
+      const body = items.map((f, i) => {
+        const card = {
+          category: "",
+          title: `${i + 1}. ${inferTitle(f)}`,
+          summary: String(f.summary || f.content || "내용 없음").replace(/Telegram export file[^\n]*/g, "").trim().slice(0, 200),
+          actor: f._resolvedName || "",
+          dateStr: kohFormatDate(f.created_at),
+          schedule: "",
+          actions: [],
+          sixR: "",
+        };
+        return formatIssueCard(card);
+      }).join("\n\n");
+      await kohSendHtml(env, chatId, `저장된 파일 ${items.length}건입니다.\n\n${body}`);
     }
     return true;
   }
@@ -5461,6 +5706,15 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
+  // CURRENT_CONTENT: 답장/전달 메시지 요약 우선 처리
+  if (hasCurrentContentForSummary(message, text)) {
+    const summaryTriggers = /요약|정리|안건|이슈|이거|이것|이 내용|이게|뭐야|뭔가|어떤|핵심|간단히|설명/;
+    if (summaryTriggers.test(text) || text.length < 15) {
+      await handleCurrentContentSummary(env, message, text, chatId, userId);
+      return;
+    }
+  }
+
   // internal knowledge: digest/file/priority 앞에서 먼저 처리
   if (kohIsInternalKnowledgeRequest(text)) {
     const handled = await kohHandleInternalKnowledgeRequest(env, chatId, text, "");
@@ -5843,6 +6097,15 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
   if (isGeneralChatQuery(cleanText)) {
     await sendMessage(env, chatId, makeGeneralChatReply(cleanText));
     return;
+  }
+
+  // CURRENT_CONTENT: 답장/전달 메시지 요약 우선 처리
+  if (hasCurrentContentForSummary(message, cleanText)) {
+    const summaryTriggers = /요약|정리|안건|이슈|이거|이것|이 내용|이게|뭐야|뭔가|어떤|핵심|간단히|설명/;
+    if (summaryTriggers.test(cleanText) || cleanText.length < 15) {
+      await handleCurrentContentSummary(env, message, cleanText, chatId, userId);
+      return;
+    }
   }
 
   if (await handleFileResendSelection(env, message, cleanText)) {
