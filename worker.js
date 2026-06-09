@@ -556,7 +556,7 @@ function inferTitle(row) {
     const category = classifyAgenda(raw);
     return generateAgendaTitle(raw, category);
   }
-  if (row.file_name) {
+  if (row.file_name && !/^photo[_@.-]/i.test(row.file_name)) {
     const name = String(row.file_name)
       .replace(/\.[a-zA-Z0-9]{1,6}$/, "")
       .replace(/[@_\-\d]/g, " ")
@@ -1078,7 +1078,7 @@ function groupImageCandidates(candidates) {
     const uploader = c.uploader_id || c.uploader_name || c.sender_name || "";
     const time = new Date(c.created_at || Date.now()).getTime();
     const bucket = c.media_group_id || Math.floor(time / (3 * 60 * 1000));
-    const key = `${room}:${uploader}:${bucket}`;
+    const key = c.media_group_key ? `mgk:${c.media_group_key}` : `${room}:${uploader}:${bucket}`;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(c);
   }
@@ -1103,13 +1103,15 @@ async function buildIssueCardFromImageGroup(rows, env) {
     action_items: [],
     source_type: "image_group",
     image_count: rows.length,
-    source_room: first.room_title || "",
+    source_room: first.original_room || first.room_title || "",
+    original_room: first.original_room || "",
     source_file: "",
     display_file_name: `이미지 ${rows.length}장`,
     telegram_file_id: first.telegram_file_id || "",
     can_send_original: rows.some(r => r.telegram_file_id || r.r2_key),
-    shared_by: first.uploader_name || first.sender_name || "",
-    uploader: first.uploader_name || first.sender_name || "",
+    from_name: first.from_name || first.sender_name || "",
+    shared_by: first.from_name || first.sender_name || "미확인",
+    uploader: first.from_name || first.sender_name || "미확인",
     date: typeof formatShortDateFromValue === "function" ? formatShortDateFromValue(first.created_at) : "",
   };
 }
@@ -1354,11 +1356,11 @@ function cleanReportSummary(text = "", card = {}) {
 }
 
 function formatReportSourceLocation(card = {}) {
-  const roomName = card.source_room || card.room_title || card.source || "알 수 없는 방";
+  const roomName = card.original_room || card.source_room || card.room_title || card.source || "알 수 없는 방";
   const room = `[${escapeHtml(roomName)}]`;
   const actor = card.mixed_actors
     ? "여러 명"
-    : (card.source_actor || card.from_name || card.sender_name || card.shared_by || card.actor || card.uploader || card._resolvedName || "공유자 확인 필요");
+    : (card.from_name || card.sender_name || "미확인");
   const date = card.date || card.dateStr || formatShortDateFromValue(card.created_at || "");
   const imageCount = Number(card.image_count || (card.source_type === "image" ? 1 : 0));
   if (imageCount > 0 || card.source_type === "image_group" || card.source_type === "image") {
@@ -1746,15 +1748,17 @@ async function buildIssueCardFromCandidate(candidate, env) {
     six_r: sixRArr,
     action_items,
     source_type: isImage ? "image" : (candidate.source_type || "file"),
-    source_room: candidate._resolvedRoom || candidate.room_title || candidate.resolved_room_title || candidate.source || "",
+    source_room: candidate.original_room || candidate._resolvedRoom || candidate.room_title || candidate.resolved_room_title || candidate.source || "",
+    original_room: candidate.original_room || "",
     source_file: candidate.file_name || "",
     display_file_name: isImage ? "이미지 1장" : (typeof sanitizeDisplayFileName === "function" ? sanitizeDisplayFileName(candidate.file_name || "") : candidate.file_name || ""),
     telegram_file_id: candidate.telegram_file_id || "",
     can_send_original: !!(candidate.telegram_file_id || candidate.r2_key),
     original_author: candidate.original_author || "",
-    shared_by: candidate.shared_by || candidate._resolvedName || candidate.uploader_name || candidate.sender_name || "",
-    uploader: candidate._resolvedName || candidate.uploader_name || candidate.sender_name || "",
-    actor: candidate._resolvedName || candidate.uploader_name || candidate.sender_name || "",
+    from_name: candidate.from_name || candidate.sender_name || "",
+    shared_by: candidate.from_name || candidate.sender_name || "미확인",
+    uploader: candidate.from_name || candidate.sender_name || "미확인",
+    actor: candidate.from_name || candidate.sender_name || "미확인",
     date: formatShortDateFromValue(candidate.created_at || candidate.date),
     relevance_score: candidate._score || candidate.relevance_score || 0,
   };
@@ -2246,7 +2250,9 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
       '' AS r2_key,
       f.created_at,
       ${hasFileStatus ? "f.source_status" : "'legacy'"} AS source_status,
-      ${hasFileStatus ? "COALESCE(f.original_room, '')" : "''"} AS original_room
+      ${hasFileStatus ? "COALESCE(f.original_room, '')" : "''"} AS original_room,
+      ${hasFileStatus ? "COALESCE(f.from_name, '')" : "''"} AS from_name,
+      ${hasFileStatus ? "COALESCE(f.media_group_key, '')" : "''"} AS media_group_key
     FROM files f
     LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(f.room_id AS TEXT)
     WHERE 1=1
@@ -2274,7 +2280,9 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
       m.content,
       m.created_at,
       ${hasMsgStatus ? "m.source_status" : "'legacy'"} AS source_status,
-      ${hasMsgStatus ? "COALESCE(m.original_room, '')" : "''"} AS original_room
+      ${hasMsgStatus ? "COALESCE(m.original_room, '')" : "''"} AS original_room,
+      ${hasMsgStatus ? "COALESCE(m.from_name, '')" : "''"} AS from_name,
+      ${hasMsgStatus ? "COALESCE(m.media_group_key, '')" : "''"} AS media_group_key
     FROM messages m
     LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(m.room_id AS TEXT)
     WHERE m.created_at >= ?
@@ -2643,7 +2651,10 @@ function kohDedupFiles(files) {
     const baseName = String(f.file_name || "").toLowerCase().replace(/\s+/g, " ").trim();
     const day = String(f.created_at || "").slice(0, 10);
     const size = Number(f.file_size || 0) || 0;
-    const key = f.telegram_file_unique_id
+    const mgk = String(f.media_group_key || "").trim();
+    const key = mgk
+      ? `mgk:${mgk}`
+      : f.telegram_file_unique_id
       ? `uniq:${f.telegram_file_unique_id}`
       : f.telegram_file_id
       ? `tg:${f.telegram_file_id}`
