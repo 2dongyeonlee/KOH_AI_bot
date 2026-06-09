@@ -400,11 +400,62 @@ function processRoom(dbName, room, messageCols, fileCols, dryRun) {
   return { scanned: messages.length, messages: importedMessages, files: importedFiles, photos: importedPhotos, skippedMessages, skippedFiles, failedMessages: 0, failedFiles: 0 };
 }
 
+function fixOriginalRoom(dbName, dryRun) {
+  console.log("=== Fix original_room from source_path ===");
+  const out = runWrangler(dbName, ["--command",
+    "SELECT DISTINCT source_path, original_room FROM messages WHERE source_type = 'telegram_export' AND source_path LIKE '%result.json';",
+    "--json"]);
+  const rows = parseRows(out);
+  if (!rows.length) {
+    console.log("No telegram_export messages with result.json source_path found.");
+    return;
+  }
+  const corrections = [];
+  for (const row of rows) {
+    const correctRoom = path.basename(path.dirname(row.source_path));
+    if (correctRoom && correctRoom !== "." && correctRoom !== row.original_room) {
+      corrections.push({ sourcePath: row.source_path, wrongRoom: row.original_room, correctRoom });
+    }
+  }
+  if (!corrections.length) {
+    console.log("All original_room values are already correct.");
+    return;
+  }
+  console.log(`Corrections needed: ${corrections.length} room(s)`);
+  corrections.forEach((c) => console.log(`  "${c.wrongRoom}" → "${c.correctRoom}"`));
+
+  const msgStatements = corrections.map((c) =>
+    `UPDATE messages SET original_room = ${sql(c.correctRoom)} WHERE source_type = 'telegram_export' AND original_room = ${sql(c.wrongRoom)} AND source_path = ${sql(c.sourcePath)};`
+  );
+  const fileStatements = corrections.map((c) =>
+    `UPDATE files SET original_room = ${sql(c.correctRoom)} WHERE source_type = 'telegram_export' AND original_room = ${sql(c.wrongRoom)} AND room_id IN (SELECT DISTINCT room_id FROM messages WHERE source_type = 'telegram_export' AND original_room = ${sql(c.correctRoom)});`
+  );
+
+  if (dryRun) {
+    [...msgStatements, ...fileStatements].forEach((s) => console.log(`[DRY-RUN] ${s}`));
+    return;
+  }
+  execSqlFile(dbName, msgStatements);
+  console.log(`Messages updated: ${corrections.length} room(s)`);
+  execSqlFile(dbName, fileStatements);
+  console.log(`Files updated: ${corrections.length} room(s)`);
+  console.log("=== Done ===");
+}
+
 function main() {
   const args = parseArgs(process.argv);
+
+  if (args["fix-original-room"]) {
+    const dryRun = !!args["dry-run"];
+    const dbName = args.db || readWranglerDbName();
+    fixOriginalRoom(dbName, dryRun);
+    return;
+  }
+
   const inputPath = args.path || args.positional[0];
   if (!inputPath) {
     console.error("usage: node scripts/ingest_export.js --path <result.json-or-export-root> [--remote] [--dry-run] [--db 6r-ai-db]");
+    console.error("       node scripts/ingest_export.js --fix-original-room [--dry-run] [--db 6r-ai-db]");
     process.exit(1);
   }
 

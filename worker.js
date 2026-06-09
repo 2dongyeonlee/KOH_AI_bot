@@ -50,7 +50,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-export-schema-ingest-remote-fix";
+const BUILD_VERSION = "koh-cpu-limit-fix-lightweight-20260609";
 
 function readBoolEnv(env, key, defaultValue = false) {
   const val = String(env[key] || "").trim().toLowerCase();
@@ -2198,14 +2198,14 @@ async function kohSendDocument(env, chatId, file, caption = "") {
 }
 
 // fileDays: number of days back to look (null = no date limit)
-async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRoomOnly = false, fileDays = 30, roomAliasTitle = "") {
-  // Compute dates in JS for reliable D1 compatibility
-  const fileSince = fileDays !== null
-    ? new Date(Date.now() - Number(fileDays) * 86400000).toISOString().slice(0, 19).replace("T", " ")
-    : null;
-  const msgSince = new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 19).replace("T", " ");
+async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRoomOnly = false, fileDays = 7, roomAliasTitle = "") {
+  // null 또는 90일 초과는 cap — unbounded scan 금지
+  const cappedDays = (fileDays === null || Number(fileDays) > 90) ? 90 : Number(fileDays);
+  const fileSince = new Date(Date.now() - cappedDays * 86400000).toISOString().slice(0, 19).replace("T", " ");
+  const msgDays   = Math.min(cappedDays, 14);
+  const msgSince  = new Date(Date.now() - msgDays * 86400000).toISOString().slice(0, 19).replace("T", " ");
 
-  const fileDateFilter = fileSince ? "AND f.created_at >= ?" : "";
+  const fileDateFilter = "AND f.created_at >= ?";
   const roomFilter = currentRoomOnly && currentRoomId ? "AND CAST(f.room_id AS TEXT) = ?" : "";
   const msgRoomFilter = currentRoomOnly && currentRoomId ? "AND CAST(m.room_id AS TEXT) = ?" : "";
 
@@ -2253,7 +2253,7 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
       ${fileDateFilter}
       ${roomFilter}
     ORDER BY ${fileOrderBy}
-    LIMIT 200
+    LIMIT 50
   `;
 
   const msgSql = `
@@ -2284,12 +2284,11 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
       AND m.content NOT LIKE '%@KOH_AI_bot%'
       ${msgRoomFilter}
     ORDER BY ${msgOrderBy}
-    LIMIT 300
+    LIMIT 100
   `;
 
-  // Build bind arrays
-  const fileParams = [];
-  if (fileSince) fileParams.push(fileSince);
+  // Build bind arrays (fileSince always present — no unbounded scan)
+  const fileParams = [fileSince];
   if (currentRoomOnly && currentRoomId) fileParams.push(String(currentRoomId));
 
   const msgParams = [msgSince];
@@ -2299,7 +2298,7 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
   const msgStmt  = env.DB.prepare(msgSql);
 
   const [fileRes, msgRes] = await Promise.all([
-    fileParams.length ? fileStmt.bind(...fileParams).all() : fileStmt.all(),
+    fileStmt.bind(...fileParams).all(),
     msgStmt.bind(...msgParams).all(),
   ]);
 
@@ -2798,8 +2797,8 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
     return true;
   }
 
-  // Initial fetch: 30-day window (or 7-day for FILE_LIST)
-  const initDays = (intent === KOH_INTENT.FILE_LIST && !hasTerms) ? 7 : 30;
+  // Initial fetch: 14-day window (or 7-day for FILE_LIST)
+  const initDays = (intent === KOH_INTENT.FILE_LIST && !hasTerms) ? 7 : 14;
   const { files: rawFiles, messages } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, initDays, roomAliasTitle);
   const files = kohDedupFiles(rawFiles);
 
@@ -2816,38 +2815,10 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
   // PRIORITY: delegate to existing handler
   if (intent === KOH_INTENT.PRIORITY) return false;
 
-  // Low confidence intent — ask user what they mean
+  // Low confidence intent — ask user what they mean (no LLM call to stay within CPU limit)
   if (intent === null) {
-    try {
-      const rows = await fetchDigestRows(env, 7, 150);
-      const corpus = rows.slice(0, 150).map((r) => {
-        const time = (r.created_at || "").slice(0, 16);
-        const room = r.source || "알 수 없는 방";
-        const fname = r.file_name ? ` [파일: ${r.file_name}]` : "";
-        const txt = String(r.text || "").replace(/Telegram export file[^\n]*/g, "").trim().slice(0, 250);
-        return `[${room}] (${time}) ${r.actor || ""}${fname}: ${txt}`;
-      }).join("\n");
-
-      const query =
-        TONE_RULE + SUMMARY_RULE +
-        `당신은 권오혁 담당의 AI 비서입니다.\n` +
-        `아래는 최근 7일간 팀 전체 방에서 공유된 자료와 대화입니다.\n\n` +
-        `[팀 자료]\n${corpus.slice(0, 7000)}\n\n` +
-        `[요청]\n${text}\n\n` +
-        `위 자료를 참고해서 요청에 답해줘.\n` +
-        `반드시 위 SUMMARY_RULE 형식으로 안건별 정리.\n` +
-        `"메뉴 선택" 안내 절대 금지.`;
-
-      const result = await difyChat(env, { query, user: "koh", conversationId: "" });
-      if (result.answer) {
-        await kohSendHtml(env, chatId, result.answer);
-        return true;
-      }
-    } catch (e) {
-      console.error("intent null fallback:", e);
-    }
     await kohSendHtml(env, chatId,
-      `질문을 이해하지 못했습니다.\n\n예시:\n· "이번주 공유된 자료 정리해줘"\n· "오늘 챙겨야 할 안건 뭐야"\n· "방별로 안건 정리해줘"`
+      `좀 더 구체적으로 알려주시면 도와드릴게요.\n\n예시:\n· "이번주 공유된 자료 정리해줘"\n· "오늘 챙겨야 할 안건 뭐야"\n· "방별로 안건 정리해줘"`
     );
     return true;
   }
@@ -2855,12 +2826,8 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
   // ── FILE_LIST → handleRecentMaterialBrief (IssueCard only, no raw output) ───
   if (intent === KOH_INTENT.FILE_LIST) {
     if (!scoredFiles.length && !hasTerms) {
-      const { files: f14r } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, 14, roomAliasTitle);
-      scoredFiles = scoreFiles(kohDedupFiles(f14r));
-    }
-    if (!scoredFiles.length) {
-      const { files: fAllR } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, null, roomAliasTitle);
-      scoredFiles = scoreFiles(kohDedupFiles(fAllR));
+      const { files: f30r } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, 30, roomAliasTitle);
+      scoredFiles = scoreFiles(kohDedupFiles(f30r));
     }
 
     if (!scoredFiles.length) {
@@ -2868,7 +2835,7 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
       return true;
     }
 
-    const display = scoredFiles.slice(0, 10);
+    const display = scoredFiles.slice(0, 5);
     const allItems = await kohResolveItems(env, display, "uploader_id", "uploader_name");
 
     await handleRecentMaterialBrief(allItems, chatId, env);
@@ -7965,9 +7932,16 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     return;
   }
 
-  // 일반 응답 — DB 자료 참고해서 SUMMARY_RULE 형식으로 답변
+  // 짧거나 모호한 쿼리 — LLM 호출 없이 안내
+  const _isAmbiguous = cleanText.length < 12 || /^(오늘|내일|이번주|최근)\s*(뭐|어때|있어|확인하면|뭘|해야)\b/.test(cleanText);
+  if (_isAmbiguous) {
+    await sendMessage(env, chatId, "좀 더 구체적으로 알려주시면 도와드릴게요.");
+    return;
+  }
+
+  // 일반 응답 — DB 자료 참고해서 SUMMARY_RULE 형식으로 답변 (3일/30행 경량 코퍼스)
   try {
-    const rows = await fetchDigestRows(env, 7, 100);
+    const rows = await fetchDigestRows(env, 3, 30);
     const corpus = rows.map((r) => {
       const room = r.source || "알 수 없는 방";
       const time = (r.created_at || "").slice(0, 16);
