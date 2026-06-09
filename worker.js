@@ -3512,12 +3512,6 @@ async function fetchNewsRaw(env, keyword) {
   }
 }
 
-function formatShortDate(value) {
-  const text = String(value || "");
-  const m = text.match(/^\d{4}-(\d{2})-(\d{2})/);
-  return m ? `${m[1]}/${m[2]}` : "";
-}
-
 function normalizeRoomTitle(row, titleKey = "room_title", joinedKey = "joined_room_title") {
   const roomId = Number(row?.room_id);
   const joined = String(row?.[joinedKey] || "").trim();
@@ -6999,13 +6993,6 @@ async function tgGetFile(env, fileId) {
   );
   const data = await res.json();
   return data.result;
-}
-
-function escapeHtml(value) {
-  return String(value || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
 }
 
 function sanitizeTelegramHtml(value) {
