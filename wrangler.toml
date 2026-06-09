@@ -1,9 +1,21 @@
 name = "koh-ai-bot"
 main = "worker.js"
 compatibility_date = "2024-11-01"
+keep_vars = true
+
+# Secrets (set via `wrangler secret put`, never commit values here):
+#   TELEGRAM_BOT_TOKEN, DIFY_API_KEY, TAVILY_API_KEY,
+#   ADMIN_TELEGRAM_ID, ADMIN_CHAT_ID, DAILY_BRIEFING_CHAT_ID,
+#   DYLEE_CHAT_ID, GEMINI_API_KEY
 
 [vars]
 DIFY_API_URL = "https://api.dify.ai/v1"
+EXTERNAL_SEARCH_ENABLED = "true"
+ENABLE_ADVANCED_PARSER = "true"
+ENABLE_IMAGE_INGEST = "true"
+ENABLE_RAG_CHUNKING = "false"
+ENABLE_VECTOR_SEARCH = "false"
+KST_TIMEZONE = "Asia/Seoul"
 
 [triggers]
 crons = ["0 23 * * *"]

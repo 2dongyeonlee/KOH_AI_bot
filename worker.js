@@ -50,7 +50,25 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-ingest-fileid-send-briefing-fix-20260609-1500";
+const BUILD_VERSION = "koh-v2-component-refactor-20260609-1600";
+
+function readBoolEnv(env, key, defaultValue = false) {
+  const val = String(env[key] || "").trim().toLowerCase();
+  if (val === "true" || val === "1" || val === "yes") return true;
+  if (val === "false" || val === "0" || val === "no") return false;
+  return defaultValue;
+}
+
+function getKstDayRange() {
+  const kstOffset = 9 * 60 * 60 * 1000;
+  const kstNow = new Date(Date.now() + kstOffset);
+  const kstDate = kstNow.toISOString().slice(0, 10); // YYYY-MM-DD in KST
+  const startMs = Date.parse(kstDate + "T00:00:00Z") - kstOffset; // KST 00:00 → UTC
+  const endMs = Date.parse(kstDate + "T23:59:59Z") - kstOffset;   // KST 23:59 → UTC
+  const toIso = (ms) => new Date(ms).toISOString().replace("T", " ").slice(0, 19);
+  return { kstDate, startIso: toIso(startMs), endIso: toIso(endMs) };
+}
+
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -1581,20 +1599,25 @@ async function handleRecentMaterialBrief(items, chatId, env) {
 }
 
 async function handleBriefingSummary(env, chatId, text, currentRoomId = "") {
+  const { kstDate, startIso, endIso } = getKstDayRange();
   const { files: rawFiles, messages: rawMessages } =
     await kohFetchRecentFilesAndMessages(env, String(currentRoomId || ""), false, 2, "");
   const files = kohDedupFiles(rawFiles || []);
   const allItems = await kohResolveItems(env, files, "uploader_id", "uploader_name");
 
   const candidates = allItems
-    .filter(c => !isBotGeneratedOutput(
-      c.summary || c.extracted_text || c.content || c.text || "",
-      c._resolvedName || c.uploader_name || ""
-    ))
+    .filter(c =>
+      !isBotGeneratedOutput(
+        c.summary || c.extracted_text || c.content || c.text || "",
+        c._resolvedName || c.uploader_name || ""
+      ) &&
+      String(c.created_at || "") >= startIso &&
+      String(c.created_at || "") <= endIso
+    )
     .slice(0, 5);
 
   if (!candidates.length) {
-    await kohSendHtml(env, chatId, "최근 2일간 공유된 자료를 찾지 못했습니다.\n오늘 자료가 있으면 /debug_today 로 적재 상태를 확인해주세요.");
+    await kohSendHtml(env, chatId, `오늘(${kstDate} KST) 공유된 자료를 찾지 못했습니다.\n적재 상태 확인: /debug_today`);
     return;
   }
 
@@ -3017,7 +3040,7 @@ async function dbSearch(env, { roomTitle, keyword, days = 7 }) {
 }
 
 function isExternalSearchEnabled(env) {
-  return String(env.EXTERNAL_SEARCH_ENABLED || "").trim().toLowerCase() === "true";
+  return readBoolEnv(env, "EXTERNAL_SEARCH_ENABLED", false);
 }
 
 function hasTavilyConfig(env) {
@@ -3650,6 +3673,8 @@ async function handleDebugEnv(env, chatId) {
       fallbackPrivateChatId = String(row?.room_id || "");
     }
   } catch (_) {}
+  const flag = (key, def = false) => readBoolEnv(env, key, def) ? "ON" : "OFF";
+  const { kstDate } = getKstDayRange();
   await sendMessage(
     env,
     chatId,
@@ -3659,7 +3684,14 @@ async function handleDebugEnv(env, chatId) {
     `ADMIN_CHAT_ID: ${env.ADMIN_CHAT_ID || "없음"}\n` +
     `ADMIN_TELEGRAM_ID: ${env.ADMIN_TELEGRAM_ID || "없음"}\n` +
     `fallback_private_chat_id: ${fallbackPrivateChatId || "없음"}\n` +
-    `cron config: KST 08:00 = UTC 23:00`
+    `KST today: ${kstDate}\n` +
+    `cron config: KST 08:00 = UTC 23:00\n\n` +
+    `Feature flags:\n` +
+    `  EXTERNAL_SEARCH_ENABLED: ${flag("EXTERNAL_SEARCH_ENABLED")}\n` +
+    `  ENABLE_ADVANCED_PARSER: ${flag("ENABLE_ADVANCED_PARSER")}\n` +
+    `  ENABLE_IMAGE_INGEST: ${flag("ENABLE_IMAGE_INGEST")}\n` +
+    `  ENABLE_RAG_CHUNKING: ${flag("ENABLE_RAG_CHUNKING")}\n` +
+    `  ENABLE_VECTOR_SEARCH: ${flag("ENABLE_VECTOR_SEARCH")}`
   );
 }
 
@@ -3859,6 +3891,10 @@ async function routeSlashCommand(env, message, text, chatId) {
     await handleDebugFileIds(env, chatId);
     return true;
   }
+  if (/^\/debug_room_ingest\b/.test(t)) {
+    await handleDebugRoomIngest(env, chatId, message);
+    return true;
+  }
   if (/^\/help\b/.test(t)) {
     await sendMessage(env, chatId, getHelpText());
     return true;
@@ -3869,30 +3905,37 @@ async function routeSlashCommand(env, message, text, chatId) {
 async function handleDebugToday(env, chatId) {
   if (!env.DB) { await sendMessage(env, chatId, "DB 없음"); return; }
   try {
-    const today = new Date().toISOString().slice(0, 10);
+    const { kstDate, startIso, endIso } = getKstDayRange();
     const msgCount = (await env.DB.prepare(
-      `SELECT COUNT(*) AS c FROM messages WHERE created_at >= ?`
-    ).bind(today + " 00:00:00").first())?.c || 0;
+      `SELECT COUNT(*) AS c FROM messages WHERE created_at >= ? AND created_at <= ?`
+    ).bind(startIso, endIso).first())?.c || 0;
     const fileCount = (await env.DB.prepare(
-      `SELECT COUNT(*) AS c FROM files WHERE created_at >= ?`
-    ).bind(today + " 00:00:00").first())?.c || 0;
+      `SELECT COUNT(*) AS c FROM files WHERE created_at >= ? AND created_at <= ?`
+    ).bind(startIso, endIso).first())?.c || 0;
     const fileWithId = (await env.DB.prepare(
-      `SELECT COUNT(*) AS c FROM files WHERE created_at >= ? AND COALESCE(telegram_file_id,'') != ''`
-    ).bind(today + " 00:00:00").first())?.c || 0;
+      `SELECT COUNT(*) AS c FROM files WHERE created_at >= ? AND created_at <= ? AND COALESCE(telegram_file_id,'') != ''`
+    ).bind(startIso, endIso).first())?.c || 0;
+    const photoCount = (await env.DB.prepare(
+      `SELECT COUNT(*) AS c FROM files WHERE created_at >= ? AND created_at <= ? AND file_type = 'photo'`
+    ).bind(startIso, endIso).first())?.c || 0;
+    const roomCount = (await env.DB.prepare(
+      `SELECT COUNT(DISTINCT room_id) AS c FROM messages WHERE created_at >= ? AND created_at <= ?`
+    ).bind(startIso, endIso).first())?.c || 0;
     const latestMsg = await env.DB.prepare(
       `SELECT sender_name, SUBSTR(content,1,60) AS content, created_at FROM messages ORDER BY created_at DESC LIMIT 1`
     ).first();
     const latestFile = await env.DB.prepare(
-      `SELECT file_name, created_at FROM files ORDER BY created_at DESC LIMIT 1`
+      `SELECT file_name, file_type, telegram_file_id, created_at FROM files ORDER BY created_at DESC LIMIT 1`
     ).first();
     await sendMessage(env, chatId,
-      `오늘 적재 현황 (${today})\n` +
-      `- messages: ${msgCount}건\n` +
-      `- files: ${fileCount}건\n` +
+      `오늘 적재 현황 (${kstDate} KST)\n` +
+      `UTC 기준: ${startIso} ~ ${endIso}\n\n` +
+      `- messages: ${msgCount}건 (방 ${roomCount}개)\n` +
+      `- files: ${fileCount}건 (사진 ${photoCount}건)\n` +
       `- files with telegram_file_id: ${fileWithId}건\n` +
-      `- files missing telegram_file_id: ${fileCount - fileWithId}건\n` +
+      `- files missing telegram_file_id: ${fileCount - fileWithId}건\n\n` +
       `- latest message: ${latestMsg ? `${latestMsg.sender_name} / ${latestMsg.content} / ${String(latestMsg.created_at || "").slice(0, 16)}` : "없음"}\n` +
-      `- latest file: ${latestFile ? `${latestFile.file_name} / ${String(latestFile.created_at || "").slice(0, 16)}` : "없음"}`
+      `- latest file: ${latestFile ? `${latestFile.file_name} (${latestFile.file_type}) file_id=${latestFile.telegram_file_id ? "있음" : "없음"} / ${String(latestFile.created_at || "").slice(0, 16)}` : "없음"}`
     );
   } catch (e) {
     await sendMessage(env, chatId, `debug_today 오류: ${String(e?.message || e).slice(0, 200)}`);
@@ -3915,6 +3958,44 @@ async function handleDebugFileIds(env, chatId) {
     await sendMessage(env, chatId, `최근 파일 ${rows.length}건\n\n${lines.join("\n\n")}`);
   } catch (e) {
     await sendMessage(env, chatId, `debug_file_ids 오류: ${String(e?.message || e).slice(0, 200)}`);
+  }
+}
+
+async function handleDebugRoomIngest(env, chatId, message) {
+  if (!env.DB) { await sendMessage(env, chatId, "DB 없음"); return; }
+  try {
+    const { kstDate, startIso } = getKstDayRange();
+    const fileRows = (await env.DB.prepare(
+      `SELECT room_id, room_title, COUNT(*) AS cnt, MAX(created_at) AS last_at
+       FROM files WHERE created_at >= ?
+       GROUP BY room_id, room_title ORDER BY cnt DESC LIMIT 10`
+    ).bind(startIso).all()).results || [];
+    const msgRows = (await env.DB.prepare(
+      `SELECT room_id, room_title, COUNT(*) AS cnt
+       FROM messages WHERE created_at >= ?
+       GROUP BY room_id, room_title ORDER BY cnt DESC LIMIT 10`
+    ).bind(startIso).all()).results || [];
+
+    const fileLines = fileRows.length
+      ? fileRows.map(r => `· ${r.room_title || r.room_id}: 파일 ${r.cnt}건 (최근 ${String(r.last_at || "").slice(0, 16)})`)
+      : ["· 오늘 파일 적재 없음"];
+    const msgLines = msgRows.length
+      ? msgRows.map(r => `· ${r.room_title || r.room_id}: 메시지 ${r.cnt}건`)
+      : ["· 오늘 메시지 없음"];
+
+    const currentRoom = message?.chat
+      ? `현재방: ${message.chat.title || message.chat.id} (id: ${message.chat.id})`
+      : "";
+
+    await sendMessage(env, chatId,
+      `[오늘 방별 적재 현황 — ${kstDate} KST]\n\n` +
+      `[파일]\n${fileLines.join("\n")}\n\n` +
+      `[메시지]\n${msgLines.join("\n")}\n\n` +
+      (currentRoom ? `${currentRoom}\n\n` : "") +
+      `⚠️ Privacy Mode ON이면 @멘션 없는 그룹 메시지는 수신 안 됨`
+    );
+  } catch (e) {
+    await sendMessage(env, chatId, `debug_room_ingest 오류: ${String(e?.message || e).slice(0, 300)}`);
   }
 }
 
@@ -6280,7 +6361,7 @@ function extractTelegramFileMeta(message) {
       kind: "photo",
       telegram_file_id: p.file_id || null,
       telegram_file_unique_id: p.file_unique_id || null,
-      file_name: `image_${message.message_id || Date.now()}.jpg`,
+      file_name: `image_${message.chat?.id || "x"}_${message.message_id || Date.now()}.jpg`,
       mime_type: "image/jpeg",
       file_size: p.file_size || 0,
     };
@@ -6362,6 +6443,92 @@ async function persistIncomingFile(env, message) {
   }
 }
 
+// Direct-INSERT ingestion — always saves telegram_file_id (fixes dbSaveFile UPDATE exclusion bug)
+async function saveIncomingFileIfAny(message, env) {
+  if (!message || !env.DB || message.from?.is_bot || message._filePersisted) return;
+  const meta = extractTelegramFileMeta(message);
+  if (!meta) return;
+  if (meta.kind === "document" && !isSupportedDocument(message)) return;
+  try {
+    const room = resolveFileRoomInfo(message);
+    if (room.sourceType === "telegram_group") {
+      await dbRegisterRoom(env, room.roomId, room.roomTitle, BOT_KEY, room.roomType);
+    }
+    const canonicalName = await getCanonicalUserName(env, message.from);
+    const fileId = meta.telegram_file_id || "";
+    const uniqueId = meta.telegram_file_unique_id || "";
+
+    if (uniqueId) {
+      const prev = await env.DB.prepare(
+        `SELECT id, telegram_file_id FROM files WHERE telegram_file_unique_id = ? ORDER BY id DESC LIMIT 1`
+      ).bind(uniqueId).first();
+      if (prev?.id) {
+        // Update telegram_file_id even if previously missing (fixes import-then-live scenario)
+        await env.DB.prepare(
+          `UPDATE files SET telegram_file_id = ?, uploader_name = ?, room_id = ?, room_title = ? WHERE id = ?`
+        ).bind(fileId, canonicalName, String(room.roomId), room.roomTitle, prev.id).run();
+        message._filePersisted = true;
+        return;
+      }
+    }
+
+    await env.DB.prepare(`
+      INSERT INTO files (
+        telegram_file_id, telegram_file_unique_id,
+        room_id, room_title,
+        uploader_id, uploader_name,
+        sender_id, sender_name,
+        file_name, file_type, mime_type, file_size,
+        source_type, extracted_text, summary, tags_json, saved_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)
+    `).bind(
+      fileId,
+      uniqueId,
+      String(room.roomId),
+      room.roomTitle,
+      String(message.from?.id || ""),
+      canonicalName,
+      String(message.from?.id || ""),
+      canonicalName,
+      meta.file_name,
+      meta.kind,
+      meta.mime_type,
+      meta.file_size || 0,
+      room.sourceType,
+      meta.kind === "photo" ? "" : "분석 중...",
+      JSON.stringify([meta.kind, ...(room.tags || [])]),
+      BOT_KEY
+    ).run();
+
+    message._filePersisted = true;
+
+    const caption = message.caption || "";
+    if (caption.length >= 20 && meta.kind === "document") {
+      const saved = await env.DB.prepare(
+        `SELECT id FROM files WHERE telegram_file_unique_id = ? ORDER BY id DESC LIMIT 1`
+      ).bind(uniqueId || "").first();
+      if (saved?.id) {
+        analyzeAndStructureFile(env, saved.id, caption).then((structured) => {
+          if (structured) updateFileStructure(env, saved.id, structured);
+        }).catch((e) => console.error("async file analysis (saveIncomingFileIfAny):", e));
+      }
+    }
+
+    if (env.CONVERSATIONS) {
+      await env.CONVERSATIONS.put("debug_files_last", "파일 메타 저장 성공 (v2)", { expirationTtl: 86400 });
+    }
+  } catch (e) {
+    console.error("saveIncomingFileIfAny:", e);
+    if (env.CONVERSATIONS) {
+      await env.CONVERSATIONS.put(
+        "debug_files_last",
+        String(e?.stack || e?.message || e).slice(0, 1500),
+        { expirationTtl: 86400 }
+      );
+    }
+  }
+}
+
 async function handleUpdate(update, env, isRelay = false) {
   if (update.my_chat_member) {
     await handleMyChatMemberUpdate(env, update.my_chat_member);
@@ -6379,7 +6546,7 @@ async function handleUpdate(update, env, isRelay = false) {
 
   await handleNewChatMembers(env, message);
   await persistIncomingMessage(env, message);
-  await persistIncomingFile(env, message);
+  await saveIncomingFileIfAny(message, env);
   if (!message._persisted) {
     await upsertUser(env, message.from, chatType === "private" ? chatId : message.from.id, chatType === "private" ? "private_dm" : "group_message");
   }
