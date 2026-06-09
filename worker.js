@@ -361,7 +361,6 @@ async function getCanonicalUserName(env, telegramUser) {
 }
 
 async function maybeUpdateUserDisplayNameFromBareName(env, message) {
-  return;
   if (!env.DB || !message?.from?.id || !looksLikeBareKoreanName(message.text || "")) return;
   await env.DB.prepare(`
     UPDATE users
@@ -530,7 +529,7 @@ function classifyAgenda(text) {
   for (const cat of categories) {
     if (cat.keywords.some(kw => t.includes(kw))) return cat.name;
   }
-  return "보고 안건";
+  return "업무 안건";
 }
 
 // 내용에서 실제 안건명 생성 (응답 문장 제거)
@@ -581,7 +580,7 @@ function inferTitle(row) {
       return `[${category}] ${name.slice(0, 35)}`;
     }
   }
-  return "[보고 안건] 자료 원본 확인";
+  return "[업무 안건] 자료 확인 필요";
 }
 
 function kohResolveRoomTitle(row, personName = "") {
@@ -667,7 +666,6 @@ function kohIsInternalKnowledgeRequest(text = "") {
   const t = String(text || "").trim();
 
   if (/^\/\w+/.test(t)) return false;
-  if (isRoomAgendaRequest(t) || isRecentMaterialBriefRequest(t) || isTodayCheckRequest(t) || isTomorrowBriefingRequest(t)) return true;
   if (isGeneralChatQuery(t)) return false;
 
   const hasInternalCue =
@@ -899,7 +897,7 @@ async function generateSmartIssueTitle(env, text, userId) {
   if (!text || text.trim().length < 10) return "";
   const cleaned = cleanSourceTextForSummary(text);
   const prompt =
-    `다음 자료를 읽고 보고 안건 제목을 10~25자 명사형으로 만들어줘.\n\n` +
+    `다음 자료를 읽고 업무 안건 제목을 10~25자 명사형으로 만들어줘.\n\n` +
     `[금지]\n` +
     `- 본문 문장 그대로 쓰기 금지\n` +
     `- 담당님/사장님으로 시작 금지\n` +
@@ -959,8 +957,8 @@ function formatIssueCard(card) {
   const sixRStr = Array.isArray(card.six_r) && card.six_r.length
     ? card.six_r.join("/")
     : (card.sixR && typeof card.sixR === "string" ? card.sixR : "업무");
-  const category = card.agenda_category || "보고 안건";
-  const issueTitle = card.issue_title || card.title || "대응 필요 이슈 점검";
+  const category = card.agenda_category || "업무 안건";
+  const issueTitle = card.issue_title || card.title || "주요 이슈 확인 필요";
   const actionItems = Array.isArray(card.action_items) ? card.action_items
     : (Array.isArray(card.actions) ? card.actions : []);
 
@@ -970,7 +968,7 @@ function formatIssueCard(card) {
   const summaryRaw = card.summary || "";
   const summaryOut = summaryRaw
     ? (cleanSourceTextForSummary(summaryRaw).split("\n").filter(Boolean)[0] || summaryRaw.split("\n")[0] || summaryRaw).slice(0, 200)
-    : "요약 가능한 본문이 없어 원본 확인이 필요함.";
+    : "본문에서 확인 가능한 업무 내용이 제한적임.";
   lines.push(`· <b>내용</b>: ${escapeHtml(summaryOut)}`);
 
   if (actionItems.length) {
@@ -1041,7 +1039,7 @@ function looksLikeBadRawTitle(text) {
   return false;
 }
 
-function makeSafeIssueTitleFromText(text, fallback = "대응 필요 이슈 점검") {
+function makeSafeIssueTitleFromText(text, fallback = "주요 이슈 확인 필요") {
   const cleaned = cleanSourceTextForSummary(text || "");
   const rules = [
     { re: /(New Vision|비전\s*선포식|선포식)/i, title: "비전선포식 추진 계획" },
@@ -1075,7 +1073,7 @@ function makeSafeSummaryFromText(text) {
     return "지방선거 결과와 관련된 대응 전략 자료가 공유됨. 지역별 정책·커뮤니케이션 포인트 확인이 필요합니다.";
   if (/(업무흐름|업무\s*흐름|정의서)/i.test(cleaned))
     return "업무흐름 정의 관련 자료가 공유됨. 프로세스와 역할 구분 확인이 필요합니다.";
-  return "요약 가능한 본문이 없어 원본 확인이 필요함.";
+  return "본문에서 확인 가능한 업무 내용이 제한적임.";
 }
 
 function isImageCandidate(c) {
@@ -1104,14 +1102,13 @@ async function buildIssueCardFromImageGroup(rows, env) {
   const basisText = cleanSourceTextForSummary(
     rows.map(r => [r.summary, r.extracted_text, r.content, r.text, r.caption].filter(Boolean).join("\n")).join("\n")
   );
-  if (!basisText) return null;
-  const title = makeSafeIssueTitleFromText(basisText, "이미지 내용 미확인");
+  const title = makeSafeIssueTitleFromText(basisText, "이미지 내용 확인 필요");
   const summary = basisText
     ? makeSafeSummaryFromText(basisText)
     : "이미지 텍스트가 추출되지 않아 안건 요약이 필요합니다. OCR 또는 원본 확인이 필요합니다.";
   return {
     issue_title: title,
-    agenda_category: typeof classifyAgenda === "function" ? classifyAgenda(basisText || title) : "보고 안건",
+    agenda_category: typeof classifyAgenda === "function" ? classifyAgenda(basisText || title) : "업무 안건",
     summary,
     six_r: typeof inferSixRByRule === "function" ? [inferSixRByRule(basisText || title)].flat().filter(Boolean) : [],
     action_items: [],
@@ -1161,7 +1158,7 @@ function containsLegacyOutput(text) {
     t.includes("저장된 파일") ||
     t.includes("[[사내 보고]") ||
     t.includes("[[대외컴]") ||
-    t.includes("[[보고 안건]") ||
+    t.includes("[[업무 안건]") ||
     /photo[_]\d+@/.test(t)
   );
 }
@@ -1328,8 +1325,8 @@ function passMaterialFindRelevance(candidate, plan) {
 
 function normalizeReportCategory(text = "") {
   const t = String(text || "").toLowerCase();
-  if (/(언론|뉴스룸|공시|고객사\s*letter|letter|mou|대외|대외컴|보도|기사|pr|cr|comm|adr|solidigm|솔리다임|epic|커뮤니케이션)/i.test(t)) return "대외컴";
-  if (/(리스크|확인\s*필요|대응\s*필요|우려|지연|논란|이슈|화재|위기|리콜|역할|불확실|risk)/i.test(t)) return "이슈";
+  if (/(언론|뉴스룸|공시|고객사\s*letter|letter|mou|대외|보도|기사|pr|ir|cr|comm|adr|solidigm|솔리다임|epic)/i.test(t)) return "대외컴";
+  if (/(리스크|확인\s*필요|대응\s*필요|우려|지연|논란|이슈|화재|위기|리콜|장애|불확실|risk)/i.test(t)) return "이슈";
   return "보고";
 }
 
@@ -1350,8 +1347,7 @@ function cleanReportTitle(text = "", category = "보고") {
     .replace(/^(자료|파일|문서|보고자료|이미지|내용|확인|요약|정리)\s*/i, "")
     .replace(/\s+/g, " ")
     .trim();
-  if (!t || looksLikeBadRawTitle(t) || /^이미지\s*\d*장?$/.test(t) ||
-      /^(보고 안건|대응 필요 이슈 점검|이미지 내용 미확인|자료 원본 확인|담당님[,，]?\s*다음주부터)/.test(t)) {
+  if (!t || looksLikeBadRawTitle(t) || /^이미지\s*\d*장?$/.test(t)) {
     t = ({ 보고: "보고자료 핵심 점검", 이슈: "대응 필요 이슈 점검", 대외컴: "대외 메시지 점검" }[category] || "보고자료 핵심 점검");
   }
   if (t.length > 25) t = t.slice(0, 25).trim();
@@ -1362,8 +1358,8 @@ function cleanReportTitle(text = "", category = "보고") {
 function cleanReportSummary(text = "", card = {}) {
   const raw = stripPhotoFileName(cleanSourceTextForSummary(text || ""));
   if (!raw || /핵심 내용 확인/.test(raw)) {
-    if (card.source_type === "image" || card.source_type === "image_group") return "이미지 내용은 아직 추출되지 않아 원본 확인이 필요합니다.";
-    return "요약 가능한 본문이 없어 원본 확인이 필요합니다.";
+    if (card.source_type === "image" || card.source_type === "image_group") return "이미지에서 확인 가능한 텍스트가 없음.";
+    return "본문에서 확인 가능한 업무 내용이 제한적임.";
   }
   const first = raw.split(/\n|[.!?]\s/).map(s => s.trim()).filter(Boolean)[0] || raw;
   return first.slice(0, 160);
@@ -1372,19 +1368,22 @@ function cleanReportSummary(text = "", card = {}) {
 function formatReportSourceLocation(card = {}) {
   const roomName = card.original_room || card.source_room || card.room_title || card.source || "알 수 없는 방";
   const room = `[${escapeHtml(roomName)}]`;
+<<<<<<< HEAD
   const actor = card.mixed_actors
     ? "여러 명"
     : (card.from_name || card.sender_name || "미확인");
+=======
+>>>>>>> 3d0fdb7 (Revert "Improve briefing judgement and output routing")
   const date = card.date || card.dateStr || formatShortDateFromValue(card.created_at || "");
   const imageCount = Number(card.image_count || (card.source_type === "image" ? 1 : 0));
   if (imageCount > 0 || card.source_type === "image_group" || card.source_type === "image") {
-    return `${room} / ${escapeHtml(actor)} / ${escapeHtml(date || "")} / 이미지 ${imageCount || 1}장`;
+    return `${room} / ${escapeHtml(date || "")} / 이미지 ${imageCount || 1}장`;
   }
-  const fileCount = Number(card.file_count || (card.display_file_name || card.source_file || card.file_name ? 1 : 0));
-  return `${room} / ${escapeHtml(actor)} / ${escapeHtml(date || "")} / 파일 ${fileCount || 1}건`;
+  const file = sanitizeDisplayFileName(card.display_file_name || card.source_file || card.file_name || "");
+  return `${room} / ${escapeHtml(date || "")}${file ? " / " + escapeHtml(file) : ""}`;
 }
 
-function formatReportCard(card, mode = "") {
+function formatReportCard(card) {
   if (!card) return "";
   const basis = [card.agenda_category, card.issue_title, card.title, card.summary, card.source_file, card.display_file_name].join(" ");
   const category = normalizeReportCategory(basis);
@@ -1393,13 +1392,11 @@ function formatReportCard(card, mode = "") {
     ? "이미지 내용 미확인 공유자료"
     : cleanReportTitle(card.issue_title || card.title || card.summary || card.source_file || "", category);
   const actionItems = Array.isArray(card.action_items) ? card.action_items : (Array.isArray(card.actions) ? card.actions : []);
-  const summaryLabel = mode === "briefing" || card.output_mode === "briefing" ? "브리핑 판단" : "요약";
-  const actionLabel = mode === "briefing" || mode === "today" || card.output_mode === "briefing" || card.output_mode === "today" ? "확인할 점" : "확인";
   const lines = [
     `<b>[${escapeHtml(category)}] ${escapeHtml(title)}</b>`,
-    `• <b>${summaryLabel}</b>: ${escapeHtml(summary)}`,
+    `• <b>내용</b>: ${escapeHtml(summary)}`,
   ];
-  if (actionItems.length) lines.push(`• <b>${actionLabel}</b>: ${escapeHtml(stripPhotoFileName(actionItems.slice(0, 2).join(", ")).slice(0, 120))}`);
+  if (actionItems.length) lines.push(`• <b>확인</b>: ${escapeHtml(stripPhotoFileName(actionItems.slice(0, 2).join(", ")).slice(0, 120))}`);
   lines.push(`• <b>위치</b>: ${formatReportSourceLocation(card)}`);
   return lines.join("\n");
 }
@@ -1672,15 +1669,15 @@ function summarizeByRule(text) {
     .filter(s => !/^(네|넵|알겠|확인|반영|수정|검토|전달)/.test(s));
   return sentences[0]
     ? sentences[0].slice(0, 140)
-    : "요약 가능한 본문이 없어 원본 확인이 필요함.";
+    : "본문에서 확인 가능한 업무 내용이 제한적임.";
 }
 
 async function summarizeCandidateContent(text, sixR, env) {
   const cleaned = cleanSourceTextForSummary(text);
   const rLabel = Array.isArray(sixR) && sixR.length ? sixR.join("/") : (sixR && typeof sixR === "string" ? sixR : "업무");
-  if (!cleaned || cleaned.length < 20) return "요약 가능한 본문이 없어 원본 확인이 필요함.";
+  if (!cleaned || cleaned.length < 20) return "본문에서 확인 가능한 업무 내용이 제한적임.";
   const prompt =
-    `다음 자료를 ${rLabel} 관점의 보고 안건으로 1~2줄 요약해줘.\n\n` +
+    `다음 자료를 ${rLabel} 관점의 업무 안건으로 1~2줄 요약해줘.\n\n` +
     `[규칙]\n` +
     `- 원문 문장을 그대로 복사하지 말 것\n` +
     `- 담당님/올려드립니다/첨부합니다 같은 전달 문구 제거\n` +
@@ -1704,9 +1701,22 @@ async function buildIssueCardFromCandidate(candidate, env) {
   const docType = parsedDoc.document_type || detectDocumentType(candidate);
   const rawText = getBestTextForIssueCard(candidate, parsedDoc);
 
-  // Image/low-quality with no extractable text: do not promote it as a briefing candidate.
+  // Image/low-quality with no extractable text → return "확인 필요" card
   if (!rawText && (docType === "image" || parsedDoc.parser_quality === "low" || parsedDoc.parser_quality === "failed")) {
-    return null;
+    return {
+      issue_title: "이미지 내용 확인 필요",
+      agenda_category: "업무 안건",
+      summary: "이미지 텍스트가 추출되지 않아 안건 요약이 필요합니다. OCR 또는 원본 확인이 필요합니다.",
+      six_r: [],
+      action_items: [],
+      source_room: candidate._resolvedRoom || candidate.room_title || "",
+      source_file: candidate.file_name || "",
+      original_author: "",
+      shared_by: "",
+      actor: candidate._resolvedName || candidate.uploader_name || candidate.sender_name || "",
+      date: formatShortDateFromValue(candidate.created_at || candidate.date),
+      relevance_score: 0,
+    };
   }
 
   const cleanText = cleanSourceTextForSummary(rawText);
@@ -1746,7 +1756,7 @@ async function buildIssueCardFromCandidate(candidate, env) {
 
   // Rule-based fallbacks — use safe helpers, never use image filenames as title
   if (!issue_title || looksLikeBadRawTitle(issue_title)) {
-    issue_title = makeSafeIssueTitleFromText(basisText || candidate.file_name, "대응 필요 이슈 점검");
+    issue_title = makeSafeIssueTitleFromText(basisText || candidate.file_name, "주요 이슈 확인 필요");
   }
   if (!summary || looksLikeRawChatResponse(summary)) {
     summary = makeSafeSummaryFromText(basisText || candidate.file_name || "");
@@ -2061,49 +2071,12 @@ async function handleRecentMaterialBrief(items, chatId, env) {
   await kohSendHtml(env, chatId, output + suffix);
 }
 
-function getBriefingEvidenceText(item = {}) {
-  return cleanSourceTextForSummary([
-    item.summary,
-    item.extracted_text,
-    item.content,
-    item.text,
-    item.caption,
-    item.file_name,
-  ].filter(Boolean).join(" "));
-}
-
-function scoreBriefingCandidate(item = {}, allItems = []) {
-  const text = getBriefingEvidenceText(item);
-  if (!text) return -40;
-  let score = 0;
-  if (/(보고|회의|브리핑|kpi|실적|재보고|회의자료)/i.test(text)) score += 25;
-  if (/(리스크|이슈|확인\s*요청|확인\s*필요|대응\s*필요|우려|지연|논란)/i.test(text)) score += 25;
-  if (/(대외|공시|언론|뉴스룸|고객사|mou|letter|커뮤니케이션|solidigm|솔리다임|epic)/i.test(text)) score += 25;
-  if (/(담당님|사장님|팀장|임원|ceo)/i.test(text)) score += 30;
-  if (/(내일|오늘|회의|보고\s*일정|오전|오후)/i.test(text)) score += 30;
-  const key = cleanReportTitle(text, normalizeReportCategory(text)).slice(0, 12);
-  if (key && allItems.filter(x => getBriefingEvidenceText(x).includes(key)).length > 1) score += 15;
-  if (isImageCandidate(item) && !String(item.summary || item.extracted_text || item.content || item.text || "").trim()) score -= 40;
-  return score;
-}
-
 async function handleBriefingSummary(env, chatId, text, currentRoomId = "") {
   const { kstDate, startIso, endIso } = getKstDayRange();
   const { files: rawFiles, messages: rawMessages } =
-    await kohFetchRecentFilesAndMessages(env, String(currentRoomId || ""), false, 3, "");
+    await kohFetchRecentFilesAndMessages(env, String(currentRoomId || ""), false, 2, "");
   const files = kohDedupFiles(rawFiles || []);
-  const fileItems = await kohResolveItems(env, files, "uploader_id", "uploader_name");
-  const messageItems = await kohResolveItems(env, rawMessages || [], "sender_id", "sender_name");
-  const allItems = [
-    ...fileItems,
-    ...messageItems.map(m => ({
-      ...m,
-      file_name: "",
-      summary: m.content || "",
-      source_actor: m._resolvedName || m.sender_name || "",
-      _resolvedName: m._resolvedName || m.sender_name || "",
-    })),
-  ];
+  const allItems = await kohResolveItems(env, files, "uploader_id", "uploader_name");
 
   const candidates = allItems
     .filter(c =>
@@ -2111,11 +2084,10 @@ async function handleBriefingSummary(env, chatId, text, currentRoomId = "") {
         c.summary || c.extracted_text || c.content || c.text || "",
         c._resolvedName || c.uploader_name || ""
       ) &&
-      getBriefingEvidenceText(c) &&
-      scoreBriefingCandidate(c, allItems) >= 50
+      String(c.created_at || "") >= startIso &&
+      String(c.created_at || "") <= endIso
     )
-    .sort((a, b) => scoreBriefingCandidate(b, allItems) - scoreBriefingCandidate(a, allItems))
-    .slice(0, 5);
+    .slice(0, 3);
 
   if (!candidates.length) {
     await kohSendHtml(env, chatId, `오늘(${kstDate} KST) 공유된 자료를 찾지 못했습니다.\n적재 상태 확인: /debug_today`);
@@ -2139,10 +2111,9 @@ async function handleBriefingSummary(env, chatId, text, currentRoomId = "") {
 
   const safeBriefingTitle = String(text || "").includes("\uB0B4\uC77C")
     ? "\uB0B4\uC77C \uBE0C\uB9AC\uD551 \uD6C4\uBCF4"
-    : "\uBE0C\uB9AC\uD551 \uD6C4\uBCF4";
+    : "\uC624\uB298 \uBE0C\uB9AC\uD551 \uD6C4\uBCF4";
   const reportHeader = `<b>${escapeHtml(safeBriefingTitle)} (${escapeHtml(kstDate)} KST)</b>\n\n`;
-  let output = dedupeReportCards(cards.map(c => ({ ...c, output_mode: "briefing", action_items: c.action_items?.length ? c.action_items : ["브리핑 전 사실관계와 담당 액션 확인"] })), 3)
-    .map(c => formatReportCard(c, "briefing")).join("\n\n");
+  let output = dedupeReportCards(cards, 3).map(formatReportCard).join("\n\n");
 
   if (containsLegacyOutput(output)) {
     console.warn("[BLOCKED_LEGACY_OUTPUT] handleBriefingSummary", output.slice(0, 300));
@@ -2156,7 +2127,7 @@ async function extractIssueCardsFromLongText(text, env, baseMeta = {}) {
   const cleaned = cleanSourceTextForSummary(text);
   if (!cleaned || cleaned.length < 50) return [];
   const prompt =
-    `다음 본문에서 서로 다른 보고 안건을 최대 5개까지 분리해 JSON 배열로 출력해줘.\n\n` +
+    `다음 본문에서 서로 다른 업무 안건을 최대 5개까지 분리해 JSON 배열로 출력해줘.\n\n` +
     `[각 항목 필드]\n` +
     `issue_title: 10~25자 명사형 제목\n` +
     `summary: 1~2줄 요약, 원문 복붙 금지\n` +
@@ -2636,22 +2607,6 @@ function kohRelevanceGate(items, terms, threshold = 8) {
   return filtered.length > 0 ? filtered : [];
 }
 
-function isRoomAgendaRequest(text = "") {
-  const t = String(text || "").replace(/\s+/g, " ").trim();
-  return /방별(로)?\s*(안건|내용|이슈)\s*(정리|요약|알려)/.test(t) ||
-    /(방별|방마다).{0,12}(안건|이슈|공유된 내용)/.test(t);
-}
-
-function isTodayCheckRequest(text = "") {
-  const t = String(text || "").replace(/\s+/g, " ").trim();
-  return /오늘.{0,12}(뭐\s*확인|확인하면\s*돼|확인해야|먼저\s*볼|챙길|우선)/.test(t);
-}
-
-function isTomorrowBriefingRequest(text = "") {
-  const t = String(text || "").replace(/\s+/g, " ").trim();
-  return /내일.{0,20}브리핑|브리핑.{0,20}(내일|미리|후보)/.test(t);
-}
-
 function kohDetectIntent(text = "") {
   const t = String(text || "").replace(/\s+/g, " ").trim();
   // Normalize common typos/colloquials for matching
@@ -2660,12 +2615,11 @@ function kohDetectIntent(text = "") {
     .replace(/보내조/g, "보내줘").replace(/줘라/g, "줘").replace(/좀$/g, "줘")
     .replace(/알려조/g, "알려줘").replace(/정리좀/g, "정리해줘").replace(/요약좀/g, "요약해줘");
 
+  // BRIEFING patterns (early check)
+  if (isBriefingRequestCheck(n)) return KOH_INTENT.BRIEFING_SUMMARY;
 
   // RECENT_MATERIAL_BRIEF patterns → FILE_LIST intent
-  if (isRoomAgendaRequest(n)) return KOH_INTENT.MESSAGE_SUMMARY;
   if (isRecentMaterialBriefRequest(n)) return KOH_INTENT.FILE_LIST;
-  if (isTodayCheckRequest(n)) return KOH_INTENT.PRIORITY;
-  if (isTomorrowBriefingRequest(n) || isBriefingRequestCheck(n)) return KOH_INTENT.BRIEFING_SUMMARY;
 
   // GENERAL_CHAT: clearly conversational, no internal data retrieval
   if (/^(날씨.*어때|오늘\s*날씨|점심.*뭐|밥.*뭐\s*먹|이거.*왜\s*안\s*돼|어떻게.*테스트|문장.*바꿔|번역해줘|설명해줘|정의가\s*뭐야|차이.*뭐야|예시.*들어|안녕하세요|반갑습니다)/.test(n) &&
@@ -2754,8 +2708,7 @@ async function kohHandlePendingSelection(env, chatId, userId, text) {
     await env.CONVERSATIONS.delete(`koh_pending_${chatId}`);
     return false;
   }
-  const numberMatch = String(text || "").match(/(\d+)\D*|^(\d+)$/);
-  const n = Number(numberMatch?.[1] || numberMatch?.[2] || 0);
+  const n = Number(String(text || "").replace(/[번호\s]/g, "").trim());
   if (!Number.isInteger(n) || n < 1 || n > 3) return false;
   const item = (state.files || [])[n - 1];
   if (!item) return false;
@@ -2777,13 +2730,13 @@ async function kohHandlePendingSelection(env, chatId, userId, text) {
       });
       await kohSendDocument(env, chatId, item, caption);
     } else {
-      await kohSendHtml(env, chatId, `현재 원본 자동 전송은 어렵습니다.\n위치: ${formatReportSourceLocation({
-        source_room: resolvedRoom,
-        source_actor: resolvedName,
+      await kohSendHtml(env, chatId, kohFormatThreeLineItem({
+        title: inferTitle(item),
+        content: "파일 원본 정보는 있으나 telegram_file_id가 없어 재전송할 수 없습니다.",
+        location,
+        person: resolvedName,
         date: kohFormatDate(item.created_at),
-        file_count: 1,
-        source_file: item.file_name || "",
-      })}`);
+      }));
     }
   } else {
     // FILE_SUMMARY
@@ -3201,46 +3154,7 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
   }
 
   // ── MEETING_SUMMARY ───────────────────────────────────────────────────────
-    if (intent === KOH_INTENT.MESSAGE_SUMMARY && isRoomAgendaRequest(text)) {
-    const roomRows = [
-      ...scoredFiles.slice(0, 20).map(f => ({
-        source_room: f._resolvedRoom || f.room_title || "",
-        source_actor: f._resolvedName || f.uploader_name || "",
-        issue_title: inferTitle(f),
-        summary: fileSummaryText(f) || f.extracted_text || f.content || "",
-        source_file: f.file_name || "",
-        display_file_name: f.file_name || "",
-        file_count: 1,
-        created_at: f.created_at || "",
-        date: kohFormatDate(f.created_at),
-      })),
-      ...filteredMsgs.slice(0, 40).map(m => ({
-        source_room: m._resolvedRoom || m.room_title || "",
-        source_actor: m._resolvedName || m.sender_name || "",
-        issue_title: inferTitle(m),
-        summary: m.content || "",
-        source_file: "",
-        file_count: 0,
-        created_at: m.created_at || "",
-        date: kohFormatDate(m.created_at),
-      })),
-    ].filter(r => cleanSourceTextForSummary(r.summary || "").length >= 20);
-
-    const cards = dedupeReportCards(roomRows.map(r => ({
-      ...r,
-      agenda_category: normalizeReportCategory([r.issue_title, r.summary].join(" ")),
-      action_items: ["담당자 기준 후속 확인 필요"],
-    })), 3);
-
-    if (!cards.length) {
-      await kohSendHtml(env, chatId, "방별로 요약할 업무 기록을 찾지 못했습니다.");
-      return true;
-    }
-
-    await kohSendHtml(env, chatId, `<b>방별 안건 ${cards.length}건입니다.</b>\n\n${cards.map(c => formatReportCard(c, "today")).join("\n\n")}`);
-    return true;
-  }
-if (intent === KOH_INTENT.MEETING_SUMMARY) {
+  if (intent === KOH_INTENT.MEETING_SUMMARY) {
     const meetingMsgs = filteredMsgs.slice(0, 20);
     if (!meetingMsgs.length && !scoredFiles.length) {
       await kohSendHtml(env, chatId, "회의 기록을 찾지 못했습니다.");
@@ -5126,7 +5040,7 @@ async function handleFilesCommand(env, chatId) {
       return formatIssueCard({
         issue_title: f.file_name ? cleanTitle(f.file_name) : "파일명 없음",
         agenda_category: typeof classifyAgenda === "function" ? classifyAgenda(cleanedSummary || f.file_name || "") : "",
-        summary: summaryText || "요약 가능한 본문이 없어 원본 확인이 필요함.",
+        summary: summaryText || "본문에서 확인 가능한 업무 내용이 제한적임.",
         six_r: [inferSixRByRule(cleanedSummary || f.file_name || "")].filter(Boolean),
         action_items: [],
         source_room: f.room_title || f.joined_room_title || "알 수 없는 방",
@@ -6064,7 +5978,7 @@ async function answerFileSearch(env, text) {
       const srcFile = r.location || String(r.title || "").slice(0, 40);
       const rawTitle = String(r.title || "자료").slice(0, 60);
       const safeTitle = looksLikeBadRawTitle(rawTitle)
-        ? makeSafeIssueTitleFromText(r.summary || r.title || "", "자료 원본 확인")
+        ? makeSafeIssueTitleFromText(r.summary || r.title || "", "자료 확인 필요")
         : rawTitle;
       return formatIssueCard({
         issue_title: `${idx + 1}. ${safeTitle}`,
@@ -6227,21 +6141,6 @@ function isNewsQuery(text) {
   return /뉴스/.test(text) || /최신\s*(기사|소식)/.test(text);
 }
 
-function isMyTelegramIdQuery(text = "") {
-  const t = String(text || "").replace(/\s+/g, " ").trim();
-  return /내\s*(텔레그램\s*)?(아이디|id)\s*(뭐야|알려줘|확인|뭔지)?/i.test(t) ||
-    /텔레그램\s*(아이디|id)\s*(뭐야|알려줘|확인)/i.test(t);
-}
-
-async function handleMyTelegramId(message, userId, chatId, env) {
-  const profileName = getSenderName(message?.from || {});
-  let name = profileName || String(userId || "");
-  try {
-    const resolved = await resolveUserName(env, userId, profileName || "");
-    if (resolved && resolved !== "공유자 확인 필요") name = resolved;
-  } catch (_) {}
-  await sendMessage(env, chatId, `${name}님으로 등록되어 있습니다.\n텔레그램 ID: ${userId}`);
-}
 function isIntroQuery(text) {
   return (
     /(뭐\s*할\s*수\s*있|기능|도움말|소개)/.test(text) ||
@@ -6710,7 +6609,7 @@ function priorityProjectName(text) {
   if (firstLine.length >= 6 && firstLine.length <= 40)
     return `${firstLine} 관련`;
 
-  return "보고 안건";
+  return "업무 안건";
 }
 
 function priorityScore(record) {
@@ -6842,7 +6741,7 @@ function summarizePriorityText(item) {
     };
   }
   return {
-    judgment: "저장 기록 확인 결과 확인되어 이번주 우선 확인 후보로 보임.",
+    judgment: "최근 저장 기록 기준 확인되어 이번주 우선 확인 후보로 보임.",
     action: "담당자·마감·보고 필요 여부를 먼저 확인 필요.",
   };
 }
@@ -6859,22 +6758,20 @@ function formatPriorityAnswer(candidates) {
     const loc = file ? `${room} > ${file}` : `${room} > 관련 메시지`;
     const content = `${s.judgment} / ${s.action}`;
     return formatReportCard({
-      issue_title: item.name,
-      summary: s.judgment,
+      issue_title: `${idx + 1}. ${item.name}`,
+      summary: content,
       source_room: room,
       source_file: file,
       display_file_name: file,
       shared_by: actor,
       uploader: actor,
-      source_actor: actor,
       date,
       six_r: [],
-      agenda_category: normalizeReportCategory(content),
-      action_items: [s.action],
-      output_mode: "today",
-    }, "today");
+      agenda_category: "보고",
+      action_items: [],
+    });
   }).join("\n\n");
-  return `<b>우선 확인 안건 ${top.length}건입니다.</b>\n\n${items}`;
+  return `우선 확인 안건 ${top.length}건입니다.\n\n${items}`;
 }
 
 async function handlePriorityQuestion(env, chatId, text) {
@@ -7203,7 +7100,7 @@ async function analyzeAndStructureFile(env, fileId, content) {
   if (!env.DIFY_API_KEY) return null;
 
   const query = TONE_RULE +
-    `다음 문서/대화를 분석해서 포함된 모든 보고 안건을 각각 추출해줘.\n\n` +
+    `다음 문서/대화를 분석해서 포함된 모든 업무 안건을 각각 추출해줘.\n\n` +
     `[카테고리 분류]\n` +
     `내용을 읽고 아래 중 하나로 분류:\n` +
     `정부·정책 / 노사·인사 / 사내 보고 / 대외컴\n` +
@@ -7615,8 +7512,8 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
   }
 
   // 본인 등록 정보 조회 → KV 직접 답변
-  if (isMyTelegramIdQuery(text) || isSelfInfoQuery(text)) {
-    await handleMyTelegramId(message, userId, chatId, env);
+  if (isSelfInfoQuery(text)) {
+    await handleSelfInfo(user, userId, chatId, env);
     return;
   }
 
@@ -7678,13 +7575,13 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
-  if (isPeopleMemoryQuery(text) && !isRecentMaterialBriefRequest(text) && !isRoomAgendaRequest(text) && !isTodayCheckRequest(text) && !isTomorrowBriefingRequest(text)) {
+  if (isPeopleMemoryQuery(text)) {
     await handleRoomPeople(env, message, chatId);
     return;
   }
 
   // pending candidate selection (1/2/3 after file list)
-  if (/(\d+)\s*번/.test(String(text || "")) || /^[1-3]$/.test(String(text || "").trim())) {
+  if (/^[1-3][번]?$/.test(String(text || "").trim())) {
     const uid = String(message.from?.id || "");
     const handled = await kohHandlePendingSelection(env, chatId, uid, text);
     if (handled) return;
@@ -8091,11 +7988,6 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     return;
   }
 
-  if (isMyTelegramIdQuery(cleanText) || isSelfInfoQuery(cleanText)) {
-    await handleMyTelegramId(message, userId, chatId, env);
-    return;
-  }
-
   // GENERAL_CHAT hard guard — skip all retrieval
   if (isGeneralChatQuery(cleanText)) {
     await sendMessage(env, chatId, makeGeneralChatReply(cleanText));
@@ -8126,13 +8018,13 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     return;
   }
 
-  if (isPeopleMemoryQuery(cleanText) && !isRecentMaterialBriefRequest(cleanText) && !isRoomAgendaRequest(cleanText) && !isTodayCheckRequest(cleanText) && !isTomorrowBriefingRequest(cleanText)) {
+  if (isPeopleMemoryQuery(cleanText)) {
     await handleRoomPeople(env, message, chatId);
     return;
   }
 
   // pending candidate selection (1/2/3 after file list)
-  if (/(\d+)\s*번/.test(String(cleanText || "")) || /^[1-3]$/.test(String(cleanText || "").trim())) {
+  if (/^[1-3][번]?$/.test(String(cleanText || "").trim())) {
     const uid = String(message.from?.id || "");
     const handled = await kohHandlePendingSelection(env, chatId, uid, cleanText);
     if (handled) return;
