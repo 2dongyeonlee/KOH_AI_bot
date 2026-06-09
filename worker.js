@@ -50,7 +50,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-kill-legacy-filelist-force-issuecard-20260609-0810";
+const BUILD_VERSION = "koh-material-find-no-raw-no-number-20260609-1100";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -853,10 +853,26 @@ async function summarizeCurrentContent(env, text, userId) {
 
 async function generateSmartIssueTitle(env, text, userId) {
   if (!text || text.trim().length < 10) return "";
-  const prompt = `다음 내용을 보고 업무 안건 제목을 10~25자로 직접 작성하라. 파일명·응답 문장 금지. 내용 기반으로만 작성.\n\n내용: ${text.slice(0, 800)}\n\n제목만 출력:`;
+  const cleaned = cleanSourceTextForSummary(text);
+  const prompt =
+    `다음 자료를 읽고 업무 안건 제목을 10~25자 명사형으로 만들어줘.\n\n` +
+    `[금지]\n` +
+    `- 본문 문장 그대로 쓰기 금지\n` +
+    `- 담당님/사장님으로 시작 금지\n` +
+    `- 올려드립니다/첨부합니다/보내드립니다/검토하겠습니다 금지\n` +
+    `- PMO는...처럼 설명문을 제목으로 쓰기 금지\n` +
+    `- 파일명/photo/Telegram export 금지\n` +
+    `- [PR/ER], [카테고리] prefix 붙이지 말 것\n\n` +
+    `[좋은 제목 예시]\n` +
+    `비전선포식 추진 계획\n` +
+    `지방선거 결과 대응 전략\n` +
+    `ADR 상장 커뮤니케이션 방안\n\n` +
+    `[자료]\n${cleaned.slice(0, 3000)}\n\n제목만 출력:`;
   try {
     const r = await difyChat(env, { query: prompt, user: userId || "koh", conversationId: "" });
-    return cleanTitle(r.answer || "");
+    const title = cleanTitle(r.answer || "");
+    if (isValidIssueTitle(title)) return title.slice(0, 35);
+    return "";
   } catch (e) {
     return "";
   }
@@ -968,20 +984,84 @@ async function handleCurrentContentSummary(env, message, query, chatId, userId) 
 
 // ── 소스 텍스트 정제 ──────────────────────────────────────────────────────────
 function cleanSourceTextForSummary(text) {
-  return String(text || "")
+  const noNoise = removeChatNoiseLines(text);
+  return String(noNoise || "")
     .split(/\n+/)
     .map(l => l.trim())
     .filter(Boolean)
-    .filter(l => !/^(네|넵|알겠습니다|확인하겠습니다|반영하겠습니다|수정하겠습니다|진행하겠습니다|검토하겠습니다|전달하겠습니다)/.test(l))
-    .filter(l => !/^(그러하겠습니다|그리하겠습니다|말씀드립니다|보고드립니다)/.test(l))
-    .filter(l => !/^(담당님|사장님|팀장님)[,\s]+(네|넵|알겠|확인)/.test(l))
-    .filter(l => !/Telegram export file/i.test(l))
-    .filter(l => !/^photo\.|^image\./i.test(l))
     .filter(l => !/저장된 파일 \d+건입니다/.test(l))
     .filter(l => !/관련 파일 \d+건/.test(l))
     .filter(l => !/📌\s*</.test(l))
     .join("\n")
     .trim();
+}
+
+function removeChatNoiseLines(text) {
+  return String(text || "")
+    .split(/\n+|\/+/)
+    .map(s => s.trim())
+    .filter(Boolean)
+    .filter(s => !/^(네|넵|알겠습니다|확인하겠습니다|반영하겠습니다|수정하겠습니다|진행하겠습니다|검토하겠습니다|전달하겠습니다)/.test(s))
+    .filter(s => !/^(그러하겠습니다|그리하겠습니다|말씀드립니다|보고드립니다)/.test(s))
+    .filter(s => {
+      if (!/^(담당님|사장님|팀장님)[,\s]*/.test(s)) return true;
+      return /(계획|보고|자료|전략|방안|이슈|일정|실적|KPI|ADR|Vision|선포식)/i.test(s);
+    })
+    .filter(s => !/(올려드립니다|첨부와 같이|파일로도 올려|보내주셔도 될 것|마이너한 얘기지만)/.test(s))
+    .filter(s => !/^photo[_@.-]/i.test(s))
+    .filter(s => !/Telegram export file/i.test(s))
+    .join("\n")
+    .trim();
+}
+
+function looksLikeRawChatResponse(text) {
+  const t = String(text || "").trim();
+  if (/^(네|넵|알겠|확인|반영|수정|검토|전달|그러하겠습니다)/.test(t)) return true;
+  if (/^(담당님|사장님|팀장님)[,\s]/.test(t)) return true;
+  if (/(올려드립니다|첨부와 같이|파일로도 올려|보내주셔도 될 것|마이너한 얘기지만)/.test(t)) return true;
+  if (/^photo[_@.-]/i.test(t)) return true;
+  return false;
+}
+
+function isValidIssueTitle(title) {
+  const t = String(title || "").trim();
+  if (t.length < 5 || t.length > 40) return false;
+  if (/^(담당님|사장님|팀장님|네|넵|알겠|확인|반영|수정|검토|전달)/.test(t)) return false;
+  if (/(올려드립니다|첨부|보내드립니다|그러하겠습니다|검토하겠습니다)/.test(t)) return false;
+  if (/^photo[_@.-]/i.test(t)) return false;
+  if (/Telegram export/i.test(t)) return false;
+  return true;
+}
+
+function extractStrongSearchTerms(query) {
+  const q = String(query || "");
+  const candidates = [];
+  const known = ["비전선포식", "New Vision", "ADR", "지방선거", "KPI", "공과기술서", "성과급", "HBM", "엔비디아", "AI 팩토리"];
+  for (const k of known) {
+    if (q.includes(k)) candidates.push(k);
+  }
+  return candidates;
+}
+
+function passMaterialFindRelevance(candidate, terms, query) {
+  const allTerms = Array.isArray(terms) && terms.length ? terms : extractStrongSearchTerms(String(query || ""));
+  if (!allTerms.length) return true;
+  const text = [
+    candidate.file_name,
+    candidate.title,
+    candidate.summary,
+    candidate.extracted_text,
+    candidate.content,
+    candidate.text,
+    candidate._resolvedRoom,
+  ].map(x => String(x || "")).join("\n");
+  const hay = text.toLowerCase();
+  return allTerms.some(t => hay.includes(String(t || "").toLowerCase()));
+}
+
+function formatIssueCardForMaterialFind(card, index) {
+  const body = formatIssueCard(card);
+  return `${body}\n· <b>원본</b>: 필요하면 "${index}번 원본 보내줘"라고 입력`;
 }
 
 function isBotGeneratedOutput(text, senderName = "") {
@@ -1023,18 +1103,19 @@ async function summarizeCandidateContent(text, sixR, env) {
   const prompt =
     `다음 자료를 ${rLabel} 관점의 업무 안건으로 1~2줄 요약해줘.\n\n` +
     `[규칙]\n` +
-    `- 원문 문장을 그대로 길게 복사하지 말 것\n` +
-    `- 인사말/응답문/잡담 제거\n` +
-    `- 핵심 사실, 목적, 일정, 보고/검토 포인트 중심\n` +
+    `- 원문 문장을 그대로 복사하지 말 것\n` +
+    `- 담당님/올려드립니다/첨부합니다 같은 전달 문구 제거\n` +
+    `- 핵심 이슈, 목적, 일정, 보고/검토 포인트만 압축\n` +
     `- 추정 금지\n` +
-    `- 140자 이내\n\n` +
+    `- 120~160자 이내\n` +
+    `- 문장 끝은 "~자료", "~안건", "~확인 필요"처럼 업무적으로 정리\n\n` +
     `[자료]\n${cleaned.slice(0, 5000)}`;
   try {
     const r = await difyChat(env, { query: prompt, user: "koh", conversationId: "" });
-    return cleanOneLine(r.answer || "").slice(0, 180) || summarizeByRule(cleaned);
-  } catch (e) {
-    return summarizeByRule(cleaned);
-  }
+    const summary = cleanOneLine(r.answer || "").slice(0, 180);
+    if (summary && !looksLikeRawChatResponse(summary)) return summary;
+  } catch (e) {}
+  return summarizeByRule(cleaned);
 }
 
 // Single-LLM-call version: gets title + summary + action_items in one shot
@@ -1055,7 +1136,9 @@ async function buildIssueCardFromCandidate(candidate, env) {
     const prompt =
       `다음 업무 자료를 보고 JSON으로만 출력해줘. 마크다운, 설명 없이 JSON만.\n\n` +
       `{"title":"10~25자 명사형 제목","summary":"1~2줄 요약 원문복붙금지"}\n\n` +
-      `[규칙] 인사말/응답문 제거. 핵심 사실/목적만. 추정 금지.\n\n` +
+      `[제목 금지] 담당님으로 시작/올려드립니다/첨부합니다/PMO는... 같은 설명문/파일명 그대로\n` +
+      `[요약 금지] 원문 그대로 복사/담당님 인사말/전달 문구 그대로\n` +
+      `[규칙] 핵심 이슈·목적·일정만. 추정 금지.\n\n` +
       `[자료]\n${basisText.slice(0, 3000)}`;
     try {
       const r = await difyChat(env, { query: prompt, user: "koh", conversationId: "" });
@@ -1063,8 +1146,10 @@ async function buildIssueCardFromCandidate(candidate, env) {
       const m = raw.match(/\{[\s\S]*?\}/);
       if (m) {
         const obj = JSON.parse(m[0]);
-        if (obj.title) issue_title = cleanTitle(obj.title);
-        if (obj.summary) summary = cleanOneLine(obj.summary).slice(0, 180);
+        const rawTitle = cleanTitle(obj.title || "");
+        const rawSummary = cleanOneLine(obj.summary || "").slice(0, 180);
+        if (isValidIssueTitle(rawTitle)) issue_title = rawTitle;
+        if (rawSummary && !looksLikeRawChatResponse(rawSummary)) summary = rawSummary;
       }
     } catch (e) {
       console.error("buildIssueCardFromCandidate LLM:", e);
@@ -2134,14 +2219,14 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
     }
     const candidates = await kohResolveItems(env, scoredFiles.slice(0, 3), "uploader_id", "uploader_name");
     await kohSavePending(env, chatId, KOH_INTENT.FILE_RESEND, candidates);
-    const body = candidates.map((f, i) => kohFormatThreeLineItem({
-      title: `${i + 1}. ${inferTitle(f)}`,
-      content: (fileSummaryText(f) || "요약 없음") + exportFileNote(f),
-      location: `${f._resolvedRoom} > ${f.file_name || "파일명 없음"}`,
-      person: f._resolvedName,
-      date: kohFormatDate(f.created_at),
-    })).join("\n\n");
-    await kohSendHtml(env, chatId, `<b>관련 파일 ${candidates.length}건 확인됩니다. 번호를 선택해주세요.</b>\n\n${body}`);
+    const body = candidates.map((f, i) => {
+      const title = escapeHtml(cleanTitle(inferTitle(f)));
+      const room = escapeHtml(f._resolvedRoom || "알 수 없는 방");
+      const person = escapeHtml(f._resolvedName || "");
+      const date = formatShortDateFromValue(f.created_at);
+      return `${i + 1}. ${title} — [${room}]${person ? " / " + person : ""}${date ? " / " + date : ""}`;
+    }).join("\n");
+    await kohSendHtml(env, chatId, `관련 파일 ${candidates.length}건 확인됩니다. 보낼 번호를 선택해주세요.\n\n${body}`);
     return true;
   }
 
@@ -2211,25 +2296,48 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
     return true;
   }
 
-  // ── MATERIAL_FIND ─────────────────────────────────────────────────────────
+  // ── MATERIAL_FIND → IssueCard 요약 (번호 선택 금지) ──────────────────────
   if (intent === KOH_INTENT.MATERIAL_FIND) {
     const gated = kohRelevanceGate(scoredFiles, terms, 8);
-    if (!gated.length && !filteredMsgs.length) {
-      await kohSendHtml(env, chatId, `"${terms.join(", ")}" 관련 자료를 찾지 못했습니다.`);
+    const relFiltered = gated.filter(c => passMaterialFindRelevance(c, terms, text));
+    if (!relFiltered.length && !filteredMsgs.length) {
+      await kohSendHtml(env, chatId, terms.length
+        ? `"${terms.join(", ")}" 관련 자료를 찾지 못했습니다.`
+        : "관련 자료를 찾지 못했습니다.");
       return true;
     }
-    const items = await kohResolveItems(env, gated.slice(0, 5), "uploader_id", "uploader_name");
-    const body = items.map((f, i) => kohFormatIssueCard({
-      title: `${i + 1}. ${inferTitle(f)}`,
-      summary: fileSummaryText(f) || "내용 확인 필요",
-      six_r: detect6R(String(f.summary || f.content || "")),
-      source_room: f._resolvedRoom,
-      source_file: f.file_name,
-      uploader: f._resolvedName,
-      date: kohFormatDate(f.created_at),
-    })).join("\n\n");
-    const canSend = items.some(f => f.telegram_file_id);
-    await kohSendHtml(env, chatId, `${body}${canSend ? "\n\n파일을 받으려면 파일명 언급 후 '보내줘'라고 해주세요." : ""}`);
+    const rawItems = await kohResolveItems(env, relFiltered.slice(0, 5), "uploader_id", "uploader_name");
+    const items = rawItems
+      .filter(f => !isBotGeneratedOutput(f.summary || f.content || "", f._resolvedName || ""))
+      .slice(0, 3);
+
+    if (!items.length) {
+      await kohSendHtml(env, chatId, "관련 자료는 확인되지만, 요약 가능한 본문을 찾지 못했습니다. 원본이 필요하면 자료명을 지정해 요청해주세요.");
+      return true;
+    }
+
+    // 후보를 pending에 저장 (이후 "1번 원본 보내줘" 처리용)
+    await kohSavePending(env, chatId, KOH_INTENT.FILE_RESEND, items);
+
+    const cards = [];
+    for (const f of items) {
+      try {
+        const card = await buildIssueCardFromCandidate(f, env);
+        if (!card || !card.summary) continue;
+        if (looksLikeRawChatResponse(card.summary)) continue;
+        cards.push(card);
+      } catch (e) {
+        console.error("MATERIAL_FIND IssueCard:", e);
+      }
+    }
+
+    if (!cards.length) {
+      await kohSendHtml(env, chatId, "관련 자료는 확인되지만, 요약 가능한 업무 본문을 찾지 못했습니다. 원본이 필요하면 자료명을 지정해 요청해주세요.");
+      return true;
+    }
+
+    const output = cards.map((card, idx) => formatIssueCardForMaterialFind(card, idx + 1)).join("\n\n");
+    await kohSendHtml(env, chatId, output);
     return true;
   }
 
