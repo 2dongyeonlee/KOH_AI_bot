@@ -4272,7 +4272,7 @@ async function handleDebugRoomIngest(env, chatId, message) {
   }
 }
 
-async function handleDebugExportIngest(env, chatId) {
+async function legacyHandleDebugExportIngest(env, chatId) {
   if (!env.DB) { await sendMessage(env, chatId, "DB 없음"); return; }
   try {
     const requiredFileCols = ["source_type", "source_status", "original_room", "source_path", "media_group_key", "from_name", "from_id"];
@@ -4337,7 +4337,7 @@ async function handleDebugExportIngest(env, chatId) {
   }
 }
 
-async function handleDebugActiveLegacy(env, chatId) {
+async function legacyHandleDebugActiveLegacy(env, chatId) {
   if (!env.DB) { await sendMessage(env, chatId, "DB 없음"); return; }
   try {
     const checkCols = ["source_type", "source_status", "original_room"];
