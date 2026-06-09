@@ -479,59 +479,74 @@ async function resolveUserName(env, userId, fallbackName = "") {
   } catch (_) { return fallback; }
 }
 
-function inferTitle(row) {
-  // 응답·인사말 패턴 — 제목으로 쓰면 안 되는 것들
-  const responsePatterns = [
-    /^(네|넵|알겠습니다|확인하겠습니다|반영하겠습니다|수정하겠습니다|보고드립니다|말씀드립니다)/,
-    /^(그리하겠습니다|검토하겠습니다|전달하겠습니다|진행하겠습니다)/,
-    /^(담당님|사장님|팀장님).{0,5}(네|넵|알겠|확인|반영)/,
-    /Telegram export file/i,
-    /^photo\.|^image\./i,
+// 안건 카테고리 자동 분류
+function classifyAgenda(text) {
+  const t = String(text || "").toLowerCase();
+  const categories = [
+    { name: "대외 커뮤니케이션", keywords: ["언론", "보도", "기자", "pr", "comm", "커뮤니케이션", "대외", "인터뷰", "성명", "입장문", "mou", "발표"] },
+    { name: "정부·정책", keywords: ["정부", "정책", "국회", "법", "규제", "지자체", "행정", "선거", "지방선거", "당선", "정치", "gr", "adr", "sec", "ipo", "상장"] },
+    { name: "노사·인사", keywords: ["노사", "성과급", "임금", "복리", "직원", "구성원", "채용", "퇴직", "인사", "승진", "조직", "the소통", "더소통"] },
+    { name: "사내 보고", keywords: ["보고", "kpi", "실적", "공과기술서", "pre-emd", "pmo", "tf", "월간", "주간", "검토", "승인", "결재", "6r", "monthly"] },
+    { name: "사업·전략", keywords: ["전략", "사업", "비전", "선포식", "로드맵", "투자", "협력", "파트너", "계약", "ai factory", "hbm", "낸드", "반도체"] },
+    { name: "위기·이슈", keywords: ["화재", "사고", "위기", "리스크", "대응", "m15", "mx", "생산차질", "품질", "recall", "리콜"] },
+    { name: "글로벌·외신", keywords: ["외신", "nikkei", "bloomberg", "reuters", "nvidia", "젠슨황", "엔비디아", "intel", "tsmc", "글로벌", "해외"] },
+    { name: "행사·이벤트", keywords: ["행사", "이벤트", "포럼", "컨퍼런스", "세미나", "방문", "미팅", "간담회", "니케이"] },
   ];
-
-  const raw = String(row.summary || row.extracted_text || row.content || "").trim();
-
-  if (raw.length >= 6) {
-    // 구조화된 안건 제목이 있으면 우선 사용
-    const agendaMatch = raw.match(/\[안건\d+\]\s*(.+?)(?:\n|$)/);
-    if (agendaMatch) return agendaMatch[1].trim().slice(0, 40);
-
-    // 줄 단위로 제목 후보 탐색
-    const lines = raw.split(/[\n.!?\/]/);
-    for (const line of lines) {
-      const clean = line
-        .replace(/(요약|정리|알려줘|해줘|보내줘|공유해줘|확인|담당님|사장님|넵|네\s|그리하겠|반영하|수정하)/g, "")
-        .replace(/Telegram export file.*/i, "")
-        .trim();
-
-      // 응답 패턴이면 건너뜀
-      if (responsePatterns.some(p => p.test(clean))) continue;
-      // 너무 짧거나 길면 건너뜀
-      if (clean.length >= 8 && clean.length <= 45) return clean;
-    }
-
-    // 응답 패턴 필터링 후 첫 30자
-    const cleaned = raw
-      .split("\n")
-      .filter(l => !responsePatterns.some(p => p.test(l.trim())))
-      .join(" ")
-      .replace(/Telegram export file[^\n]*/gi, "")
-      .trim()
-      .slice(0, 40);
-    if (cleaned.length >= 5) return cleaned;
+  for (const cat of categories) {
+    if (cat.keywords.some(kw => t.includes(kw))) return cat.name;
   }
+  return "업무 안건";
+}
 
-  // 파일명에서 추출 (최후 수단)
+// 내용에서 실제 안건명 생성 (응답 문장 제거)
+function generateAgendaTitle(content, category) {
+  const text = String(content || "").trim();
+  const removePatterns = [
+    /^(네|넵|알겠습니다|확인하겠습니다|반영하겠습니다|수정하겠습니다|진행하겠습니다|검토하겠습니다|전달하겠습니다)[.,\s]*/,
+    /^(그리하겠습니다|그렇게하겠습니다|말씀드립니다|보고드립니다)[.,\s]*/,
+    /^(담당님|사장님|팀장님)[,\s]+(네|넵|알겠|확인)[.,\s]*/,
+    /Telegram export file[^\n]*/gi,
+    /^photo\.|^image\./i,
+    /\s*(으로|로|이라고|라고)\s*$/,
+  ];
+  const lines = text.split(/[\n]/);
+  for (const line of lines) {
+    let clean = line.trim();
+    for (const p of removePatterns) clean = clean.replace(p, "").trim();
+    if (/^(네|넵|알|반영|수정|확인|검토|전달|진행|그리하|말씀|보고).{0,5}(겠습니다|하겠|드립니다)/.test(clean)) continue;
+    if (clean.length < 8 || clean.length > 50) continue;
+    return `[${category}] ${clean}`;
+  }
+  const firstMeaningful = lines
+    .map(l => l.trim())
+    .filter(l => l.length >= 8 && !removePatterns.some(p => p.test(l)))
+    .filter(l => !/^(네|넵|알겠|반영|수정|확인|검토|진행|그리하|말씀|보고)/.test(l))
+    [0] || "";
+  return firstMeaningful.length >= 5
+    ? `[${category}] ${firstMeaningful.slice(0, 35)}`
+    : `[${category}] 업무 자료`;
+}
+
+function inferTitle(row) {
+  const raw = String(row.summary || row.extracted_text || row.content || "").trim();
+  if (raw) {
+    const agendaMatch = raw.match(/\[안건\d+\]\s*(.{5,40})(?:\n|$)/);
+    if (agendaMatch) return agendaMatch[1].trim();
+    const category = classifyAgenda(raw);
+    return generateAgendaTitle(raw, category);
+  }
   if (row.file_name) {
     const name = String(row.file_name)
       .replace(/\.[a-zA-Z0-9]{1,6}$/, "")
       .replace(/[@_\-\d]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
-    if (name.length >= 4) return name.slice(0, 40);
+    if (name.length >= 4) {
+      const category = classifyAgenda(name);
+      return `[${category}] ${name.slice(0, 35)}`;
+    }
   }
-
-  return "업무 안건";
+  return "[업무 안건] 자료 확인 필요";
 }
 
 function kohResolveRoomTitle(row, personName = "") {
@@ -1301,14 +1316,25 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
 
     const fileCorpus = items.map((f, i) => {
       const content = String(f.summary || f.content || "").replace(/Telegram export file[^\n]*/g, "").trim().slice(0, 300);
-      return `[${i+1}] 공유자: ${f._resolvedName || "미확인"} / 날짜: ${kohFormatDate(f.created_at)}\n내용: ${content || "내용 없음"}`;
+      return `[${i+1}] 방: ${f._resolvedRoom || "알 수 없는 방"} / 공유자: ${f._resolvedName || "미확인"} / 날짜: ${kohFormatDate(f.created_at)}\n내용: ${content || "내용 없음"}`;
     }).join("\n\n");
 
     const aiQuery = TONE_RULE +
-      `다음은 팀에서 공유된 파일들의 내용입니다. 각 파일을 업무 안건명(5~20자)으로 명확히 제목을 붙이고, 핵심 내용을 2줄로 요약해줘.\n\n` +
-      `형식:\n[번호] 안건명: OOO 관련 보고 건\n내용: 핵심 내용 1줄\n출처: 공유자 / 날짜\n\n` +
-      `파일 내용이 없거나 "Telegram export"만 있으면 "이미지 자료 (내용 확인 필요)"로 표시.\n\n` +
-      fileCorpus;
+      `다음은 팀에서 공유된 파일들입니다. 각 파일의 내용을 읽고 아래 형식으로 정리해줘.\n\n` +
+      `[중요 규칙]\n` +
+      `1. 제목은 내용을 읽고 직접 작성 — 파일 내 문장을 그대로 쓰지 말 것\n` +
+      `2. "여겠습니다", "알겠습니다", "반영하겠습니다" 같은 응답 문장은 제목 불가\n` +
+      `3. 카테고리 분류 필수:\n` +
+      `   [정부·정책] / [노사·인사] / [사내 보고] / [대외 커뮤니케이션]\n` +
+      `   [위기·이슈] / [사업·전략] / [글로벌·외신] / [행사·이벤트]\n` +
+      `4. 하나의 자료에 여러 안건이 있으면 각각 별도로 작성\n\n` +
+      `[출력 형식]\n` +
+      `📌 [카테고리] 안건명 (10~25자)\n` +
+      `· 핵심 내용: 1~2줄 (사실 기반, 추정 금지)\n` +
+      `· 위치: [방이름]\n` +
+      `· 공유자: <u>이름</u> / 날짜\n` +
+      `· 링크: URL (있을 때만)\n\n` +
+      `[파일 내용]\n` + fileCorpus;
 
     let aiResult = "";
     try {
