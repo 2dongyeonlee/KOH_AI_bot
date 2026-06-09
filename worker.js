@@ -4077,11 +4077,84 @@ async function routeSlashCommand(env, message, text, chatId) {
     await handleDebugActiveLegacy(env, chatId);
     return true;
   }
+  if (/^\/admin_migrate\b/.test(t)) {
+    await handleAdminMigrateSchema(env, chatId, message.from?.id);
+    return true;
+  }
   if (/^\/help\b/.test(t)) {
     await sendMessage(env, chatId, getHelpText());
     return true;
   }
   return false;
+}
+
+async function handleAdminMigrateSchema(env, chatId, userId) {
+  if (!env.DB) { await sendMessage(env, chatId, "DB 없음"); return; }
+  const isAdmin = await checkIsAdmin(String(userId || ""), env);
+  if (!isAdmin) { await sendMessage(env, chatId, "관리자만 실행 가능합니다."); return; }
+
+  const EXPORT_SCHEMA = {
+    files: [
+      ["source_type",         "TEXT DEFAULT ''"],
+      ["source_status",       "TEXT DEFAULT 'legacy'"],
+      ["original_room",       "TEXT DEFAULT ''"],
+      ["source_path",         "TEXT DEFAULT ''"],
+      ["media_group_key",     "TEXT DEFAULT ''"],
+      ["from_name",           "TEXT DEFAULT ''"],
+      ["from_id",             "TEXT DEFAULT ''"],
+      ["telegram_message_id", "TEXT DEFAULT ''"],
+    ],
+    messages: [
+      ["source_type",          "TEXT DEFAULT ''"],
+      ["source_status",        "TEXT DEFAULT 'legacy'"],
+      ["original_room",        "TEXT DEFAULT ''"],
+      ["from_name",            "TEXT DEFAULT ''"],
+      ["from_id",              "TEXT DEFAULT ''"],
+      ["reply_to_message_id",  "TEXT DEFAULT ''"],
+      ["telegram_message_id",  "TEXT DEFAULT ''"],
+    ],
+  };
+
+  const lines = ["[Schema Migration]", ""];
+  let added = 0, skipped = 0, failed = 0;
+
+  for (const [table, cols] of Object.entries(EXPORT_SCHEMA)) {
+    let existing = new Set();
+    try {
+      const rows = (await env.DB.prepare(`PRAGMA table_info(${table})`).all()).results || [];
+      existing = new Set(rows.map(r => r.name));
+    } catch (e) {
+      lines.push(`❌ PRAGMA ${table}: ${String(e.message || e).slice(0, 100)}`);
+      failed++;
+      continue;
+    }
+
+    for (const [col, def] of cols) {
+      if (existing.has(col)) {
+        lines.push(`⏩ ${table}.${col}`);
+        skipped++;
+        continue;
+      }
+      try {
+        await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`).run();
+        lines.push(`✅ ${table}.${col} 추가`);
+        added++;
+      } catch (e) {
+        const msg = String(e.message || e);
+        if (/duplicate column|already exists/i.test(msg)) {
+          lines.push(`⏩ ${table}.${col} (이미 존재)`);
+          skipped++;
+        } else {
+          lines.push(`❌ ${table}.${col}: ${msg.slice(0, 80)}`);
+          failed++;
+        }
+      }
+    }
+  }
+
+  lines.push("", `추가: ${added}개 / skip: ${skipped}개 / 실패: ${failed}개`);
+  if (!failed) lines.push("✅ 완료 — 이제 ingest_export.js 로 데이터를 적재하세요.");
+  await sendMessage(env, chatId, lines.join("\n"));
 }
 
 async function handleDebugToday(env, chatId) {
