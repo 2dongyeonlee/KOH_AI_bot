@@ -50,7 +50,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-current-reply-summary-6r-issuecard-20260609-0700";
+const BUILD_VERSION = "koh-recent-brief-issuecard-no-raw-20260609-0740";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -895,28 +895,56 @@ async function buildIssueCardFromCurrentText(env, bundle, query, userId) {
 
 function formatIssueCard(card) {
   if (!card) return "";
+  const sixRStr = Array.isArray(card.six_r) && card.six_r.length
+    ? card.six_r.join("/")
+    : (card.sixR && typeof card.sixR === "string" ? card.sixR : "");
+  const category = card.agenda_category || "";
+  const issueTitle = card.issue_title || card.title || "주요 이슈 확인 필요";
+  const summaryText = card.summary || "";
+  const actionItems = Array.isArray(card.action_items) ? card.action_items
+    : (Array.isArray(card.actions) ? card.actions : []);
+
+  const tagParts = [];
+  if (sixRStr) tagParts.push(`[${escapeHtml(sixRStr)}]`);
+  if (category) tagParts.push(`[${escapeHtml(category)}]`);
+  const tagPrefix = tagParts.length ? tagParts.join(" ") + " " : "";
+
   const lines = [];
-  const heading = card.category ? `📌 ${card.category} ${escapeHtml(card.title)}` : `📌 ${escapeHtml(card.title)}`;
-  lines.push(heading);
-  if (card.summary) {
-    const summaryLines = card.summary.split(/\n/).map(l => l.trim()).filter(Boolean);
-    for (const sl of summaryLines.slice(0, 3)) {
-      lines.push(`· ${escapeHtml(sl)}`);
+  lines.push(`📌 <b>${tagPrefix}${escapeHtml(issueTitle)}</b>`);
+
+  if (summaryText) {
+    const sl = summaryText.split(/\n/).map(l => l.trim()).filter(Boolean);
+    for (const s of sl.slice(0, 3)) {
+      lines.push(`· <b>내용</b>: ${escapeHtml(s)}`);
     }
+  } else {
+    lines.push(`· <b>내용</b>: 핵심 내용 확인 필요`);
   }
-  if (card.actor) {
-    const dateTag = card.dateStr ? ` (${card.dateStr})` : "";
-    lines.push(`· 공유/전달: <u>${escapeHtml(card.actor)}</u>${dateTag}`);
+
+  if (actionItems.length) {
+    lines.push(`· <b>액션</b>: ${escapeHtml(actionItems.slice(0, 3).join(", "))}`);
   }
-  if (card.schedule) {
-    lines.push(`⚡ 마감/일정: ${escapeHtml(card.schedule)}`);
+
+  const sourceRoom = card.source_room || "";
+  const sourceFile = card.source_file || "";
+  const locParts = [];
+  if (sourceRoom) locParts.push(`[${sourceRoom}]`);
+  if (sourceFile) locParts.push(sourceFile);
+  if (locParts.length) {
+    lines.push(`· <b>자료 위치</b>: ${escapeHtml(locParts.join(" > "))}`);
   }
-  if (card.actions && card.actions.length > 0) {
-    lines.push(`\n▸ 액션아이템`);
-    for (const a of card.actions) {
-      lines.push(`  · ${escapeHtml(a)}`);
-    }
+
+  const actor = card.original_author || card.shared_by || card.actor || card.uploader || "";
+  const dateStr = card.date || card.dateStr || "";
+  if (actor || dateStr) {
+    lines.push(`· <b>공유/전달</b>: <u>${escapeHtml(actor || "공유자 확인 필요")}</u>${dateStr ? " / " + escapeHtml(dateStr) : ""}`);
   }
+
+  const schedule = card.schedule || "";
+  if (schedule) {
+    lines.push(`⚡ 마감/일정: ${escapeHtml(schedule)}`);
+  }
+
   return lines.join("\n");
 }
 
@@ -936,6 +964,151 @@ async function handleCurrentContentSummary(env, message, query, chatId, userId) 
     await sendMessage(env, chatId, summary || "요약 결과를 생성할 수 없습니다.");
   }
   return true;
+}
+
+// ── 소스 텍스트 정제 ──────────────────────────────────────────────────────────
+function cleanSourceTextForSummary(text) {
+  return String(text || "")
+    .split(/\n+/)
+    .map(l => l.trim())
+    .filter(Boolean)
+    .filter(l => !/^(네|넵|알겠습니다|확인하겠습니다|반영하겠습니다|수정하겠습니다|진행하겠습니다|검토하겠습니다|전달하겠습니다)/.test(l))
+    .filter(l => !/^(그러하겠습니다|그리하겠습니다|말씀드립니다|보고드립니다)/.test(l))
+    .filter(l => !/^(담당님|사장님|팀장님)[,\s]+(네|넵|알겠|확인)/.test(l))
+    .filter(l => !/Telegram export file/i.test(l))
+    .filter(l => !/^photo\.|^image\./i.test(l))
+    .filter(l => !/저장된 파일 \d+건입니다/.test(l))
+    .filter(l => !/관련 파일 \d+건/.test(l))
+    .filter(l => !/📌\s*</.test(l))
+    .join("\n")
+    .trim();
+}
+
+function isBotGeneratedOutput(text, senderName = "") {
+  const t = String(text || "");
+  const s = String(senderName || "").toLowerCase();
+  if (s.includes("bot") || s.includes("koh_ai_bot")) return true;
+  if (t.includes("저장된 파일") && t.includes("건입니다")) return true;
+  if (t.includes("관련 파일") && t.includes("번호를 선택")) return true;
+  if (t.includes("📌") && (t.includes("자료 위치") || t.includes("공유/전달"))) return true;
+  if (t.includes("· <b>내용</b>:") || t.includes("· <b>자료 위치</b>:")) return true;
+  return false;
+}
+
+function formatShortDateFromValue(v) {
+  if (!v) return "";
+  const d = typeof v === "number" ? new Date(v * 1000) : new Date(v);
+  if (Number.isNaN(d.getTime())) return "";
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${mm}/${dd}`;
+}
+
+function summarizeByRule(text) {
+  const t = cleanSourceTextForSummary(text);
+  const sentences = t
+    .split(/[.!?\n。]/)
+    .map(s => s.trim())
+    .filter(s => s.length >= 15)
+    .filter(s => !/^(네|넵|알겠|확인|반영|수정|검토|전달)/.test(s));
+  return sentences[0]
+    ? sentences[0].slice(0, 140)
+    : "자료의 핵심 내용 확인이 필요합니다.";
+}
+
+async function summarizeCandidateContent(text, sixR, env) {
+  const cleaned = cleanSourceTextForSummary(text);
+  const rLabel = Array.isArray(sixR) && sixR.length ? sixR.join("/") : (sixR && typeof sixR === "string" ? sixR : "업무");
+  if (!cleaned || cleaned.length < 20) return "자료의 핵심 내용 확인이 필요합니다.";
+  const prompt =
+    `다음 자료를 ${rLabel} 관점의 업무 안건으로 1~2줄 요약해줘.\n\n` +
+    `[규칙]\n` +
+    `- 원문 문장을 그대로 길게 복사하지 말 것\n` +
+    `- 인사말/응답문/잡담 제거\n` +
+    `- 핵심 사실, 목적, 일정, 보고/검토 포인트 중심\n` +
+    `- 추정 금지\n` +
+    `- 140자 이내\n\n` +
+    `[자료]\n${cleaned.slice(0, 5000)}`;
+  try {
+    const r = await difyChat(env, { query: prompt, user: "koh", conversationId: "" });
+    return cleanOneLine(r.answer || "").slice(0, 180) || summarizeByRule(cleaned);
+  } catch (e) {
+    return summarizeByRule(cleaned);
+  }
+}
+
+async function buildIssueCardFromCandidate(candidate, env) {
+  const rawText = candidate.summary || candidate.extracted_text || candidate.content || candidate.text || candidate.file_name || "";
+  const cleanText = cleanSourceTextForSummary(rawText);
+  const basisText = cleanText || candidate.file_name || "";
+  const agenda_category = typeof classifyAgenda === "function" ? classifyAgenda(basisText) : "";
+  const six_r = inferSixRByRule(basisText);
+  const sixRArr = six_r ? [six_r] : [];
+  const issue_title = await generateSmartIssueTitle(env, basisText, "koh");
+  const summary = await summarizeCandidateContent(basisText, six_r, env);
+  const action_items = await extractActionItemsFromText(env, basisText, "koh");
+  return {
+    issue_title: issue_title || candidate.file_name || "주요 이슈 확인 필요",
+    agenda_category,
+    summary,
+    six_r: sixRArr,
+    action_items,
+    source_room: candidate._resolvedRoom || candidate.room_title || candidate.resolved_room_title || candidate.source || "",
+    source_file: candidate.file_name || "",
+    original_author: candidate.original_author || "",
+    shared_by: candidate.shared_by || "",
+    actor: candidate._resolvedName || candidate.uploader_name || candidate.sender_name || "",
+    date: formatShortDateFromValue(candidate.created_at || candidate.date),
+    relevance_score: candidate._score || candidate.relevance_score || 0
+  };
+}
+
+async function extractIssueCardsFromLongText(text, env, baseMeta = {}) {
+  const cleaned = cleanSourceTextForSummary(text);
+  if (!cleaned || cleaned.length < 50) return [];
+  const prompt =
+    `다음 본문에서 서로 다른 업무 안건을 최대 5개까지 분리해 JSON 배열로 출력해줘.\n\n` +
+    `[각 항목 필드]\n` +
+    `issue_title: 10~25자 명사형 제목\n` +
+    `summary: 1~2줄 요약, 원문 복붙 금지\n` +
+    `six_r: GR/PR/IR/CR/BR/ER 중 배열 (예: ["CR","GR"])\n` +
+    `agenda_category: 정부·정책/노사·인사/사내 보고/대외 커뮤니케이션/위기·이슈/사업·전략/글로벌·외신/행사·이벤트 중 하나\n` +
+    `action_items: 최대 3개 배열\n\n` +
+    `[규칙]\n` +
+    `- 응답문/잡담 제외\n` +
+    `- 여러 키워드가 있으면 안건별로 분리\n` +
+    `- JSON 배열만 출력\n\n` +
+    `[본문]\n${cleaned.slice(0, 7000)}`;
+  try {
+    const r = await difyChat(env, { query: prompt, user: "koh", conversationId: "" });
+    const raw = String(r.answer || "");
+    const arr = JSON.parse(raw.match(/\[[\s\S]*\]/)?.[0] || "[]");
+    if (Array.isArray(arr) && arr.length) {
+      return arr.slice(0, 5).map(x => ({
+        issue_title: cleanTitle(x.issue_title || ""),
+        agenda_category: x.agenda_category || (typeof classifyAgenda === "function" ? classifyAgenda(cleaned) : ""),
+        summary: cleanOneLine(x.summary || "").slice(0, 180),
+        six_r: Array.isArray(x.six_r) ? x.six_r : [inferSixRByRule(cleaned)].filter(Boolean),
+        action_items: Array.isArray(x.action_items) ? x.action_items.slice(0, 3) : [],
+        source_room: baseMeta.source_room || "",
+        source_file: baseMeta.source_file || "",
+        original_author: baseMeta.original_author || "",
+        shared_by: baseMeta.shared_by || "",
+        actor: baseMeta.actor || "",
+        date: baseMeta.date || ""
+      }));
+    }
+  } catch (e) {
+    console.error("extractIssueCardsFromLongText:", e);
+  }
+  const fallback = await buildIssueCardFromCandidate({
+    text: cleaned,
+    _resolvedRoom: baseMeta.source_room,
+    file_name: baseMeta.source_file,
+    _resolvedName: baseMeta.actor,
+    created_at: baseMeta.date
+  }, env);
+  return fallback ? [fallback] : [];
 }
 
 function kohIsFileSendRequest(text = "") {
@@ -1743,7 +1916,7 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
     return true;
   }
 
-  // ── FILE_LIST ─────────────────────────────────────────────────────────────
+  // ── FILE_LIST (recent material brief — IssueCard only, no raw output) ───────
   if (intent === KOH_INTENT.FILE_LIST) {
     if (!scoredFiles.length && !hasTerms) {
       const { files: f14r } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, 14, roomAliasTitle);
@@ -1760,54 +1933,42 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
     }
 
     const display = scoredFiles.slice(0, 10);
-    const items = await kohResolveItems(env, display, "uploader_id", "uploader_name");
+    const allItems = await kohResolveItems(env, display, "uploader_id", "uploader_name");
 
-    const fileCorpus = items.map((f, i) => {
-      const content = String(f.summary || f.content || "").replace(/Telegram export file[^\n]*/g, "").trim().slice(0, 300);
-      return `[${i+1}] 방: ${f._resolvedRoom || "알 수 없는 방"} / 공유자: ${f._resolvedName || "미확인"} / 날짜: ${kohFormatDate(f.created_at)}\n내용: ${content || "내용 없음"}`;
-    }).join("\n\n");
+    // 봇이 생성한 요약 출력물 제외
+    const items = allItems.filter(f =>
+      !isBotGeneratedOutput(
+        f.summary || f.content || f.text || "",
+        f._resolvedName || f.uploader_name || ""
+      )
+    );
 
-    const aiQuery = TONE_RULE +
-      `다음은 팀에서 공유된 파일들입니다. 각 파일의 내용을 읽고 아래 형식으로 정리해줘.\n\n` +
-      `[중요 규칙]\n` +
-      `1. 제목은 내용을 읽고 직접 작성 — 파일 내 문장을 그대로 쓰지 말 것\n` +
-      `2. "여겠습니다", "알겠습니다", "반영하겠습니다" 같은 응답 문장은 제목 불가\n` +
-      `3. 카테고리 분류 필수:\n` +
-      `   [정부·정책] / [노사·인사] / [사내 보고] / [대외 커뮤니케이션]\n` +
-      `   [위기·이슈] / [사업·전략] / [글로벌·외신] / [행사·이벤트]\n` +
-      `4. 하나의 자료에 여러 안건이 있으면 각각 별도로 작성\n\n` +
-      `[출력 형식]\n` +
-      `📌 [카테고리] 안건명 (10~25자)\n` +
-      `· 핵심 내용: 1~2줄 (사실 기반, 추정 금지)\n` +
-      `· 위치: [방이름]\n` +
-      `· 공유자: <u>이름</u> / 날짜\n` +
-      `· 링크: URL (있을 때만)\n\n` +
-      `[파일 내용]\n` + fileCorpus;
-
-    let aiResult = "";
-    try {
-      const r = await difyChat(env, { query: aiQuery, user: userId, conversationId: "" });
-      aiResult = r.answer || "";
-    } catch(e) { console.error("FILE_LIST AI:", e); }
-
-    if (aiResult) {
-      await sendMessage(env, chatId, `최근 공유 자료 ${items.length}건\n\n${aiResult}`);
-    } else {
-      const body = items.map((f, i) => {
-        const card = {
-          category: "",
-          title: `${i + 1}. ${inferTitle(f)}`,
-          summary: String(f.summary || f.content || "내용 없음").replace(/Telegram export file[^\n]*/g, "").trim().slice(0, 200),
-          actor: f._resolvedName || "",
-          dateStr: kohFormatDate(f.created_at),
-          schedule: "",
-          actions: [],
-          sixR: "",
-        };
-        return formatIssueCard(card);
-      }).join("\n\n");
-      await kohSendHtml(env, chatId, `저장된 파일 ${items.length}건입니다.\n\n${body}`);
+    if (!items.length) {
+      await kohSendHtml(env, chatId, "최근 공유자료에서 요약할 수 있는 원문을 찾지 못했습니다.");
+      return true;
     }
+
+    // 각 자료를 IssueCard로 변환 — raw 복붙 금지
+    const cards = [];
+    for (const f of items.slice(0, 5)) {
+      try {
+        const card = await buildIssueCardFromCandidate(f, env);
+        if (card && card.summary && !/^(네|넵|알겠|확인|반영|수정)/.test(card.summary)) {
+          cards.push(card);
+        }
+      } catch (e) {
+        console.error("FILE_LIST IssueCard:", e);
+      }
+    }
+
+    if (!cards.length) {
+      await kohSendHtml(env, chatId, "자료 내용 요약 중 문제가 발생했습니다. 잠시 후 다시 시도해주세요.");
+      return true;
+    }
+
+    const body = cards.map(formatIssueCard).join("\n\n");
+    const suffix = items.length > 5 ? `\n\n더 보고 싶으면 "더 보여줘"라고 입력해주세요.` : "";
+    await kohSendHtml(env, chatId, body + suffix);
     return true;
   }
 
