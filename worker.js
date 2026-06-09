@@ -50,7 +50,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-material-find-no-raw-no-number-20260609-1100";
+const BUILD_VERSION = "koh-generic-material-find-dynamic-terms-20260609-1230";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -1033,30 +1033,104 @@ function isValidIssueTitle(title) {
   return true;
 }
 
-function extractStrongSearchTerms(query) {
-  const q = String(query || "");
-  const candidates = [];
-  const known = ["비전선포식", "New Vision", "ADR", "지방선거", "KPI", "공과기술서", "성과급", "HBM", "엔비디아", "AI 팩토리"];
-  for (const k of known) {
-    if (q.includes(k)) candidates.push(k);
+function extractDynamicSearchTerms(query) {
+  const q = String(query || "").trim();
+  const stopwords = new Set([
+    "자료", "파일", "문서", "관련", "찾아줘", "찾아", "어디", "있어", "있나요",
+    "알려줘", "확인해줘", "보여줘", "요약", "정리", "공유", "보내줘",
+    "원본", "좀", "해줘", "뭐야", "무엇", "최근", "올라온", "공유된", "것", "거"
+  ]);
+  const terms = [];
+
+  // 따옴표 안 표현 우선
+  const quoted = [...q.matchAll(/[""']([^""']{2,40})[""']/g)].map(m => m[1].trim());
+  terms.push(...quoted);
+
+  // 패턴 추출
+  const patterns = [
+    /(.{2,30})\s*관련\s*(자료|파일|문서|이슈|논의|보고자료)/,
+    /(.{2,30})\s*(자료|파일|문서|보고자료|회의자료|논의|이슈)\s*(찾아|어디|있|알려|보여)/,
+    /(.{2,30})\s*(찾아줘|어디\s*있|있어\??|알려줘|확인해줘)/,
+  ];
+  for (const p of patterns) {
+    const m = q.match(p);
+    if (m && m[1] && m[1].trim().length >= 2) terms.push(m[1].trim());
   }
-  return candidates;
+
+  // 토큰 추출: 한글/영문/숫자 2자 이상, stopword 제외
+  const tokens = q
+    .replace(/[^\p{L}\p{N}\s·._-]/gu, " ")
+    .split(/\s+/)
+    .map(x => x.trim())
+    .filter(x => x.length >= 2)
+    .filter(x => !stopwords.has(x));
+  terms.push(...tokens);
+
+  return [...new Set(
+    terms
+      .map(t => t.replace(/^(그|이|저)\s*/, "").trim())
+      .map(t => t.replace(/\s*(관련|자료|파일|문서|보고자료|찾아줘|알려줘|어디.*)$/, "").trim())
+      .filter(t => t.length >= 2)
+      .filter(t => !stopwords.has(t))
+  )].slice(0, 8);
 }
 
-function passMaterialFindRelevance(candidate, terms, query) {
-  const allTerms = Array.isArray(terms) && terms.length ? terms : extractStrongSearchTerms(String(query || ""));
-  if (!allTerms.length) return true;
-  const text = [
-    candidate.file_name,
-    candidate.title,
-    candidate.summary,
-    candidate.extracted_text,
-    candidate.content,
-    candidate.text,
-    candidate._resolvedRoom,
-  ].map(x => String(x || "")).join("\n");
-  const hay = text.toLowerCase();
-  return allTerms.some(t => hay.includes(String(t || "").toLowerCase()));
+function expandSearchTerms(terms) {
+  const aliasMap = {
+    "비전선포식": ["New Vision", "Vision", "선포식", "비전 선포"],
+    "ADR": ["ADR 상장", "나스닥", "상장", "Global AI Infra"],
+    "지방선거": ["선거", "지자체", "당선", "정책 대응"],
+    "KPI": ["성과", "실적", "공과기술서", "CEO 보고"],
+    "성과급": ["임금", "보상", "구성원", "노사"],
+    "엔비디아": ["NVIDIA", "젠슨황", "AI 팩토리", "AI Factory"],
+    "HBM": ["메모리", "AI 메모리", "반도체"],
+  };
+  const out = new Set(terms);
+  for (const term of terms) {
+    for (const [k, aliases] of Object.entries(aliasMap)) {
+      if (term.includes(k) || k.includes(term)) {
+        aliases.forEach(a => out.add(a));
+      }
+    }
+  }
+  return [...out];
+}
+
+function extractMetadataFilters(query) {
+  const q = String(query || "");
+  const filters = {};
+  const dateMatch = q.match(/(\d{1,2}월\s*\d{1,2}일|\d{1,2}\/\d{1,2}|오늘|어제|이번주|지난주)/);
+  if (dateMatch) filters.date_hint = dateMatch[1];
+  const personMatch = q.match(/([가-힣]{2,4})[이가]?\s*(올린|공유한|보낸|전달한)/);
+  if (personMatch) filters.uploader_hint = personMatch[1];
+  return filters;
+}
+
+function passMaterialFindRelevance(candidate, plan) {
+  const terms = Array.isArray(plan && plan.search_terms) ? plan.search_terms : [];
+  if (!terms.length) return true;
+
+  const metaFilters = plan.meta_filters || {};
+  // 사람 필터: uploader_hint가 있으면 이름 매칭 필수
+  if (metaFilters.uploader_hint) {
+    const uploaderText = [candidate._resolvedName, candidate.uploader_name, candidate.sender_name]
+      .map(x => String(x || "")).join(" ").toLowerCase();
+    if (!uploaderText.includes(metaFilters.uploader_hint.toLowerCase())) return false;
+  }
+
+  let score = 0;
+  for (const term of terms) {
+    const t = String(term || "").toLowerCase();
+    if (!t) continue;
+    if (String(candidate.file_name || "").toLowerCase().includes(t)) score += 5;
+    if (String(candidate.title || "").toLowerCase().includes(t)) score += 4;
+    if (String(candidate.summary || "").toLowerCase().includes(t)) score += 3;
+    if (String(candidate.extracted_text || "").toLowerCase().includes(t)) score += 2;
+    if (String(candidate.content || candidate.text || "").toLowerCase().includes(t)) score += 1;
+    if (String(candidate._resolvedRoom || candidate.room_title || "").toLowerCase().includes(t)) score += 1;
+  }
+  candidate.relevance_score = Math.max(candidate.relevance_score || 0, score);
+  return score >= 2;
 }
 
 function formatIssueCardForMaterialFind(card, index) {
@@ -2298,11 +2372,18 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
 
   // ── MATERIAL_FIND → IssueCard 요약 (번호 선택 금지) ──────────────────────
   if (intent === KOH_INTENT.MATERIAL_FIND) {
-    const gated = kohRelevanceGate(scoredFiles, terms, 8);
-    const relFiltered = gated.filter(c => passMaterialFindRelevance(c, terms, text));
+    // 동적 검색어 추출 + synonym 확장
+    const baseTerms = extractDynamicSearchTerms(text);
+    const searchTerms = expandSearchTerms(baseTerms.length ? baseTerms : terms);
+    const metaFilters = extractMetadataFilters(text);
+    const plan = { search_terms: searchTerms.length ? searchTerms : terms, user_goal: text, meta_filters: metaFilters };
+
+    const gated = kohRelevanceGate(scoredFiles, searchTerms.length ? searchTerms : terms, 5);
+    const relFiltered = gated.filter(c => passMaterialFindRelevance(c, plan));
     if (!relFiltered.length && !filteredMsgs.length) {
-      await kohSendHtml(env, chatId, terms.length
-        ? `"${terms.join(", ")}" 관련 자료를 찾지 못했습니다.`
+      const displayTerms = baseTerms.length ? baseTerms.slice(0, 3) : terms.slice(0, 3);
+      await kohSendHtml(env, chatId, displayTerms.length
+        ? `"${displayTerms.join(", ")}" 관련 자료를 찾지 못했습니다.`
         : "관련 자료를 찾지 못했습니다.");
       return true;
     }
