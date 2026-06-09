@@ -50,7 +50,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-generic-material-find-dynamic-terms-20260609-1230";
+const BUILD_VERSION = "koh-advanced-parser-before-chunking-20260609-1300";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -1138,6 +1138,214 @@ function formatIssueCardForMaterialFind(card, index) {
   return `${body}\n· <b>원본</b>: 필요하면 "${index}번 원본 보내줘"라고 입력`;
 }
 
+// ── Advanced Parser + Layout-aware Text Splitter ───────────────────────────────
+
+const CHUNK_POLICY = {
+  faq:             { minTokens: 100,  maxTokens: 300,  overlapRatio: 0.10 },
+  report:          { minTokens: 800,  maxTokens: 1200, overlapRatio: 0.18 },
+  ppt:             { minTokens: 600,  maxTokens: 1000, overlapRatio: 0.15 },
+  news:            { minTokens: 300,  maxTokens: 600,  overlapRatio: 0.12 },
+  blog:            { minTokens: 300,  maxTokens: 600,  overlapRatio: 0.12 },
+  meeting_note:    { minTokens: 700,  maxTokens: 1000, overlapRatio: 0.18 },
+  telegram_thread: { minTokens: 500,  maxTokens: 800,  overlapRatio: 0.12 },
+  image:           { minTokens: 0,    maxTokens: 0,    overlapRatio: 0    },
+  short_memo:      { minTokens: 0,    maxTokens: 0,    overlapRatio: 0    },
+};
+
+function detectDocumentType(source) {
+  const name = String(source.file_name || source.fileName || "").toLowerCase();
+  const mime = String(source.mime_type || source.mimeType || source.file_type || source.fileType || "").toLowerCase();
+  const text = String(source.extracted_text || source.summary || source.content || source.text || "");
+
+  if (mime.startsWith("image/") || /\.(jpg|jpeg|png|gif|webp|bmp|tiff?)$/i.test(name)) return "image";
+  if (mime.includes("pdf") || name.endsWith(".pdf")) {
+    if (/(회의|의사록|안건|발언|결정사항)/i.test(text)) return "meeting_note";
+    return "report";
+  }
+  if (/(ppt|pptx|odp)$/.test(name) || mime.includes("presentation")) return "ppt";
+  if (/(doc|docx|odt)$/.test(name) || mime.includes("word")) return "report";
+  if (/\.(txt|md)$/.test(name)) {
+    if (text.length < 500) return "short_memo";
+    if (/(Q:|A:|질문:|답변:|FAQ)/i.test(text)) return "faq";
+    return "short_memo";
+  }
+  if (/(회의|의사록|안건|발언|결정사항|참석자)/i.test(text)) return "meeting_note";
+  if (/(뉴스|기사|보도자료|bloomberg|reuters|nikkei)/i.test(text)) return "news";
+  if (text.length < 300) return "short_memo";
+  if (/(전략|로드맵|비전|사업계획|추진계획)/i.test(text)) return "report";
+  return "unknown";
+}
+
+function evaluateParserQuality(parsed) {
+  const text = String(parsed?.full_text || parsed?.layout_text || "").trim();
+  if (!text) return "failed";
+  if (text.length < 100) return "low";
+  if (/photo_|image_|Telegram export file/i.test(text)) return "low";
+  if (text.length >= 1000) return "high";
+  return "medium";
+}
+
+function buildParsedDocumentFromExistingFields(source) {
+  const docType = detectDocumentType(source);
+  const rawText = source.extracted_text || source.summary || source.content || source.text || "";
+  const fullText = cleanSourceTextForSummary(rawText);
+  const contextText = String(source._contextMessage || source.caption || "");
+  const combinedText = [fullText, contextText].filter(Boolean).join("\n").trim();
+
+  const parsed = {
+    parser_type: docType === "image" ? "image_ocr" : "existing_fields",
+    document_type: docType,
+    pages: [],
+    full_text: combinedText,
+    layout_text: combinedText,
+    parser_quality: "unknown",
+    needs_ocr: docType === "image" && !combinedText,
+    needs_manual_review: false,
+  };
+  parsed.parser_quality = evaluateParserQuality(parsed);
+  return parsed;
+}
+
+async function runAdvancedParser(source, env) {
+  // TODO: hook external OCR / vision / PDF parser here
+  return buildParsedDocumentFromExistingFields(source);
+}
+
+async function ensureParsedDocumentsTable(env) {
+  if (!env.DB) return;
+  try {
+    await env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS parsed_documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_type TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        parser_type TEXT DEFAULT '',
+        document_type TEXT DEFAULT 'unknown',
+        full_text TEXT DEFAULT '',
+        layout_json TEXT DEFAULT '{}',
+        parser_quality TEXT DEFAULT 'unknown',
+        needs_ocr INTEGER DEFAULT 0,
+        needs_manual_review INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `).run();
+  } catch (e) {
+    console.error("ensureParsedDocumentsTable:", e);
+  }
+}
+
+async function getParsedDocument(source, env) {
+  if (!env.DB) return null;
+  const sourceId = String(
+    source.telegram_file_unique_id || source.file_name || source.id || ""
+  );
+  const sourceType = source.source_type || (source.file_name ? "file" : "message");
+  if (!sourceId) return null;
+  try {
+    const row = await env.DB.prepare(
+      `SELECT * FROM parsed_documents WHERE source_type = ? AND source_id = ? ORDER BY id DESC LIMIT 1`
+    ).bind(sourceType, sourceId).first();
+    return row || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function saveParsedDocument(source, parsed, env) {
+  if (!env.DB) return;
+  const sourceId = String(
+    source.telegram_file_unique_id || source.file_name || source.id || ""
+  );
+  const sourceType = source.source_type || (source.file_name ? "file" : "message");
+  if (!sourceId) return;
+  try {
+    await ensureParsedDocumentsTable(env);
+    const existing = await getParsedDocument(source, env);
+    if (existing) {
+      await env.DB.prepare(`
+        UPDATE parsed_documents
+        SET parser_type=?, document_type=?, full_text=?, layout_json=?,
+            parser_quality=?, needs_ocr=?, needs_manual_review=?, updated_at=CURRENT_TIMESTAMP
+        WHERE id=?
+      `).bind(
+        parsed.parser_type || "",
+        parsed.document_type || "unknown",
+        String(parsed.full_text || "").slice(0, 50000),
+        JSON.stringify(parsed.pages || []),
+        parsed.parser_quality || "unknown",
+        parsed.needs_ocr ? 1 : 0,
+        parsed.needs_manual_review ? 1 : 0,
+        existing.id
+      ).run();
+    } else {
+      await env.DB.prepare(`
+        INSERT INTO parsed_documents
+          (source_type, source_id, parser_type, document_type, full_text, layout_json, parser_quality, needs_ocr, needs_manual_review)
+        VALUES (?,?,?,?,?,?,?,?,?)
+      `).bind(
+        sourceType, sourceId,
+        parsed.parser_type || "",
+        parsed.document_type || "unknown",
+        String(parsed.full_text || "").slice(0, 50000),
+        JSON.stringify(parsed.pages || []),
+        parsed.parser_quality || "unknown",
+        parsed.needs_ocr ? 1 : 0,
+        parsed.needs_manual_review ? 1 : 0
+      ).run();
+    }
+  } catch (e) {
+    console.error("saveParsedDocument:", e);
+  }
+}
+
+async function ensureParsedDocument(source, env) {
+  const existing = await getParsedDocument(source, env);
+  if (existing && existing.parser_quality !== "failed") return existing;
+  const parsed = await runAdvancedParser(source, env);
+  await saveParsedDocument(source, parsed, env);
+  return parsed;
+}
+
+function getBestTextForIssueCard(source, parsed) {
+  const docType = detectDocumentType(source);
+  if (parsed?.full_text && parsed.full_text.trim().length >= 50) return parsed.full_text;
+  if (source.extracted_text && source.extracted_text.trim().length >= 20) return source.extracted_text;
+  if (source.summary && source.summary.trim().length >= 20) return source.summary;
+  if (source.content && source.content.trim().length >= 20) return source.content;
+  if (docType === "image") return "";
+  return source.file_name || "";
+}
+
+function splitTextByDocumentType(fullText, documentType) {
+  const policy = CHUNK_POLICY[documentType] || CHUNK_POLICY.report;
+  if (!policy.maxTokens) return [];
+  const text = String(fullText || "").trim();
+  if (!text) return [];
+
+  // approx: 1 token ≈ 2 Korean chars
+  const maxChars = policy.maxTokens * 2;
+  const overlapChars = Math.floor(maxChars * policy.overlapRatio);
+
+  const sections = text.split(/\n{2,}/);
+  const chunks = [];
+  let buf = "";
+
+  for (const sec of sections) {
+    if ((buf.length ? buf.length + 2 : 0) + sec.length <= maxChars) {
+      buf = buf ? buf + "\n\n" + sec : sec;
+    } else {
+      if (buf) chunks.push(buf.trim());
+      const overlap = overlapChars > 0 && buf.length > overlapChars
+        ? buf.slice(-overlapChars)
+        : "";
+      buf = overlap ? overlap + "\n\n" + sec : sec;
+    }
+  }
+  if (buf.trim()) chunks.push(buf.trim());
+  return chunks;
+}
+
 function isBotGeneratedOutput(text, senderName = "") {
   const t = String(text || "");
   const s = String(senderName || "").toLowerCase();
@@ -1194,7 +1402,29 @@ async function summarizeCandidateContent(text, sixR, env) {
 
 // Single-LLM-call version: gets title + summary + action_items in one shot
 async function buildIssueCardFromCandidate(candidate, env) {
-  const rawText = candidate.summary || candidate.extracted_text || candidate.content || candidate.text || candidate.file_name || "";
+  // Advanced Parser: use cached parsed doc if present, else build from existing fields
+  const parsedDoc = candidate._parsed || buildParsedDocumentFromExistingFields(candidate);
+  const docType = parsedDoc.document_type || detectDocumentType(candidate);
+  const rawText = getBestTextForIssueCard(candidate, parsedDoc);
+
+  // Image/low-quality with no extractable text → return "확인 필요" card
+  if (!rawText && (docType === "image" || parsedDoc.parser_quality === "low" || parsedDoc.parser_quality === "failed")) {
+    return {
+      issue_title: "이미지 내용 확인 필요",
+      agenda_category: "업무 안건",
+      summary: "이미지 텍스트가 추출되지 않아 안건 요약이 필요합니다. OCR 또는 원본 확인이 필요합니다.",
+      six_r: [],
+      action_items: [],
+      source_room: candidate._resolvedRoom || candidate.room_title || "",
+      source_file: candidate.file_name || "",
+      original_author: "",
+      shared_by: "",
+      actor: candidate._resolvedName || candidate.uploader_name || candidate.sender_name || "",
+      date: formatShortDateFromValue(candidate.created_at || candidate.date),
+      relevance_score: 0,
+    };
+  }
+
   const cleanText = cleanSourceTextForSummary(rawText);
   const basisText = cleanText || candidate.file_name || "";
   const agenda_category = typeof classifyAgenda === "function" ? classifyAgenda(basisText) : "";
@@ -1230,8 +1460,12 @@ async function buildIssueCardFromCandidate(candidate, env) {
     }
   }
 
-  // Rule-based fallbacks — no extra LLM call
-  if (!issue_title) issue_title = candidate.file_name ? cleanTitle(candidate.file_name) : "주요 이슈 확인 필요";
+  // Rule-based fallbacks — no extra LLM call; never use image filenames
+  if (!issue_title) {
+    const fn = candidate.file_name || "";
+    const isImageFile = /^photo[_@.-]|^image[_@.-]|\.(jpg|jpeg|png|gif|webp)$/i.test(fn);
+    issue_title = fn && !isImageFile ? cleanTitle(fn) : "주요 이슈 확인 필요";
+  }
   if (!summary) summary = summarizeByRule(basisText);
 
   return {
@@ -6813,6 +7047,25 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
       summary,
       tags: ["document", ...room.tags],
     });
+
+    // Advanced Parser: cache parsed result for this file (non-blocking, best-effort)
+    try {
+      const fileUniqueId = message.document?.file_unique_id || "";
+      const parsedDoc = buildParsedDocumentFromExistingFields({
+        file_name: fileName,
+        mime_type: mimeType,
+        source_type: room.sourceType,
+        extracted_text: extractedText,
+        summary,
+        caption: message.caption || "",
+      });
+      await saveParsedDocument(
+        { telegram_file_unique_id: fileUniqueId, file_name: fileName, source_type: room.sourceType },
+        parsedDoc,
+        env
+      );
+    } catch (_) {}
+
     await sendMessage(env, chatId, summary || "파일은 저장됐으나 요약은 아직 미생성임.");
   } catch (e) {
     console.error("handleFile error:", e);
