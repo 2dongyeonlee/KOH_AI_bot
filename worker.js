@@ -50,7 +50,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-6r-assistant-priority-roadmap-20260609-0330";
+const BUILD_VERSION = "koh-general-chat-hard-guard-20260609-0630";
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -634,6 +634,7 @@ function kohIsInternalKnowledgeRequest(text = "") {
   const t = String(text || "").trim();
 
   if (/^\/\w+/.test(t)) return false;
+  if (isGeneralChatQuery(t)) return false;
 
   const hasInternalCue =
     /(자료|파일|문서|보고자료|보고내용|내용|상세|요약|정리|어디|위치|보내줘|공유해줘|첨부해줘|알려줘|포함된\s*방|다른\s*방|단체방|공유된|챙겨야|우선순위|안건|회의|일정|올라온|첨부된|저장된|뭐야|있어|뭐있어|뭐있었|전달해줘|공유됐|보여줘.*자료|자료.*보여줘|무슨\s*얘기|논의|뭐부터|먼저\s*챙길|핵심만|자세히|보고용)/.test(t);
@@ -643,6 +644,59 @@ function kohIsInternalKnowledgeRequest(text = "") {
     !/(방|대화|공유|자료|파일|문서|보고내용|우리|저희|팀)/.test(t);
 
   return hasInternalCue && !isPureExternal;
+}
+
+// ── GENERAL_CHAT hard guard ────────────────────────────────────────────────
+function isGeneralChatQuery(query) {
+  const q = String(query || "").trim().toLowerCase();
+  if (!q) return false;
+
+  const casualPatterns = [
+    /^(안녕|하이|hello|hi|헬로)$/i,
+    /^(뭐해|뭐하니|뭐하고\s*있어|모해)\??$/,
+    /^(밥\s*먹었니|밥\s*먹었어|밥\s*먹었냐|식사했어|식사\s*했니|점심\s*먹었어|저녁\s*먹었어)\??$/,
+    /^(잘\s*지내|잘\s*있어|괜찮아)\??$/,
+    /^(고마워|감사|땡큐|thanks)$/i,
+    /^(테스트|대답해봐|응답해봐|살아있어)\??$/,
+    /^(너\s*누구야|넌\s*누구야|너는\s*뭐야)\??$/,
+    /^(왜\s*안\s*돼|왜안돼|이거\s*왜\s*안돼|이거\s*돼|작동해)\??$/,
+    /^(어떻게\s*해|어케\s*해|어떻게\s*테스트|테스트\s*어떻게)\??$/,
+  ];
+  if (casualPatterns.some(p => p.test(q))) return true;
+
+  const workIntentKeywords = [
+    "자료", "파일", "문서", "보고", "요약", "정리", "공유", "보내", "전달",
+    "회의", "일정", "마감", "액션", "해야", "챙겨", "확인", "안건",
+    "이슈", "6r", "gr", "pr", "ir", "cr", "br", "er",
+    "뉴스", "기사", "검색", "찾아", "어디", "리스트", "목록",
+    "최근", "이번주", "오늘까지", "내일", "방금", "이 내용", "이거 요약",
+    "올라온", "첨부", "저장", "공유됐", "올라왔"
+  ];
+  const hasWorkIntent = workIntentKeywords.some(k => q.includes(k));
+  if (!hasWorkIntent && q.length <= 25) return true;
+
+  return false;
+}
+
+function makeGeneralChatReply(query) {
+  const q = String(query || "").trim();
+  if (/밥\s*먹었|식사|점심|저녁/.test(q)) return "아직 못 먹었어요. 식사 하셨어요?";
+  if (/뭐해|뭐하니|뭐하고/.test(q)) return "대기 중이에요. 자료 정리나 회의 내용 요약이 필요하면 바로 도와드릴게요.";
+  if (/안녕|하이|hello|hi/i.test(q)) return "안녕하세요. 필요한 자료나 안건 있으면 말씀해주세요.";
+  if (/테스트|대답해봐|응답/.test(q)) return "응답 정상입니다.";
+  if (/왜\s*안\s*돼|왜안돼|이거\s*돼|작동/.test(q)) return "현재 동작은 확인됐어요. 어떤 기능이 안 되는지 알려주시면 기준으로 점검해볼게요.";
+  if (/누구야|뭐야/.test(q)) return "저는 권오혁 담당님의 AI 비서입니다. 자료 찾기, 요약, 안건 정리 등을 도와드려요.";
+  return "네, 말씀해주세요.";
+}
+
+function isBotGeneratedSummary(text, senderName = "") {
+  const t = String(text || "");
+  const s = String(senderName || "").toLowerCase();
+  if (s.includes("bot") || s.includes("koh_ai_bot")) return true;
+  if (t.includes("📌 [") && t.includes("· 위치:")) return true;
+  if (t.includes("· 공유자:") && t.includes("· 핵심")) return true;
+  if (t.includes("관련 파일은 아래와 같습니다")) return true;
+  return false;
 }
 
 function kohIsFileSendRequest(text = "") {
@@ -1322,6 +1376,7 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
   function scoreMsgs(rows) {
     return rows
       .filter(m => !kohLooksLikeCommandOrRequestOnly(m.content))
+      .filter(m => !isBotGeneratedSummary(m.content, m.sender_name))
       .map(m => ({
         ...m,
         _score: kohScoreRecord(m, terms) +
@@ -5400,6 +5455,12 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
+  // GENERAL_CHAT hard guard in DM handler
+  if (isGeneralChatQuery(text)) {
+    await sendMessage(env, chatId, makeGeneralChatReply(text));
+    return;
+  }
+
   // internal knowledge: digest/file/priority 앞에서 먼저 처리
   if (kohIsInternalKnowledgeRequest(text)) {
     const handled = await kohHandleInternalKnowledgeRequest(env, chatId, text, "");
@@ -5596,7 +5657,7 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
   }
 
   // 자유 질문 — DB 자료 참고해서 SUMMARY_RULE 형식으로 답변
-  if (text.length > 2) {
+  if (text.length > 2 && !isGeneralChatQuery(text)) {
     try {
       const rows = await fetchDigestRows(env, 7, 100);
       if (rows.length > 0) {
@@ -5778,6 +5839,12 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     return;
   }
 
+  // GENERAL_CHAT hard guard — skip all retrieval
+  if (isGeneralChatQuery(cleanText)) {
+    await sendMessage(env, chatId, makeGeneralChatReply(cleanText));
+    return;
+  }
+
   if (await handleFileResendSelection(env, message, cleanText)) {
     return;
   }
@@ -5919,6 +5986,12 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     const query = TONE_RULE + "다음 팀 대화 기록의 핵심 논의를 항목별로 요약해줘.\n\n" + corpus;
     const result = await difyChat(env, { query, user: userId, conversationId: "" });
     await sendMessage(env, chatId, result.answer || "요약 중 오류가 발생했습니다.", { parseMode: "HTML" });
+    return;
+  }
+
+  // GENERAL_CHAT final gate — before digest fetch
+  if (isGeneralChatQuery(cleanText)) {
+    await sendMessage(env, chatId, makeGeneralChatReply(cleanText));
     return;
   }
 
