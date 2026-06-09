@@ -29,14 +29,14 @@ const SUMMARY_RULE = `
 ⚡ 마감: 날짜 (있을 때만)
 
 카테고리:
-[정부·정책] [노사·인사] [사내 보고] [대외 커뮤니케이션]
+[정부·정책] [노사·인사] [사내 보고] [대외컴]
 [위기·이슈] [사업·전략] [글로벌·외신] [행사·이벤트]
 
 규칙:
 - 제목은 내용을 읽고 직접 작성 — 본문 문장 그대로 붙여쓰기 금지
 - "여겠습니다", "알겠습니다" 같은 응답 문장은 제목 불가
 - 하나의 자료에 여러 안건이 있으면 각각 별도 📌로 분리
-- 파일명(photo_xxx 등)을 안건명으로 절대 쓰지 말 것
+- 파일명(photo[_]xxx 등)을 안건명으로 절대 쓰지 말 것
 - 안건 사이 반드시 한 줄 띄기
 - 모든 방 자료 빠짐없이 포함 필수
 - 1:1 방 공유 자료도 실제 공유자 이름 표시
@@ -503,7 +503,7 @@ async function resolveUserName(env, userId, fallbackName = "") {
 function classifyAgenda(text) {
   const t = String(text || "").toLowerCase();
   const categories = [
-    { name: "대외 커뮤니케이션", keywords: ["언론", "보도", "기자", "pr", "comm", "커뮤니케이션", "대외", "인터뷰", "성명", "입장문", "mou", "발표"] },
+    { name: "대외컴", keywords: ["언론", "보도", "기자", "pr", "comm", "커뮤니케이션", "대외", "인터뷰", "성명", "입장문", "mou", "발표"] },
     { name: "정부·정책", keywords: ["정부", "정책", "국회", "법", "규제", "지자체", "행정", "선거", "지방선거", "당선", "정치", "gr", "adr", "sec", "ipo", "상장"] },
     { name: "노사·인사", keywords: ["노사", "성과급", "임금", "복리", "직원", "구성원", "채용", "퇴직", "인사", "승진", "조직", "the소통", "더소통"] },
     { name: "사내 보고", keywords: ["보고", "kpi", "실적", "공과기술서", "pre-emd", "pmo", "tf", "월간", "주간", "검토", "승인", "결재", "6r", "monthly"] },
@@ -714,7 +714,7 @@ function isBotGeneratedSummary(text, senderName = "") {
   if (t.includes("📌 [") && t.includes("· 위치:")) return true;
   if (t.includes("· 공유자:") && t.includes("· 핵심")) return true;
   if (t.includes("관련 파일은 아래와 같습니다")) return true;
-  if (t.includes("📌") && t.includes("자료 위치:")) return true;
+  if (t.includes("📌") && t.includes("위치:")) return true;
   if (t.includes("공유/전달:") && t.includes("📌")) return true;
   if (/저장된 파일\s*\d+건입니다/.test(t)) return true;
   return false;
@@ -939,6 +939,7 @@ async function buildIssueCardFromCurrentText(env, bundle, query, userId) {
 
 function formatIssueCard(card) {
   if (!card) return "";
+  if (typeof formatReportCard === "function") return formatReportCard(card);
   const sixRStr = Array.isArray(card.six_r) && card.six_r.length
     ? card.six_r.join("/")
     : (card.sixR && typeof card.sixR === "string" ? card.sixR : "업무");
@@ -953,14 +954,14 @@ function formatIssueCard(card) {
   const summaryRaw = card.summary || "";
   const summaryOut = summaryRaw
     ? (cleanSourceTextForSummary(summaryRaw).split("\n").filter(Boolean)[0] || summaryRaw.split("\n")[0] || summaryRaw).slice(0, 200)
-    : "자료의 핵심 내용 확인이 필요합니다.";
+    : "본문에서 확인 가능한 업무 내용이 제한적임.";
   lines.push(`· <b>내용</b>: ${escapeHtml(summaryOut)}`);
 
   if (actionItems.length) {
     lines.push(`· <b>액션</b>: ${escapeHtml(actionItems.slice(0, 3).join(", "))}`);
   }
 
-  lines.push(`· <b>자료 위치</b>: ${formatSourceLocation(card)}`);
+  lines.push(`· <b>위치</b>: ${formatSourceLocation(card)}`);
 
   const actor = card.original_author || card.shared_by || card.actor || card.uploader || "공유자 확인 필요";
   const dateStr = card.date || card.dateStr || "";
@@ -1004,7 +1005,7 @@ function cleanSourceTextForSummary(text) {
     .filter(s => !/Telegram export file/i.test(s))
     .filter(s => !/저장된 파일 \d+건입니다/.test(s))
     .filter(s => !/관련 파일 \d+건/.test(s))
-    .filter(s => !/🧩 내용|📎 자료 위치|👤 공유자/.test(s))
+    .filter(s => !/🧩 내용|📎 위치|👤 공유자/.test(s))
     .filter(s => !/📌\s*</.test(s))
     .filter(s => !/제공된 파일 내용이 없어/.test(s))
     .join("\n")
@@ -1058,7 +1059,7 @@ function makeSafeSummaryFromText(text) {
     return "지방선거 결과와 관련된 대응 전략 자료가 공유됨. 지역별 정책·커뮤니케이션 포인트 확인이 필요합니다.";
   if (/(업무흐름|업무\s*흐름|정의서)/i.test(cleaned))
     return "업무흐름 정의 관련 자료가 공유됨. 프로세스와 역할 구분 확인이 필요합니다.";
-  return "자료의 핵심 내용 확인이 필요합니다.";
+  return "본문에서 확인 가능한 업무 내용이 제한적임.";
 }
 
 function isImageCandidate(c) {
@@ -1135,14 +1136,14 @@ function containsLegacyOutput(text) {
   const t = String(text || "");
   return (
     t.includes("🧩 내용") ||
-    t.includes("📎 자료 위치") ||
+    t.includes("📎 위치") ||
     t.includes("👤 공유자/일자") ||
     t.includes("👤 공유자") ||
     t.includes("저장된 파일") ||
     t.includes("[[사내 보고]") ||
-    t.includes("[[대외 커뮤니케이션]") ||
+    t.includes("[[대외컴]") ||
     t.includes("[[업무 안건]") ||
-    /photo_\d+@/.test(t)
+    /photo[_]\d+@/.test(t)
   );
 }
 
@@ -1306,9 +1307,105 @@ function passMaterialFindRelevance(candidate, plan) {
   return score >= 2;
 }
 
+function normalizeReportCategory(text = "") {
+  const t = String(text || "").toLowerCase();
+  if (/(언론|뉴스룸|공시|고객사\s*letter|letter|mou|대외|보도|기사|pr|ir|cr|comm|adr|solidigm|솔리다임|epic)/i.test(t)) return "대외컴";
+  if (/(리스크|확인\s*필요|대응\s*필요|우려|지연|논란|이슈|화재|위기|리콜|장애|불확실|risk)/i.test(t)) return "이슈";
+  return "보고";
+}
+
+function stripPhotoFileName(text = "") {
+  return String(text || "")
+    .replace(/\b(?:photo|image)[_@.-][^\s<>\]]+/gi, "이미지")
+    .replace(/Telegram export file[^\n]*/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function cleanReportTitle(text = "", category = "보고") {
+  let t = stripPhotoFileName(text)
+    .replace(/\[[^\]]+\]/g, " ")
+    .replace(/\.[a-z0-9]{2,5}\b/gi, " ")
+    .replace(/[_\-@]+/g, " ")
+    .replace(/\b\d{6,}\b/g, " ")
+    .replace(/^(자료|파일|문서|보고자료|이미지|내용|확인|요약|정리)\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!t || looksLikeBadRawTitle(t) || /^이미지\s*\d*장?$/.test(t)) {
+    t = ({ 보고: "보고자료 핵심 점검", 이슈: "대응 필요 이슈 점검", 대외컴: "대외 메시지 점검" }[category] || "보고자료 핵심 점검");
+  }
+  if (t.length > 25) t = t.slice(0, 25).trim();
+  if (t.length < 8) t = `${t} 주요 안건`.trim().slice(0, 25);
+  return t;
+}
+
+function cleanReportSummary(text = "", card = {}) {
+  const raw = stripPhotoFileName(cleanSourceTextForSummary(text || ""));
+  if (!raw || /핵심 내용 확인/.test(raw)) {
+    if (card.source_type === "image" || card.source_type === "image_group") return "이미지에서 확인 가능한 텍스트가 없음.";
+    return "본문에서 확인 가능한 업무 내용이 제한적임.";
+  }
+  const first = raw.split(/\n|[.!?]\s/).map(s => s.trim()).filter(Boolean)[0] || raw;
+  return first.slice(0, 160);
+}
+
+function formatReportSourceLocation(card = {}) {
+  const roomName = card.source_room || card.room_title || card.source || "알 수 없는 방";
+  const room = `[${escapeHtml(roomName)}]`;
+  const date = card.date || card.dateStr || formatShortDateFromValue(card.created_at || "");
+  const imageCount = Number(card.image_count || (card.source_type === "image" ? 1 : 0));
+  if (imageCount > 0 || card.source_type === "image_group" || card.source_type === "image") {
+    return `${room} / ${escapeHtml(date || "")} / 이미지 ${imageCount || 1}장`;
+  }
+  const file = sanitizeDisplayFileName(card.display_file_name || card.source_file || card.file_name || "");
+  return `${room} / ${escapeHtml(date || "")}${file ? " / " + escapeHtml(file) : ""}`;
+}
+
+function formatReportCard(card) {
+  if (!card) return "";
+  const basis = [card.agenda_category, card.issue_title, card.title, card.summary, card.source_file, card.display_file_name].join(" ");
+  const category = normalizeReportCategory(basis);
+  const summary = cleanReportSummary(card.summary || card.text || card.content || "", card);
+  const title = ((card.source_type === "image" || card.source_type === "image_group") && summary.includes("텍스트가 없음"))
+    ? "이미지 내용 미확인 공유자료"
+    : cleanReportTitle(card.issue_title || card.title || card.summary || card.source_file || "", category);
+  const actionItems = Array.isArray(card.action_items) ? card.action_items : (Array.isArray(card.actions) ? card.actions : []);
+  const lines = [
+    `<b>[${escapeHtml(category)}] ${escapeHtml(title)}</b>`,
+    `• <b>내용</b>: ${escapeHtml(summary)}`,
+  ];
+  if (actionItems.length) lines.push(`• <b>확인</b>: ${escapeHtml(stripPhotoFileName(actionItems.slice(0, 2).join(", ")).slice(0, 120))}`);
+  lines.push(`• <b>위치</b>: ${formatReportSourceLocation(card)}`);
+  return lines.join("\n");
+}
+
+function cardDedupKey(card = {}) {
+  return [
+    normalizeReportCategory([card.agenda_category, card.issue_title, card.summary].join(" ")),
+    cleanReportTitle(card.issue_title || card.title || card.summary || card.source_file || ""),
+    card.source_room || card.room_title || card.source || "",
+    card.date || card.dateStr || "",
+    sanitizeDisplayFileName(card.display_file_name || card.source_file || card.file_name || ""),
+    card.image_count || "",
+  ].join("|").toLowerCase();
+}
+
+function dedupeReportCards(cards = [], limit = 3) {
+  const seen = new Set();
+  const out = [];
+  for (const card of cards.filter(Boolean)) {
+    const key = cardDedupKey(card);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(card);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 function formatIssueCardForMaterialFind(card, index) {
-  const body = formatIssueCard(card);
-  return `${body}\n· <b>원본</b>: 필요하면 "${index}번 원본 보내줘"라고 입력`;
+  const body = formatReportCard(card);
+  return `${body}\n\u2022 <b>\uC6D0\uBCF8</b>: \uD544\uC694\uD558\uBA74 "${index}\uBC88 \uC6D0\uBCF8 \uBCF4\uB0B4\uC918"\uB77C\uACE0 \uC785\uB825`;
 }
 
 // ── Advanced Parser + Layout-aware Text Splitter ───────────────────────────────
@@ -1353,7 +1450,7 @@ function evaluateParserQuality(parsed) {
   const text = String(parsed?.full_text || parsed?.layout_text || "").trim();
   if (!text) return "failed";
   if (text.length < 100) return "low";
-  if (/photo_|image_|Telegram export file/i.test(text)) return "low";
+  if (/photo[_]|image_|Telegram export file/i.test(text)) return "low";
   if (text.length >= 1000) return "high";
   return "medium";
 }
@@ -1527,8 +1624,8 @@ function isBotGeneratedOutput(text, senderName = "") {
   if (s.includes("bot") || s.includes("koh_ai_bot")) return true;
   if (t.includes("저장된 파일") && t.includes("건입니다")) return true;
   if (t.includes("관련 파일") && t.includes("번호를 선택")) return true;
-  if (t.includes("📌") && (t.includes("자료 위치") || t.includes("공유/전달"))) return true;
-  if (t.includes("· <b>내용</b>:") || t.includes("· <b>자료 위치</b>:")) return true;
+  if (t.includes("📌") && (t.includes("위치") || t.includes("공유/전달"))) return true;
+  if (t.includes("· <b>내용</b>:") || t.includes("· <b>위치</b>:")) return true;
   return false;
 }
 
@@ -1550,13 +1647,13 @@ function summarizeByRule(text) {
     .filter(s => !/^(네|넵|알겠|확인|반영|수정|검토|전달)/.test(s));
   return sentences[0]
     ? sentences[0].slice(0, 140)
-    : "자료의 핵심 내용 확인이 필요합니다.";
+    : "본문에서 확인 가능한 업무 내용이 제한적임.";
 }
 
 async function summarizeCandidateContent(text, sixR, env) {
   const cleaned = cleanSourceTextForSummary(text);
   const rLabel = Array.isArray(sixR) && sixR.length ? sixR.join("/") : (sixR && typeof sixR === "string" ? sixR : "업무");
-  if (!cleaned || cleaned.length < 20) return "자료의 핵심 내용 확인이 필요합니다.";
+  if (!cleaned || cleaned.length < 20) return "본문에서 확인 가능한 업무 내용이 제한적임.";
   const prompt =
     `다음 자료를 ${rLabel} 관점의 업무 안건으로 1~2줄 요약해줘.\n\n` +
     `[규칙]\n` +
@@ -1749,14 +1846,14 @@ async function handleRecentMaterialBrief(items, chatId, env) {
     } catch (e) { console.error("handleRecentMaterialBrief card:", e); }
   }
 
-  const finalCards = cards.filter(Boolean).slice(0, 5);
+  const finalCards = dedupeReportCards(cards, 3);
 
   if (!finalCards.length) {
     await kohSendHtml(env, chatId, "최근 공유자료는 확인되지만, 요약 가능한 업무 본문을 찾지 못했습니다.");
     return;
   }
 
-  let output = finalCards.map(formatIssueCard).join("\n\n");
+  let output = finalCards.map(formatReportCard).join("\n\n");
 
   if (containsLegacyOutput(output)) {
     console.warn("[BLOCKED_LEGACY_OUTPUT] handleRecentMaterialBrief", output.slice(0, 300));
@@ -1782,7 +1879,7 @@ async function handleBriefingSummary(env, chatId, text, currentRoomId = "") {
       String(c.created_at || "") >= startIso &&
       String(c.created_at || "") <= endIso
     )
-    .slice(0, 5);
+    .slice(0, 3);
 
   if (!candidates.length) {
     await kohSendHtml(env, chatId, `오늘(${kstDate} KST) 공유된 자료를 찾지 못했습니다.\n적재 상태 확인: /debug_today`);
@@ -1804,15 +1901,18 @@ async function handleBriefingSummary(env, chatId, text, currentRoomId = "") {
     return;
   }
 
-  const header = `📋 <b>오늘 브리핑 후보 (${kstDate} KST)</b>\n\n`;
-  let output = cards.filter(Boolean).map(formatIssueCard).join("\n\n");
+  const safeBriefingTitle = String(text || "").includes("\uB0B4\uC77C")
+    ? "\uB0B4\uC77C \uBE0C\uB9AC\uD551 \uD6C4\uBCF4"
+    : "\uC624\uB298 \uBE0C\uB9AC\uD551 \uD6C4\uBCF4";
+  const reportHeader = `<b>${escapeHtml(safeBriefingTitle)} (${escapeHtml(kstDate)} KST)</b>\n\n`;
+  let output = dedupeReportCards(cards, 3).map(formatReportCard).join("\n\n");
 
   if (containsLegacyOutput(output)) {
     console.warn("[BLOCKED_LEGACY_OUTPUT] handleBriefingSummary", output.slice(0, 300));
     output = "브리핑 자료를 확인했지만 출력 포맷 오류가 감지되었습니다.";
   }
 
-  await kohSendHtml(env, chatId, header + output);
+  await kohSendHtml(env, chatId, reportHeader + output);
 }
 
 async function extractIssueCardsFromLongText(text, env, baseMeta = {}) {
@@ -1824,7 +1924,7 @@ async function extractIssueCardsFromLongText(text, env, baseMeta = {}) {
     `issue_title: 10~25자 명사형 제목\n` +
     `summary: 1~2줄 요약, 원문 복붙 금지\n` +
     `six_r: GR/PR/IR/CR/BR/ER 중 배열 (예: ["CR","GR"])\n` +
-    `agenda_category: 정부·정책/노사·인사/사내 보고/대외 커뮤니케이션/위기·이슈/사업·전략/글로벌·외신/행사·이벤트 중 하나\n` +
+    `agenda_category: 정부·정책/노사·인사/사내 보고/대외컴/위기·이슈/사업·전략/글로벌·외신/행사·이벤트 중 하나\n` +
     `action_items: 최대 3개 배열\n\n` +
     `[규칙]\n` +
     `- 응답문/잡담 제외\n` +
@@ -4653,7 +4753,7 @@ async function handleFilesCommand(env, chatId) {
       return formatIssueCard({
         issue_title: f.file_name ? cleanTitle(f.file_name) : "파일명 없음",
         agenda_category: typeof classifyAgenda === "function" ? classifyAgenda(cleanedSummary || f.file_name || "") : "",
-        summary: summaryText || "자료의 핵심 내용 확인이 필요합니다.",
+        summary: summaryText || "본문에서 확인 가능한 업무 내용이 제한적임.",
         six_r: [inferSixRByRule(cleanedSummary || f.file_name || "")].filter(Boolean),
         action_items: [],
         source_room: f.room_title || f.joined_room_title || "알 수 없는 방",
@@ -5463,7 +5563,7 @@ async function sendFileRow(env, chatId, row) {
     await kohSendHtml(env, chatId,
       `원본 전송용 file_id가 저장되어 있지 않아 바로 전송할 수 없습니다.\n` +
       extraMsg +
-      `\n· <b>자료 위치</b>: ${loc}\n` +
+      `\n· <b>위치</b>: ${loc}\n` +
       `· <b>공유/전달</b>: <u>${escapeHtml(actor)}</u> / ${formatShortDate(row.created_at)}`
     );
     return;
@@ -5483,7 +5583,7 @@ async function sendFileRow(env, chatId, row) {
     console.error("sendFileRow Telegram error:", e.message);
     await kohSendHtml(env, chatId,
       `파일 전송 중 오류가 발생했습니다. Telegram file_id가 만료되었을 수 있습니다.\n` +
-      `· <b>자료 위치</b>: [${escapeHtml(room)}] &gt; ${escapeHtml(displayName || "파일")}\n` +
+      `· <b>위치</b>: [${escapeHtml(room)}] &gt; ${escapeHtml(displayName || "파일")}\n` +
       `· <b>공유/전달</b>: <u>${escapeHtml(actor)}</u> / ${formatShortDate(row.created_at)}`
     );
   }
@@ -6325,7 +6425,7 @@ function summarizePriorityText(item) {
   }
   if (/M15|화재|고객사|Letter|대외/i.test(text)) {
     return {
-      judgment: "고객사 Letter와 대외 커뮤니케이션 리스크가 연결되어 우선 확인 필요성이 큼.",
+      judgment: "고객사 Letter와 대외컴 리스크가 연결되어 우선 확인 필요성이 큼.",
       action: "Letter 검토 현황과 유관부서 협의 상태를 먼저 확인 필요.",
     };
   }
@@ -6342,14 +6442,15 @@ function summarizePriorityText(item) {
     };
   }
   return {
-    judgment: "최근 기록에서 반복 확인되어 이번주 우선 확인 후보로 보임.",
+    judgment: "최근 저장 기록 기준 확인되어 이번주 우선 확인 후보로 보임.",
     action: "담당자·마감·보고 필요 여부를 먼저 확인 필요.",
   };
 }
 
 function formatPriorityAnswer(candidates) {
   if (!candidates.length) return "최근 저장된 업무 기록이 없어 우선순위를 판단할 수 없음.";
-  const items = candidates.slice(0, 5).map((item, idx) => {
+  const top = candidates.slice(0, 3);
+  const items = top.map((item, idx) => {
     const s = summarizePriorityText(item);
     const date = formatShortDate(item.latest);
     const room = [...item.rooms][0] || "알 수 없는 방";
@@ -6357,7 +6458,7 @@ function formatPriorityAnswer(candidates) {
     const file = [...item.files][0] || "";
     const loc = file ? `${room} > ${file}` : `${room} > 관련 메시지`;
     const content = `${s.judgment} / ${s.action}`;
-    return formatIssueCard({
+    return formatReportCard({
       issue_title: `${idx + 1}. ${item.name}`,
       summary: content,
       source_room: room,
@@ -6367,11 +6468,11 @@ function formatPriorityAnswer(candidates) {
       uploader: actor,
       date,
       six_r: [],
-      agenda_category: "업무·전략",
+      agenda_category: "보고",
       action_items: [],
     });
   }).join("\n\n");
-  return `이번주 챙길 안건 ${candidates.slice(0, 5).length}건입니다.\n\n${items}`;
+  return `우선 확인 안건 ${top.length}건입니다.\n\n${items}`;
 }
 
 async function handlePriorityQuestion(env, chatId, text) {
@@ -6407,10 +6508,10 @@ async function answerDigest(env, userText, userId) {
     `[출력 형식 - 이 형식 외 절대 다른 형식 사용 금지]\n` +
     `📌 [6R코드] [카테고리] 안건명 (명사형 10~25자)\n` +
     `· 내용: 1~2줄 요약 (사실 기반, 추정 금지)\n` +
-    `· 자료 위치: [방이름] &gt; 파일명\n` +
+    `· 위치: [방이름] &gt; 파일명\n` +
     `· 공유/전달: 공유자이름 / MM/DD\n\n` +
-    `6R코드: GR/PR/IR/CR/BR/ER 중 선택. 카테고리: 정부·정책/노사·인사/사내 보고/대외 커뮤니케이션/위기·이슈/사업·전략 중 선택.\n` +
-    `위 형식을 안건마다 반복. photo_xxx/파일명을 안건명으로 쓰지 말 것.\n`;
+    `6R코드: GR/PR/IR/CR/BR/ER 중 선택. 카테고리: 정부·정책/노사·인사/사내 보고/대외컴/위기·이슈/사업·전략 중 선택.\n` +
+    `위 형식을 안건마다 반복. photo[_]xxx/파일명을 안건명으로 쓰지 말 것.\n`;
   const result = await difyChat(env, { query, user: String(userId), conversationId: "" });
   return result?.answer || "요약을 생성하지 못했습니다.";
 }
@@ -6703,7 +6804,7 @@ async function analyzeAndStructureFile(env, fileId, content) {
     `다음 문서/대화를 분석해서 포함된 모든 업무 안건을 각각 추출해줘.\n\n` +
     `[카테고리 분류]\n` +
     `내용을 읽고 아래 중 하나로 분류:\n` +
-    `정부·정책 / 노사·인사 / 사내 보고 / 대외 커뮤니케이션\n` +
+    `정부·정책 / 노사·인사 / 사내 보고 / 대외컴\n` +
     `위기·이슈 / 사업·전략 / 글로벌·외신 / 행사·이벤트\n\n` +
     `[추출 규칙]\n` +
     `- 여러 안건이 있으면 반드시 각각 분리 (합치지 말 것)\n` +
@@ -7300,7 +7401,7 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
       `· 핵심 내용 1~2줄\n` +
       `· 출처: [방이름] 공유자 (날짜 시간)\n\n` +
       `[규칙]\n` +
-      `- 파일명(photo_xxx 등)을 제목으로 쓰지 말 것\n` +
+      `- 파일명(photo[_]xxx 등)을 제목으로 쓰지 말 것\n` +
       `- 내용 기반으로 안건명 직접 작성 (예: KPI 공과기술서 보고 건, MOU 커뮤니케이션 방안 등)\n` +
       `- 안건별로 한 줄 띄어쓰기\n` +
       `- 마크다운(*,#,**) 사용 금지\n` +
@@ -7358,7 +7459,7 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
       `· 핵심 내용 1~2줄\n` +
       `· 출처: [방이름] 공유자 (날짜 시간)\n\n` +
       `[규칙]\n` +
-      `- 파일명(photo_xxx 등)을 제목으로 쓰지 말 것\n` +
+      `- 파일명(photo[_]xxx 등)을 제목으로 쓰지 말 것\n` +
       `- 안건별로 한 줄 띄어쓰기\n` +
       `- 마크다운(*,#,**) 사용 금지\n` +
       `- 이모티콘(📌) 포함\n\n` +
@@ -7715,7 +7816,7 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
       `· 핵심 내용 1~2줄\n` +
       `· 출처: [방이름] 공유자 (날짜 시간)\n\n` +
       `[규칙]\n` +
-      `- 파일명(photo_xxx 등)을 제목으로 쓰지 말 것\n` +
+      `- 파일명(photo[_]xxx 등)을 제목으로 쓰지 말 것\n` +
       `- 안건별로 한 줄 띄어쓰기\n` +
       `- 마크다운(*,#,**) 사용 금지\n` +
       `- 이모티콘(📌) 포함\n\n` +
