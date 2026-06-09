@@ -50,7 +50,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-final-natural-router-canonical-output-20260609-2000";
+const BUILD_VERSION = "koh-export-ingest-202605-202606-final";
 
 function readBoolEnv(env, key, defaultValue = false) {
   const val = String(env[key] || "").trim().toLowerCase();
@@ -2074,6 +2074,16 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
   const roomFilter = currentRoomOnly && currentRoomId ? "AND CAST(f.room_id AS TEXT) = ?" : "";
   const msgRoomFilter = currentRoomOnly && currentRoomId ? "AND CAST(m.room_id AS TEXT) = ?" : "";
 
+  // source_status 컬럼 여부에 따라 active 우선 정렬 적용
+  const hasFileStatus = await columnExists(env, "files", "source_status");
+  const hasMsgStatus = await columnExists(env, "messages", "source_status");
+  const fileOrderBy = hasFileStatus
+    ? "CASE WHEN COALESCE(f.source_status,'legacy') = 'active' THEN 0 ELSE 1 END ASC, f.created_at DESC"
+    : "f.created_at DESC";
+  const msgOrderBy = hasMsgStatus
+    ? "CASE WHEN COALESCE(m.source_status,'legacy') = 'active' THEN 0 ELSE 1 END ASC, m.created_at DESC"
+    : "m.created_at DESC";
+
   const fileSql = `
     SELECT
       f.id,
@@ -2099,13 +2109,15 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
       '' AS source_type,
       f.saved_by,
       '' AS r2_key,
-      f.created_at
+      f.created_at,
+      ${hasFileStatus ? "f.source_status" : "'legacy'"} AS source_status,
+      ${hasFileStatus ? "COALESCE(f.original_room, '')" : "''"} AS original_room
     FROM files f
     LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(f.room_id AS TEXT)
     WHERE 1=1
       ${fileDateFilter}
       ${roomFilter}
-    ORDER BY f.created_at DESC
+    ORDER BY ${fileOrderBy}
     LIMIT 200
   `;
 
@@ -2125,7 +2137,9 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
       '' AS source_type,
       m.saved_by,
       m.content,
-      m.created_at
+      m.created_at,
+      ${hasMsgStatus ? "m.source_status" : "'legacy'"} AS source_status,
+      ${hasMsgStatus ? "COALESCE(m.original_room, '')" : "''"} AS original_room
     FROM messages m
     LEFT JOIN rooms r ON CAST(r.room_id AS TEXT) = CAST(m.room_id AS TEXT)
     WHERE m.created_at >= ?
@@ -2134,7 +2148,7 @@ async function kohFetchRecentFilesAndMessages(env, currentRoomId = "", currentRo
       AND m.content NOT LIKE '/%'
       AND m.content NOT LIKE '%@KOH_AI_bot%'
       ${msgRoomFilter}
-    ORDER BY m.created_at DESC
+    ORDER BY ${msgOrderBy}
     LIMIT 300
   `;
 
@@ -4055,6 +4069,14 @@ async function routeSlashCommand(env, message, text, chatId) {
     await handleDebugRoomIngest(env, chatId, message);
     return true;
   }
+  if (/^\/debug_export_ingest\b/.test(t)) {
+    await handleDebugExportIngest(env, chatId);
+    return true;
+  }
+  if (/^\/debug_active_legacy\b/.test(t)) {
+    await handleDebugActiveLegacy(env, chatId);
+    return true;
+  }
   if (/^\/help\b/.test(t)) {
     await sendMessage(env, chatId, getHelpText());
     return true;
@@ -4156,6 +4178,96 @@ async function handleDebugRoomIngest(env, chatId, message) {
     );
   } catch (e) {
     await sendMessage(env, chatId, `debug_room_ingest 오류: ${String(e?.message || e).slice(0, 300)}`);
+  }
+}
+
+async function handleDebugExportIngest(env, chatId) {
+  if (!env.DB) { await sendMessage(env, chatId, "DB 없음"); return; }
+  try {
+    const hasSourceStatus = await columnExists(env, "files", "source_status");
+    const hasOriginalRoom = await columnExists(env, "files", "original_room");
+    const hasMsgSourceStatus = await columnExists(env, "messages", "source_status");
+
+    if (!hasSourceStatus || !hasMsgSourceStatus) {
+      await sendMessage(env, chatId,
+        "source_status 컬럼이 없습니다.\n" +
+        "node scripts/ingest_export.js <export-root> 를 먼저 실행하세요."
+      );
+      return;
+    }
+
+    const fileRows = (await env.DB.prepare(
+      `SELECT original_room, source_status, COUNT(*) AS cnt, MAX(created_at) AS last_at
+       FROM files
+       WHERE source_type = 'telegram_export'
+       GROUP BY original_room, source_status
+       ORDER BY original_room, source_status`
+    ).all()).results || [];
+
+    const msgRows = (await env.DB.prepare(
+      `SELECT original_room, source_status, COUNT(*) AS cnt
+       FROM messages
+       WHERE source_type = 'telegram_export'
+       GROUP BY original_room, source_status
+       ORDER BY original_room`
+    ).all()).results || [];
+
+    if (!fileRows.length && !msgRows.length) {
+      await sendMessage(env, chatId, "telegram_export 데이터가 없습니다. 적재가 필요합니다.");
+      return;
+    }
+
+    const fileLines = fileRows.map(r =>
+      `· ${r.original_room || "(방 없음)"} [${r.source_status || "legacy"}]: 파일 ${r.cnt}건 (최근 ${String(r.last_at || "").slice(0, 10)})`
+    );
+    const msgLines = msgRows.map(r =>
+      `· ${r.original_room || "(방 없음)"} [${r.source_status || "legacy"}]: 메시지 ${r.cnt}건`
+    );
+
+    await sendMessage(env, chatId,
+      `[Export 적재 현황]\n\n` +
+      `[파일]\n${fileLines.join("\n") || "없음"}\n\n` +
+      `[메시지]\n${msgLines.join("\n") || "없음"}`
+    );
+  } catch (e) {
+    await sendMessage(env, chatId, `debug_export_ingest 오류: ${String(e?.message || e).slice(0, 300)}`);
+  }
+}
+
+async function handleDebugActiveLegacy(env, chatId) {
+  if (!env.DB) { await sendMessage(env, chatId, "DB 없음"); return; }
+  try {
+    const hasStatus = await columnExists(env, "files", "source_status");
+    const hasMsgStatus = await columnExists(env, "messages", "source_status");
+
+    const fileActive = hasStatus
+      ? (await env.DB.prepare(`SELECT COUNT(*) AS c FROM files WHERE source_status = 'active'`).first())?.c || 0
+      : 0;
+    const fileLegacy = hasStatus
+      ? (await env.DB.prepare(`SELECT COUNT(*) AS c FROM files WHERE source_status != 'active' OR source_status IS NULL`).first())?.c || 0
+      : (await env.DB.prepare(`SELECT COUNT(*) AS c FROM files`).first())?.c || 0;
+    const msgActive = hasMsgStatus
+      ? (await env.DB.prepare(`SELECT COUNT(*) AS c FROM messages WHERE source_status = 'active'`).first())?.c || 0
+      : 0;
+    const msgLegacy = hasMsgStatus
+      ? (await env.DB.prepare(`SELECT COUNT(*) AS c FROM messages WHERE source_status != 'active' OR source_status IS NULL`).first())?.c || 0
+      : (await env.DB.prepare(`SELECT COUNT(*) AS c FROM messages`).first())?.c || 0;
+
+    const totalFiles = fileActive + fileLegacy;
+    const totalMsgs = msgActive + msgLegacy;
+
+    await sendMessage(env, chatId,
+      `[source_status 현황]\n\n` +
+      `[파일] 전체 ${totalFiles}건\n` +
+      `· active:  ${fileActive}건\n` +
+      `· legacy:  ${fileLegacy}건\n\n` +
+      `[메시지] 전체 ${totalMsgs}건\n` +
+      `· active:  ${msgActive}건\n` +
+      `· legacy:  ${msgLegacy}건\n\n` +
+      (hasStatus ? "" : "⚠️ source_status 컬럼 없음 — ingest_export.js 실행 후 재확인")
+    );
+  } catch (e) {
+    await sendMessage(env, chatId, `debug_active_legacy 오류: ${String(e?.message || e).slice(0, 300)}`);
   }
 }
 
@@ -5160,14 +5272,19 @@ async function sendFileRow(env, chatId, row) {
   const displayName = sanitizeDisplayFileName(row.file_name) || "";
 
   if (!fileId) {
-    // r2_key fallback TODO — for now inform user clearly
     const loc = displayName
       ? `[${room}] &gt; ${escapeHtml(displayName)}`
       : `[${room}]`;
+    const sourcePath = row.source_path || "";
+    const isExport = row.source_status === "active" || sourcePath;
+    const extraMsg = isExport
+      ? `\n· <b>원본 경로</b>: export 자료 (telegram_file_id 없음, R2 전송 미구현)\n` +
+        (sourcePath ? `· <b>로컬 경로</b>: <code>${escapeHtml(sourcePath)}</code>\n` : "")
+      : `원본은 재업로드 후부터 전송 가능합니다.\n`;
     await kohSendHtml(env, chatId,
       `원본 전송용 file_id가 저장되어 있지 않아 바로 전송할 수 없습니다.\n` +
-      `해당 자료는 위치/요약은 확인되며, 원본은 재업로드 후부터 전송 가능합니다.\n\n` +
-      `· <b>자료 위치</b>: ${loc}\n` +
+      extraMsg +
+      `\n· <b>자료 위치</b>: ${loc}\n` +
       `· <b>공유/전달</b>: <u>${escapeHtml(actor)}</u> / ${formatShortDate(row.created_at)}`
     );
     return;
