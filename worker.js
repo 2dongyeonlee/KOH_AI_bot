@@ -3580,6 +3580,12 @@ async function columnExists(env, tableName, columnName) {
   } catch (e) { return false; }
 }
 
+async function tableColumns(env, tableName) {
+  if (!env.DB || !(await tableExists(env, tableName))) return new Set();
+  const result = await env.DB.prepare(`PRAGMA table_info(${tableName})`).all();
+  return new Set((result.results || []).map(r => r.name));
+}
+
 async function safeCountTable(env, tableName) {
   const exists = await tableExists(env, tableName);
   if (!exists) return { exists: false, count: 0 };
@@ -3962,6 +3968,14 @@ async function routeSlashCommand(env, message, text, chatId) {
     await handleDebugImports(env, chatId);
     return true;
   }
+  if (/^\/debug_active_legacy\b/.test(t)) {
+    await handleDebugActiveLegacy(env, chatId);
+    return true;
+  }
+  if (/^\/debug_export_ingest\b/.test(t)) {
+    await handleDebugExportIngest(env, chatId);
+    return true;
+  }
   if (/^\/users\b/.test(t) || isUserListQuery(t)) {
     await handleUserList(chatId, env);
     return true;
@@ -4098,6 +4112,7 @@ async function handleAdminMigrateSchema(env, chatId, userId) {
       ["source_type",         "TEXT DEFAULT ''"],
       ["source_status",       "TEXT DEFAULT 'legacy'"],
       ["original_room",       "TEXT DEFAULT ''"],
+      ["export_message_id",   "TEXT DEFAULT ''"],
       ["source_path",         "TEXT DEFAULT ''"],
       ["media_group_key",     "TEXT DEFAULT ''"],
       ["from_name",           "TEXT DEFAULT ''"],
@@ -4108,9 +4123,12 @@ async function handleAdminMigrateSchema(env, chatId, userId) {
       ["source_type",          "TEXT DEFAULT ''"],
       ["source_status",        "TEXT DEFAULT 'legacy'"],
       ["original_room",        "TEXT DEFAULT ''"],
+      ["export_message_id",    "TEXT DEFAULT ''"],
       ["from_name",            "TEXT DEFAULT ''"],
       ["from_id",              "TEXT DEFAULT ''"],
       ["reply_to_message_id",  "TEXT DEFAULT ''"],
+      ["source_path",          "TEXT DEFAULT ''"],
+      ["media_group_key",      "TEXT DEFAULT ''"],
       ["telegram_message_id",  "TEXT DEFAULT ''"],
     ],
   };
@@ -5225,6 +5243,78 @@ async function handleDebugImports(env, chatId) {
     );
   } catch (e) {
     await sendMessage(env, chatId, `debug_imports 실패: ${String(e?.message || e).slice(0, 500)}`);
+  }
+}
+
+async function handleDebugActiveLegacy(env, chatId) {
+  if (!env.DB) {
+    await sendMessage(env, chatId, "DB 없음");
+    return;
+  }
+  try {
+    const requiredMessages = ["source_type", "source_status", "original_room", "export_message_id", "from_name", "from_id", "reply_to_message_id", "source_path", "media_group_key"];
+    const requiredFiles = ["source_type", "source_status", "original_room", "export_message_id", "from_name", "from_id", "source_path", "media_group_key"];
+    const msgCols = await tableColumns(env, "messages");
+    const fileCols = await tableColumns(env, "files");
+    const missingMessages = requiredMessages.filter(c => !msgCols.has(c));
+    const missingFiles = requiredFiles.filter(c => !fileCols.has(c));
+    let out = "[debug_active_legacy]\n";
+    out += `messages missing: ${missingMessages.join(", ") || "없음"}\n`;
+    out += `files missing: ${missingFiles.join(", ") || "없음"}\n`;
+    if (msgCols.has("source_status")) {
+      const rows = await env.DB.prepare(`SELECT source_status, COUNT(*) AS count FROM messages GROUP BY source_status ORDER BY source_status`).all();
+      out += "\nmessages\n" + ((rows.results || []).map(r => `${r.source_status || "(blank)"}: ${r.count}`).join("\n") || "없음") + "\n";
+    }
+    if (fileCols.has("source_status")) {
+      const rows = await env.DB.prepare(`SELECT source_status, COUNT(*) AS count FROM files GROUP BY source_status ORDER BY source_status`).all();
+      out += "\nfiles\n" + ((rows.results || []).map(r => `${r.source_status || "(blank)"}: ${r.count}`).join("\n") || "없음");
+    }
+    await sendMessage(env, chatId, out.slice(0, 3500));
+  } catch (e) {
+    await sendMessage(env, chatId, `debug_active_legacy 실패: ${String(e?.message || e).slice(0, 500)}`);
+  }
+}
+
+async function handleDebugExportIngest(env, chatId) {
+  if (!env.DB) {
+    await sendMessage(env, chatId, "DB 없음");
+    return;
+  }
+  try {
+    const msgCols = await tableColumns(env, "messages");
+    const fileCols = await tableColumns(env, "files");
+    const activeMessages = msgCols.has("source_status")
+      ? await env.DB.prepare(`SELECT COUNT(*) AS count FROM messages WHERE source_status = 'active'`).first()
+      : { count: 0 };
+    const activeFiles = fileCols.has("source_status")
+      ? await env.DB.prepare(`SELECT COUNT(*) AS count FROM files WHERE source_status = 'active'`).first()
+      : { count: 0 };
+    let out = "[debug_export_ingest]\n";
+    if (await tableExists(env, "export_ingest_runs")) {
+      const run = await env.DB.prepare(`
+        SELECT *
+        FROM export_ingest_runs
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `).first();
+      if (run) {
+        out += `path: ${run.source_path || ""}\n`;
+        out += `original_room: ${run.original_room || ""}\n`;
+        out += `scanned: ${run.scanned_messages || 0}\n`;
+        out += `messages imported/skipped/failed: ${run.imported_messages || 0}/${run.skipped_messages || 0}/${run.failed_messages || 0}\n`;
+        out += `files imported/skipped/failed: ${run.imported_files || 0}/${run.skipped_files || 0}/${run.failed_files || 0}\n`;
+        out += `run active messages/files: ${run.active_messages || 0}/${run.active_files || 0}\n`;
+        out += `created_at: ${run.created_at || ""}\n`;
+      } else {
+        out += "last run: 없음\n";
+      }
+    } else {
+      out += "export_ingest_runs 테이블 없음\n";
+    }
+    out += `current active messages/files: ${activeMessages?.count || 0}/${activeFiles?.count || 0}`;
+    await sendMessage(env, chatId, out.slice(0, 3500));
+  } catch (e) {
+    await sendMessage(env, chatId, `debug_export_ingest 실패: ${String(e?.message || e).slice(0, 500)}`);
   }
 }
 

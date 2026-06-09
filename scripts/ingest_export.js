@@ -1,151 +1,183 @@
 #!/usr/bin/env node
 "use strict";
 
-/**
- * scripts/ingest_export.js
- *
- * 여러 Telegram Export 폴더를 KOH_AI_bot D1 DB에 일괄 적재.
- *
- * 사용법:
- *   node scripts/ingest_export.js "C:\...\telegram_exports\202605_202606"
- *   node scripts/ingest_export.js "C:\...\telegram_exports\202605_202606" --dry-run
- *   node scripts/ingest_export.js "C:\...\telegram_exports\202605_202606" --db 6r-ai-db
- */
-
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const { spawnSync } = require("child_process");
 
-// ── CLI 파싱 ──────────────────────────────────────────────────────────────────
+const DEFAULT_DB = "6r-ai-db";
 
 function parseArgs(argv) {
   const args = { positional: [] };
   for (let i = 2; i < argv.length; i++) {
-    const part = argv[i];
-    if (part.startsWith("--")) {
-      const key = part.slice(2);
-      const next = argv[i + 1];
-      if (!next || next.startsWith("--")) args[key] = true;
-      else { args[key] = next; i++; }
-    } else {
-      args.positional.push(part);
+    const item = argv[i];
+    if (!item.startsWith("--")) {
+      args.positional.push(item);
+      continue;
     }
+    const key = item.slice(2);
+    const next = argv[i + 1];
+    if (!next || next.startsWith("--")) args[key] = true;
+    else args[key] = next, i++;
   }
   return args;
 }
 
-// ── wrangler 설정 읽기 ────────────────────────────────────────────────────────
-
 function readWranglerDbName() {
   const file = path.join(process.cwd(), "wrangler.toml");
-  if (!fs.existsSync(file)) return "6r-ai-db";
+  if (!fs.existsSync(file)) return DEFAULT_DB;
   const text = fs.readFileSync(file, "utf8");
-  const m = text.match(/database_name\s*=\s*"([^"]+)"/);
-  return m ? m[1] : "6r-ai-db";
+  return text.match(/database_name\s*=\s*"([^"]+)"/)?.[1] || DEFAULT_DB;
 }
 
-// ── wrangler 실행 ─────────────────────────────────────────────────────────────
-
-function winCmdExists(cmd) {
+function commandExists(command) {
   if (process.platform !== "win32") return true;
-  const r = spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/c", "where", cmd], {
-    stdio: ["ignore", "pipe", "pipe"], encoding: "utf8",
+  const result = spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/c", "where", command], {
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf8",
   });
-  return r.status === 0;
+  return result.status === 0;
 }
 
 function runWrangler(dbName, args) {
-  const localWrangler = path.join(
-    process.cwd(), "node_modules", ".bin",
-    process.platform === "win32" ? "wrangler.cmd" : "wrangler"
-  );
+  const localWrangler = path.join(process.cwd(), "node_modules", ".bin", process.platform === "win32" ? "wrangler.cmd" : "wrangler");
   const localWranglerJs = path.join(process.cwd(), "node_modules", "wrangler", "bin", "wrangler.js");
   const cmd = process.env.ComSpec || "cmd.exe";
-
   const candidates = process.platform === "win32"
     ? [
-        ...(winCmdExists("npx.cmd") ? [{ command: cmd, prefix: ["/d", "/c", "npx.cmd", "wrangler"], shell: false }] : []),
         ...(fs.existsSync(localWranglerJs) ? [{ command: process.execPath, prefix: [localWranglerJs], shell: false }] : []),
-        { command: localWrangler, prefix: [], shell: true },
-        ...(winCmdExists("wrangler.cmd") ? [{ command: cmd, prefix: ["/d", "/c", "wrangler.cmd"], shell: false }] : []),
+        ...(commandExists("npx.cmd") ? [{ command: cmd, prefix: ["/d", "/c", "npx.cmd", "wrangler"], shell: false }] : []),
+        ...(fs.existsSync(localWrangler) ? [{ command: localWrangler, prefix: [], shell: true }] : []),
+        ...(commandExists("wrangler.cmd") ? [{ command: cmd, prefix: ["/d", "/c", "wrangler.cmd"], shell: false }] : []),
       ]
     : [
         { command: "npx", prefix: ["wrangler"], shell: false },
-        { command: localWrangler, prefix: [], shell: false },
+        ...(fs.existsSync(localWrangler) ? [{ command: localWrangler, prefix: [], shell: false }] : []),
         { command: "wrangler", prefix: [], shell: false },
       ];
 
   const capture = args.includes("--json");
   const errors = [];
-  for (const c of candidates) {
-    const fullArgs = [...c.prefix, "d1", "execute", dbName, "--remote", ...args];
-    const r = spawnSync(c.command, fullArgs, {
+  for (const candidate of candidates) {
+    const fullArgs = [...candidate.prefix, "d1", "execute", dbName, "--remote", ...args];
+    const result = spawnSync(candidate.command, fullArgs, {
       stdio: capture ? ["ignore", "pipe", "pipe"] : "inherit",
       encoding: "utf8",
-      shell: c.shell,
+      shell: candidate.shell,
     });
-    if (r.error) {
-      errors.push(`${c.command}: ${r.error.message}`);
-      continue;
-    }
-    if (r.status === 0) return r.stdout || "";
-    errors.push(`${c.command} exit ${r.status}: ${(r.stderr || r.stdout || "").slice(0, 300)}`);
+    if (!result.error && result.status === 0) return result.stdout || "";
+    errors.push([
+      "wrangler execution failed",
+      `command: ${candidate.command}`,
+      `args: ${fullArgs.join(" ")}`,
+      result.error?.message || result.stderr || result.stdout || `exit ${result.status}`,
+      "fix: run npm.cmd install, then check npx.cmd wrangler --version",
+    ].join("\n"));
   }
-  throw new Error(["wrangler 실행 실패", ...errors].join("\n"));
+  throw new Error(errors.join("\n---\n"));
 }
 
-function parseWranglerResults(out) {
+function parseRows(output) {
   try {
-    const parsed = JSON.parse(out);
+    const parsed = JSON.parse(output);
     return parsed?.[0]?.results || parsed?.results || [];
-  } catch { return []; }
+  } catch {
+    return [];
+  }
 }
 
 function columnsFor(dbName, table) {
+  const out = runWrangler(dbName, ["--command", `PRAGMA table_info(${table});`, "--json"]);
+  return new Set(parseRows(out).map((row) => row.name));
+}
+
+function sql(value) {
+  if (value === null || value === undefined || value === "") return "NULL";
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function execSqlFile(dbName, statements) {
+  const body = statements.filter(Boolean).join("\n");
+  if (!body.trim()) return;
+  const file = path.join(os.tmpdir(), `koh_ingest_${Date.now()}_${Math.random().toString(16).slice(2)}.sql`);
+  fs.writeFileSync(file, body, "utf8");
   try {
-    const out = runWrangler(dbName, ["--command", `PRAGMA table_info(${table});`, "--json"]);
-    const rows = parseWranglerResults(out);
-    return new Set(rows.map(r => r.name));
-  } catch { return new Set(); }
+    runWrangler(dbName, ["--file", file]);
+  } finally {
+    try { fs.unlinkSync(file); } catch { /* ignore */ }
+  }
 }
 
-// ── SQL 헬퍼 ──────────────────────────────────────────────────────────────────
-
-function sql(v) {
-  if (v === null || v === undefined || v === "") return "NULL";
-  return `'${String(v).replace(/'/g, "''")}'`;
+function ensureColumns(dbName, table, definitions, existingColumns, dryRun) {
+  const statements = [];
+  for (const [name, ddl] of Object.entries(definitions)) {
+    if (!existingColumns.has(name)) statements.push(`ALTER TABLE ${table} ADD COLUMN ${name} ${ddl};`);
+  }
+  if (dryRun || !statements.length) {
+    if (dryRun && statements.length) statements.forEach((s) => console.log(`[DRY-RUN] ${s}`));
+    return;
+  }
+  for (const statement of statements) {
+    try {
+      runWrangler(dbName, ["--command", statement]);
+      console.log(`[SCHEMA] ${statement}`);
+    } catch (error) {
+      if (!String(error?.message || error).includes("duplicate column")) throw error;
+    }
+  }
 }
 
-function insertWhereNotExists(table, cols, values, whereClause) {
-  const colStr = cols.join(", ");
-  const valStr = values.map(sql).join(", ");
-  return `INSERT INTO ${table} (${colStr}) SELECT ${valStr} WHERE NOT EXISTS (SELECT 1 FROM ${table} WHERE ${whereClause});`;
-}
+function ensureExportSchema(dbName, dryRun) {
+  const messageCols = columnsFor(dbName, "messages");
+  const fileCols = columnsFor(dbName, "files");
 
-function upsertMsg(table, cols, values, whereClause) {
-  // INSERT if not exists, then UPDATE source_status/updated_at if row exists
-  const insert = insertWhereNotExists(table, cols, values, whereClause);
-  const updateCols = ["source_status", "original_room"].filter(c => cols.includes(c));
-  if (!updateCols.length) return insert;
-  const setStr = updateCols.map(c => {
-    const idx = cols.indexOf(c);
-    return `${c} = ${sql(values[idx])}`;
-  }).join(", ");
-  const update = `UPDATE ${table} SET ${setStr} WHERE ${whereClause} AND COALESCE(source_status, 'legacy') != 'active';`;
-  return `${insert}\n${update}`;
-}
+  ensureColumns(dbName, "messages", {
+    source_type: "TEXT DEFAULT ''",
+    source_status: "TEXT DEFAULT 'legacy'",
+    original_room: "TEXT DEFAULT ''",
+    export_message_id: "TEXT DEFAULT ''",
+    from_name: "TEXT DEFAULT ''",
+    from_id: "TEXT DEFAULT ''",
+    reply_to_message_id: "TEXT DEFAULT ''",
+    source_path: "TEXT DEFAULT ''",
+    media_group_key: "TEXT DEFAULT ''",
+  }, messageCols, dryRun);
 
-// ── 텍스트 정규화 ─────────────────────────────────────────────────────────────
+  ensureColumns(dbName, "files", {
+    source_type: "TEXT DEFAULT ''",
+    source_status: "TEXT DEFAULT 'legacy'",
+    original_room: "TEXT DEFAULT ''",
+    export_message_id: "TEXT DEFAULT ''",
+    from_name: "TEXT DEFAULT ''",
+    from_id: "TEXT DEFAULT ''",
+    source_path: "TEXT DEFAULT ''",
+    media_group_key: "TEXT DEFAULT ''",
+  }, fileCols, dryRun);
+
+  if (!dryRun) {
+    runWrangler(dbName, ["--command", `CREATE TABLE IF NOT EXISTS export_ingest_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_path TEXT,
+      original_room TEXT,
+      scanned_messages INTEGER DEFAULT 0,
+      imported_messages INTEGER DEFAULT 0,
+      skipped_messages INTEGER DEFAULT 0,
+      failed_messages INTEGER DEFAULT 0,
+      imported_files INTEGER DEFAULT 0,
+      skipped_files INTEGER DEFAULT 0,
+      failed_files INTEGER DEFAULT 0,
+      active_messages INTEGER DEFAULT 0,
+      active_files INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );`]);
+  }
+}
 
 function normalizeText(value) {
   if (Array.isArray(value)) {
-    return value.map(item => {
-      if (typeof item === "string") return item;
-      if (item && typeof item.text === "string") return item.text;
-      return "";
-    }).join("");
+    return value.map((item) => typeof item === "string" ? item : (item?.text || "")).join("");
   }
   return typeof value === "string" ? value : "";
 }
@@ -154,379 +186,303 @@ function hashText(value) {
   return crypto.createHash("sha1").update(String(value || "")).digest("hex").slice(0, 16);
 }
 
-// ── 사용자 파싱 ───────────────────────────────────────────────────────────────
-
-function userFromMessage(msg) {
-  const id = msg.from_id || msg.actor_id || "";
-  const name = msg.from || msg.actor || "";
+function userFromMessage(message) {
+  const id = message.from_id || message.actor_id || "";
+  const name = message.from || message.actor || "";
   if (!id && !name) return null;
-  const norm = String(name || "").toLowerCase().replace(/\s+/g, "_").replace(/[^\w가-힣]/g, "");
+  const fallback = String(name || "").toLowerCase().replace(/\s+/g, "_").replace(/[^\w가-힣]/g, "");
   return {
-    id: String(id || `export:${norm || hashText(name)}`),
+    id: String(id || `export:${fallback || hashText(name)}`),
     name: String(name || id),
   };
 }
 
-// ── 파일 파싱 ─────────────────────────────────────────────────────────────────
-
-function fileFromMessage(msg, exportDir) {
-  const filePath = msg.file || msg.photo || msg.media || "";
+function fileFromMessage(message, exportDir) {
+  const filePath = message.file || message.photo || message.media || "";
   if (!filePath) return null;
   const fileName = path.basename(filePath);
   const absPath = path.resolve(exportDir, filePath);
-  let size = Number(msg.file_size || 0) || 0;
-  if (!size && fs.existsSync(absPath)) {
-    try { size = fs.statSync(absPath).size; } catch { /* ignore */ }
+  let fileSize = Number(message.file_size || 0) || 0;
+  if (!fileSize && fs.existsSync(absPath)) {
+    try { fileSize = fs.statSync(absPath).size; } catch { /* ignore */ }
   }
-  const isPhoto = msg.photo || /\.(jpg|jpeg|png|webp|gif)$/i.test(fileName);
-  const ext = path.extname(fileName).replace(".", "").toLowerCase();
+  const isPhoto = !!message.photo || /\.(jpg|jpeg|png|webp|gif)$/i.test(fileName);
   return {
     fileName,
-    fileType: isPhoto ? "photo" : (ext || String(msg.media_type || "file")),
-    mimeType: msg.mime_type || (isPhoto ? "image/jpeg" : ""),
-    fileSize: size,
-    localPath: filePath,    // relative (as in result.json)
-    absPath,                // absolute (for local access)
+    fileType: isPhoto ? "photo" : (path.extname(fileName).replace(".", "").toLowerCase() || String(message.media_type || "file")),
+    mimeType: message.mime_type || (isPhoto ? "image/jpeg" : ""),
+    fileSize,
+    localPath: filePath,
+    absPath,
   };
 }
 
-// ── 주변 메시지 컨텍스트 ──────────────────────────────────────────────────────
-
 function contextMessages(messages, index, radius = 3) {
-  const start = Math.max(0, index - radius);
-  const end = Math.min(messages.length, index + radius + 1);
   const out = [];
-  for (let i = start; i < end; i++) {
-    const m = messages[i];
-    const text = normalizeText(m?.text || m?.caption).replace(/\s+/g, " ").trim();
-    if (!text) continue;
-    out.push({ id: m.id || "", date: m.date || "", from: m.from || m.actor || "", text: text.slice(0, 300) });
+  for (let i = Math.max(0, index - radius); i < Math.min(messages.length, index + radius + 1); i++) {
+    const message = messages[i];
+    const text = normalizeText(message?.text || message?.caption).replace(/\s+/g, " ").trim();
+    if (text) out.push({ id: message.id || "", date: message.date || "", from: message.from || message.actor || "", text: text.slice(0, 300) });
   }
   return out.slice(0, 7);
 }
 
-// ── media_group_key 생성 ──────────────────────────────────────────────────────
-// 같은 방+발신자의 3분 단위 시간 버킷으로 이미지를 묶음
-
-function mediaGroupKey(roomId, userId, dateStr) {
-  const ms = dateStr ? Date.parse(dateStr) : Date.now();
-  const bucket = Math.floor((isNaN(ms) ? Date.now() : ms) / (3 * 60 * 1000));
-  return `${roomId}:${userId}:${bucket}`;
+function mediaGroupKey(roomId, userId, dateString) {
+  const time = Date.parse(dateString || "") || Date.now();
+  return `${roomId}:${userId || ""}:${Math.floor(time / (3 * 60 * 1000))}`;
 }
 
-// ── 스키마 마이그레이션 ───────────────────────────────────────────────────────
-
-function ensureColumns(dbName, table, colDefs, existingCols, dryRun = false) {
-  const stmts = [];
-  for (const [col, def] of Object.entries(colDefs)) {
-    if (!existingCols.has(col)) {
-      stmts.push(`ALTER TABLE ${table} ADD COLUMN ${col} ${def};`);
-    }
-  }
-  if (!stmts.length) return;
-  if (dryRun) {
-    console.log(`[DRY-RUN] Schema migrations for ${table}:`);
-    stmts.forEach(s => console.log(`  ${s}`));
-    return;
-  }
-  for (const stmt of stmts) {
-    try {
-      runWrangler(dbName, ["--command", stmt]);
-      console.log(`  [SCHEMA] ${stmt}`);
-    } catch (e) {
-      // Column may already exist (race); ignore
-      if (!String(e.message).includes("duplicate column")) throw e;
-    }
-  }
+function insertSelect(table, values, existingColumns, whereNotExists = "") {
+  const entries = Object.entries(values).filter(([key]) => existingColumns.has(key));
+  if (!entries.length) return "";
+  const columns = entries.map(([key]) => key).join(", ");
+  const valuesSql = entries.map(([, value]) => sql(value)).join(", ");
+  if (whereNotExists) return `INSERT INTO ${table} (${columns}) SELECT ${valuesSql} WHERE NOT EXISTS (${whereNotExists});`;
+  return `INSERT INTO ${table} (${columns}) VALUES (${valuesSql});`;
 }
 
-// ── 단일 방(result.json) 처리 ──────────────────────────────────────────────────
+function updateWhere(table, values, existingColumns, whereClause) {
+  const entries = Object.entries(values).filter(([key]) => existingColumns.has(key));
+  if (!entries.length || !whereClause) return "";
+  const setSql = entries.map(([key, value]) => `${key} = ${sql(value)}`).join(", ");
+  return `UPDATE ${table} SET ${setSql} WHERE ${whereClause};`;
+}
 
-function processRoom(dbName, exportDir, originalRoom, messageCols, fileCols, dryRun) {
-  const resultPath = path.join(exportDir, "result.json");
-  if (!fs.existsSync(resultPath)) return { messages: 0, files: 0, skipped: 0 };
+function discoverExports(inputPath) {
+  const fullPath = path.resolve(inputPath);
+  if (!fs.existsSync(fullPath)) throw new Error(`path not found: ${fullPath}`);
+  const stat = fs.statSync(fullPath);
+  if (stat.isFile()) {
+    if (path.basename(fullPath).toLowerCase() !== "result.json") throw new Error(`not a result.json file: ${fullPath}`);
+    return [{ name: path.basename(path.dirname(fullPath)), dir: path.dirname(fullPath), resultPath: fullPath }];
+  }
+  if (fs.existsSync(path.join(fullPath, "result.json"))) {
+    return [{ name: path.basename(fullPath), dir: fullPath, resultPath: path.join(fullPath, "result.json") }];
+  }
+  return fs.readdirSync(fullPath, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => ({ name: entry.name, dir: path.join(fullPath, entry.name), resultPath: path.join(fullPath, entry.name, "result.json") }))
+    .filter((entry) => fs.existsSync(entry.resultPath));
+}
 
-  let data;
-  try { data = JSON.parse(fs.readFileSync(resultPath, "utf8")); }
-  catch (e) { console.warn(`  [WARN] result.json 파싱 오류: ${e.message}`); return { messages: 0, files: 0, skipped: 0 }; }
-
+function processRoom(dbName, room, messageCols, fileCols, dryRun) {
+  const data = JSON.parse(fs.readFileSync(room.resultPath, "utf8"));
   const messages = Array.isArray(data.messages) ? data.messages : [];
-  // room_id: group id (< 0) 또는 export-based ID
+  const originalRoom = room.name;
   const roomId = data.id ? String(data.id) : `export:${hashText(originalRoom)}`;
   const roomTitle = data.name || originalRoom;
   const statements = [];
-  let importedMessages = 0, importedFiles = 0, importedPhotos = 0, skipped = 0;
-  const seenMessages = new Set(), seenFiles = new Set();
+  const seenMessages = new Set();
+  const seenFiles = new Set();
+  let importedMessages = 0;
+  let importedFiles = 0;
+  let importedPhotos = 0;
+  let skippedMessages = 0;
+  let skippedFiles = 0;
 
-  for (let idx = 0; idx < messages.length; idx++) {
-    const msg = messages[idx];
-    if (msg.type && msg.type !== "message" && msg.type !== "service") continue;
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    if (message.type && message.type !== "message" && message.type !== "service") continue;
 
-    const text = normalizeText(msg.text || msg.caption);
-    const file = fileFromMessage(msg, exportDir);
-    const nearby = file ? contextMessages(messages, idx, 3) : [];
-    const nearbyText = nearby.map(m => m.text).join(" / ");
+    const text = normalizeText(message.text || message.caption);
+    const file = fileFromMessage(message, room.dir);
+    const nearby = file ? contextMessages(messages, index, 3) : [];
+    const nearbyText = nearby.map((item) => item.text).join(" / ");
     const fileContext = text || nearbyText;
     const fileSummary = fileContext ? fileContext.slice(0, 1000) : (file ? `Telegram export file: ${file.fileName}` : "");
-    const contentForMsg = text || (file ? `[file] ${file.fileName}${fileSummary ? "\n" + fileSummary : ""}`.trim() : "");
-    const user = userFromMessage(msg);
-    const msgId = msg.id ? String(msg.id) : hashText(`${msg.date}|${user?.id || ""}|${contentForMsg}`);
+    const content = text || (file ? `[file] ${file.fileName}${fileSummary ? "\n" + fileSummary : ""}`.trim() : "");
+    const user = userFromMessage(message);
+    const exportMessageId = message.id ? String(message.id) : hashText(`${message.date}|${user?.id || ""}|${content}`);
+    const replyId = message.reply_to_message_id || message.reply_to_message?.id || "";
+    const groupKey = file ? mediaGroupKey(roomId, user?.id || "", message.date || "") : "";
 
-    // messages
-    const dedupeKeyMsg = `${roomId}|${originalRoom}|${msgId}`;
-    if (seenMessages.has(dedupeKeyMsg)) { skipped++; }
-    else {
-      seenMessages.add(dedupeKeyMsg);
-      if (contentForMsg) {
-        const whereMsg = `source_type = 'telegram_export' AND original_room = ${sql(originalRoom)} AND telegram_message_id = ${sql(msgId)}`;
-        const msgCols = ["telegram_message_id", "room_id", "room_title", "sender_id", "sender_name",
-          "from_id", "from_name",
-          "content", "saved_by", "source_type", "source_status", "original_room",
-          "reply_to_message_id", "created_at", "raw_json"]
-          .filter(c => messageCols.has(c));
-        const msgVals = msgCols.map(c => ({
-          telegram_message_id: msgId,
+    if (content) {
+      const messageKey = `${roomId}|${originalRoom}|${exportMessageId}`;
+      if (seenMessages.has(messageKey)) {
+        skippedMessages++;
+      } else {
+        seenMessages.add(messageKey);
+        const where = `SELECT 1 FROM messages WHERE source_type = 'telegram_export' AND original_room = ${sql(originalRoom)} AND export_message_id = ${sql(exportMessageId)}`;
+        const values = {
           room_id: roomId,
           room_title: roomTitle,
           sender_id: user?.id || "",
           sender_name: user?.name || "",
-          from_id: String(msg.from_id || msg.actor_id || user?.id || ""),
-          from_name: String(msg.from || msg.actor || user?.name || ""),
-          content: contentForMsg.slice(0, 4000),
+          from_id: String(message.from_id || message.actor_id || user?.id || ""),
+          from_name: String(message.from || message.actor || user?.name || ""),
+          content: content.slice(0, 4000),
           saved_by: "telegram_export_importer",
           source_type: "telegram_export",
           source_status: "active",
           original_room: originalRoom,
-          reply_to_message_id: msg.reply_to_message_id ? String(msg.reply_to_message_id) : null,
-          created_at: msg.date || new Date().toISOString(),
-          raw_json: JSON.stringify({ id: msg.id, date: msg.date, from: msg.from, from_id: msg.from_id }),
-        }[c]));
-        statements.push(upsertMsg("messages", msgCols, msgVals, whereMsg));
+          export_message_id: exportMessageId,
+          telegram_message_id: exportMessageId,
+          reply_to_message_id: replyId,
+          source_path: room.resultPath,
+          media_group_key: groupKey,
+          created_at: message.date || new Date().toISOString(),
+        };
+        const updateKey = `id = (
+          SELECT MAX(id) FROM messages
+          WHERE source_type = 'telegram_export'
+            AND original_room = ${sql(originalRoom)}
+            AND export_message_id = ${sql(exportMessageId)}
+        )`;
+        statements.push(insertSelect("messages", values, messageCols, where));
+        statements.push(updateWhere("messages", values, messageCols, updateKey));
         importedMessages++;
-      } else { skipped++; }
-    }
-
-    // files
-    if (file) {
-      const dedupeKeyFile = `${roomId}|${originalRoom}|${msgId}|${file.fileName}`;
-      if (seenFiles.has(dedupeKeyFile)) { skipped++; }
-      else {
-        seenFiles.add(dedupeKeyFile);
-        const mgKey = mediaGroupKey(roomId, user?.id || "", msg.date || "");
-        const whereFile = `source_type = 'telegram_export' AND original_room = ${sql(originalRoom)} AND telegram_message_id = ${sql(msgId)} AND file_name = ${sql(file.fileName)}`;
-        const fCols = ["uploader_id", "uploader_name", "sender_id", "sender_name",
-          "from_id", "from_name",
-          "file_name", "file_type", "mime_type", "file_size",
-          "content", "summary", "extracted_text",
-          "room_id", "room_title",
-          "telegram_file_id", "telegram_file_unique_id",
-          "source_path", "r2_key",
-          "tags_json", "saved_by", "source_type", "source_status",
-          "original_room", "telegram_message_id", "media_group_key",
-          "created_at"]
-          .filter(c => fileCols.has(c));
-        if (file.fileType === "photo" || /^image\//i.test(file.mimeType)) importedPhotos++;
-        const fVals = fCols.map(c => ({
-          uploader_id: user?.id || "",
-          uploader_name: user?.name || "",
-          sender_id: user?.id || "",
-          sender_name: user?.name || "",
-          from_id: String(msg.from_id || msg.actor_id || user?.id || ""),
-          from_name: String(msg.from || msg.actor || user?.name || ""),
-          file_name: file.fileName,
-          file_type: file.fileType,
-          mime_type: file.mimeType,
-          file_size: file.fileSize || 0,
-          content: fileContext.slice(0, 4000),
-          summary: fileSummary.slice(0, 1000),
-          extracted_text: fileContext.slice(0, 4000),
-          room_id: roomId,
-          room_title: roomTitle,
-          telegram_file_id: null,
-          telegram_file_unique_id: null,
-          source_path: file.absPath,
-          r2_key: null,
-          tags_json: JSON.stringify({
-            source_type: "telegram_export",
-            local_path: file.localPath,
-            abs_path: file.absPath,
-            source_room: originalRoom,
-            context_messages: nearby,
-          }),
-          saved_by: "telegram_export_importer",
-          source_type: "telegram_export",
-          source_status: "active",
-          original_room: originalRoom,
-          telegram_message_id: msgId,
-          media_group_key: mgKey,
-          created_at: msg.date || new Date().toISOString(),
-        }[c]));
-        statements.push(upsertMsg("files", fCols, fVals, whereFile));
-        importedFiles++;
       }
+    } else {
+      skippedMessages++;
+    }
+
+    if (file) {
+      const fileKey = `${roomId}|${originalRoom}|${exportMessageId}|${file.fileName}`;
+      if (seenFiles.has(fileKey)) {
+        skippedFiles++;
+        continue;
+      }
+      seenFiles.add(fileKey);
+      if (file.fileType === "photo" || /^image\//i.test(file.mimeType)) importedPhotos++;
+      const where = `SELECT 1 FROM files WHERE source_type = 'telegram_export' AND original_room = ${sql(originalRoom)} AND export_message_id = ${sql(exportMessageId)} AND file_name = ${sql(file.fileName)}`;
+      const tags = JSON.stringify({
+        source_type: "telegram_export",
+        local_path: file.localPath,
+        abs_path: file.absPath,
+        source_room: originalRoom,
+        context_messages: nearby,
+      });
+      const values = {
+        uploader_id: user?.id || "",
+        uploader_name: user?.name || "",
+        sender_id: user?.id || "",
+        sender_name: user?.name || "",
+        from_id: String(message.from_id || message.actor_id || user?.id || ""),
+        from_name: String(message.from || message.actor || user?.name || ""),
+        file_name: file.fileName,
+        file_type: file.fileType,
+        mime_type: file.mimeType,
+        file_size: file.fileSize || 0,
+        content: fileContext.slice(0, 4000),
+        summary: fileSummary.slice(0, 1000),
+        extracted_text: fileContext.slice(0, 4000),
+        room_id: roomId,
+        room_title: roomTitle,
+        telegram_file_id: null,
+        telegram_file_unique_id: null,
+        source_path: file.absPath,
+        r2_key: null,
+        tags_json: tags,
+        saved_by: "telegram_export_importer",
+        source_type: "telegram_export",
+        source_status: "active",
+        original_room: originalRoom,
+        export_message_id: exportMessageId,
+        telegram_message_id: exportMessageId,
+        media_group_key: groupKey,
+        created_at: message.date || new Date().toISOString(),
+      };
+      const updateKey = `id = (
+        SELECT MAX(id) FROM files
+        WHERE source_type = 'telegram_export'
+          AND original_room = ${sql(originalRoom)}
+          AND export_message_id = ${sql(exportMessageId)}
+          AND file_name = ${sql(file.fileName)}
+      )`;
+      statements.push(insertSelect("files", values, fileCols, where));
+      statements.push(updateWhere("files", values, fileCols, updateKey));
+      importedFiles++;
     }
   }
 
-  const filtered = statements.filter(Boolean);
-  if (!filtered.length) return { messages: importedMessages, files: importedFiles, photos: importedPhotos, skipped };
-
-  if (dryRun) {
-    console.log(`  [DRY-RUN] Would execute ${filtered.length} SQL statements`);
-    console.log(`  [DRY-RUN] Sample:\n${filtered.slice(0, 2).join("\n").slice(0, 500)}`);
-    return { messages: importedMessages, files: importedFiles, photos: importedPhotos, skipped };
-  }
-
-  const tmpFile = path.join(os.tmpdir(), `koh_ingest_${Date.now()}_${hashText(originalRoom)}.sql`);
-  fs.writeFileSync(tmpFile, filtered.join("\n"), "utf8");
-  try {
-    runWrangler(dbName, ["--file", tmpFile]);
-  } finally {
-    try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
-  }
-
-  return { messages: importedMessages, files: importedFiles, photos: importedPhotos, skipped };
+  if (!dryRun) execSqlFile(dbName, statements);
+  else console.log(`[DRY-RUN] ${originalRoom}: ${statements.length} SQL statements`);
+  return { scanned: messages.length, messages: importedMessages, files: importedFiles, photos: importedPhotos, skippedMessages, skippedFiles, failedMessages: 0, failedFiles: 0 };
 }
-
-// ── 메인 ─────────────────────────────────────────────────────────────────────
 
 function main() {
   const args = parseArgs(process.argv);
-  const exportRoot = args.positional[0] || args.path;
-  if (!exportRoot) {
-    console.error([
-      "사용법:",
-      `  node scripts/ingest_export.js <export-root-path>`,
-      `  node scripts/ingest_export.js "C:\\Users\\pc\\Documents\\...\\202605_202606"`,
-      "",
-      "옵션:",
-      "  --dry-run    실제 저장 없이 처리 결과만 출력",
-      "  --db <name>  D1 database 이름 (기본값: wrangler.toml에서 읽음)",
-    ].join("\n"));
+  const inputPath = args.path || args.positional[0];
+  if (!inputPath) {
+    console.error("usage: node scripts/ingest_export.js --path <result.json-or-export-root> [--remote] [--dry-run] [--db 6r-ai-db]");
     process.exit(1);
   }
 
   const dryRun = !!args["dry-run"];
   const dbName = args.db || readWranglerDbName();
-  const rootPath = path.resolve(exportRoot);
+  const sourcePath = path.resolve(inputPath);
+  const rooms = discoverExports(sourcePath);
+  if (!rooms.length) throw new Error(`no result.json found: ${sourcePath}`);
 
-  if (!fs.existsSync(rootPath)) {
-    console.error(`경로가 존재하지 않습니다: ${rootPath}`);
-    process.exit(1);
-  }
+  console.log("=== KOH_AI_bot Export Ingest ===");
+  console.log(`Source: ${sourcePath}`);
+  console.log(`D1 database: ${dbName}`);
+  console.log(`Found export rooms: ${rooms.length}`);
 
-  console.log(`\n=== KOH_AI_bot Export Ingest ===`);
-  console.log(`Root: ${rootPath}`);
-  console.log(`DB:   ${dbName}`);
-  if (dryRun) console.log(`MODE: DRY-RUN (저장 안 함)`);
-  console.log("");
+  ensureExportSchema(dbName, dryRun);
+  const messageCols = dryRun ? new Set([...columnsFor(dbName, "messages"), "source_status", "export_message_id", "source_path", "media_group_key"]) : columnsFor(dbName, "messages");
+  const fileCols = dryRun ? new Set([...columnsFor(dbName, "files"), "source_status", "export_message_id"]) : columnsFor(dbName, "files");
 
-  // 스키마 조회
-  console.log("스키마 확인 중...");
-  const messageCols = columnsFor(dbName, "messages");
-  const fileCols = columnsFor(dbName, "files");
+  let scanned = 0;
+  let importedMessages = 0;
+  let skippedMessages = 0;
+  let failedMessages = 0;
+  let importedFiles = 0;
+  let skippedFiles = 0;
+  let failedFiles = 0;
+  let photos = 0;
 
-  if (!messageCols.size) {
-    console.error("messages 테이블이 없거나 D1 접근 실패. wrangler 설정을 확인하세요.");
-    process.exit(1);
-  }
-
-  // 필요한 컬럼 추가 (없으면 ALTER TABLE)
-  console.log("신규 컬럼 추가 (이미 있으면 skip)...");
-  ensureColumns(dbName, "messages", {
-    source_type:          "TEXT DEFAULT ''",
-    source_status:        "TEXT DEFAULT 'legacy'",
-    original_room:        "TEXT DEFAULT ''",
-    from_name:            "TEXT DEFAULT ''",
-    from_id:              "TEXT DEFAULT ''",
-    reply_to_message_id:  "TEXT DEFAULT ''",
-    telegram_message_id:  "TEXT DEFAULT ''",
-  }, messageCols, dryRun);
-
-  ensureColumns(dbName, "files", {
-    source_type:          "TEXT DEFAULT ''",
-    source_status:        "TEXT DEFAULT 'legacy'",
-    original_room:        "TEXT DEFAULT ''",
-    source_path:          "TEXT DEFAULT ''",
-    media_group_key:      "TEXT DEFAULT ''",
-    from_name:            "TEXT DEFAULT ''",
-    from_id:              "TEXT DEFAULT ''",
-    telegram_message_id:  "TEXT DEFAULT ''",
-  }, fileCols, dryRun);
-
-  // 컬럼 목록 다시 조회 (ALTER 이후)
-  const msgColsFinal = dryRun ? new Set([...messageCols,
-    "source_type", "source_status", "original_room",
-    "from_name", "from_id", "reply_to_message_id", "telegram_message_id",
-  ]) : columnsFor(dbName, "messages");
-  const fileColsFinal = dryRun ? new Set([...fileCols,
-    "source_type", "source_status", "original_room",
-    "source_path", "media_group_key", "from_name", "from_id", "telegram_message_id",
-  ]) : columnsFor(dbName, "files");
-
-  // export 하위 폴더 탐색
-  const entries = fs.readdirSync(rootPath, { withFileTypes: true });
-  const roomDirs = entries
-    .filter(e => e.isDirectory())
-    .map(e => ({ name: e.name, dir: path.join(rootPath, e.name) }))
-    .filter(({ dir }) => fs.existsSync(path.join(dir, "result.json")));
-
-  if (!roomDirs.length) {
-    // 루트 자체에 result.json이 있을 수도 있음
-    if (fs.existsSync(path.join(rootPath, "result.json"))) {
-      roomDirs.push({ name: path.basename(rootPath), dir: rootPath });
-    } else {
-      console.error(`result.json을 포함한 하위 폴더가 없습니다: ${rootPath}`);
-      process.exit(1);
-    }
-  }
-
-  console.log(`발견된 export 방: ${roomDirs.length}개\n`);
-
-  let totalMessages = 0, totalFiles = 0, totalPhotos = 0, totalSkipped = 0;
-  const results = [];
-
-  for (const { name, dir } of roomDirs) {
-    process.stdout.write(`[${name}] 처리 중... `);
+  for (const room of rooms) {
+    process.stdout.write(`[${room.name}] importing... `);
     try {
-      const { messages, files, photos, skipped } = processRoom(
-        dbName, dir, name, msgColsFinal, fileColsFinal, dryRun
-      );
-      totalMessages += messages;
-      totalFiles += files;
-      totalPhotos += (photos || 0);
-      totalSkipped += skipped;
-      results.push({ room: name, messages, files, photos: photos || 0, skipped, ok: true });
-      console.log(`메시지 ${messages}건, 파일 ${files}건 (사진 ${photos || 0}건), 중복skip ${skipped}건`);
-    } catch (e) {
-      results.push({ room: name, ok: false, error: e.message });
-      console.log(`실패: ${e.message.slice(0, 120)}`);
+      const result = processRoom(dbName, room, messageCols, fileCols, dryRun);
+      scanned += result.scanned;
+      importedMessages += result.messages;
+      skippedMessages += result.skippedMessages;
+      failedMessages += result.failedMessages;
+      importedFiles += result.files;
+      skippedFiles += result.skippedFiles;
+      failedFiles += result.failedFiles;
+      photos += result.photos || 0;
+      console.log(`messages ${result.messages}, files ${result.files}, photos ${result.photos || 0}, skipped ${result.skippedMessages + result.skippedFiles}`);
+    } catch (error) {
+      failedMessages++;
+      failedFiles++;
+      console.log(`failed: ${String(error?.message || error).slice(0, 160)}`);
     }
   }
 
-  console.log("\n=== 완료 ===");
-  console.log(`source root: ${rootPath}`);
-  console.log(`총 메시지:   ${totalMessages}건`);
-  console.log(`총 파일:     ${totalFiles}건`);
-  console.log(`총 사진:     ${totalPhotos}건`);
-  console.log(`중복 skip:   ${totalSkipped}건`);
-
-  const failed = results.filter(r => !r.ok);
-  if (failed.length) {
-    console.log(`\n실패 ${failed.length}건:`);
-    failed.forEach(r => console.log(`  [${r.room}] ${r.error}`));
+  let activeMessages = 0;
+  let activeFiles = 0;
+  if (!dryRun) {
+    activeMessages = parseRows(runWrangler(dbName, ["--command", "SELECT COUNT(*) AS count FROM messages WHERE source_status = 'active';", "--json"]))[0]?.count || 0;
+    activeFiles = parseRows(runWrangler(dbName, ["--command", "SELECT COUNT(*) AS count FROM files WHERE source_status = 'active';", "--json"]))[0]?.count || 0;
+    runWrangler(dbName, ["--command", `INSERT INTO export_ingest_runs (
+      source_path, original_room, scanned_messages, imported_messages, skipped_messages, failed_messages,
+      imported_files, skipped_files, failed_files, active_messages, active_files
+    ) VALUES (
+      ${sql(sourcePath)}, ${sql(rooms.length === 1 ? rooms[0].name : path.basename(sourcePath))},
+      ${scanned}, ${importedMessages}, ${skippedMessages}, ${failedMessages},
+      ${importedFiles}, ${skippedFiles}, ${failedFiles}, ${activeMessages}, ${activeFiles}
+    );`]);
   }
 
-  if (dryRun) {
-    console.log("\n[DRY-RUN] 실제 저장 안 함. 저장하려면 --dry-run 없이 실행하세요.");
-  } else {
-    console.log(`\nsource_status='active' 로 저장 완료.`);
-    console.log("worker.js에서 /debug_active_legacy 로 건수를 확인하세요.");
+  console.log("=== Done ===");
+  console.log(`Loaded messages: ${scanned}`);
+  console.log(`Imported messages: ${importedMessages}`);
+  console.log(`Skipped duplicate messages: ${skippedMessages}`);
+  console.log(`Imported files: ${importedFiles}`);
+  console.log(`Skipped duplicate files: ${skippedFiles}`);
+  console.log(`Imported photos: ${photos}`);
+  if (!dryRun) {
+    console.log(`Active messages: ${activeMessages}`);
+    console.log(`Active files: ${activeFiles}`);
   }
 }
 
 try {
   main();
-} catch (e) {
-  console.error(e.message || e);
+} catch (error) {
+  console.error(error?.stack || error?.message || error);
   process.exit(1);
 }
