@@ -50,7 +50,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-export-ingest-schema-run-fix";
+const BUILD_VERSION = "koh-export-schema-ingest-remote-fix";
 
 function readBoolEnv(env, key, defaultValue = false) {
   const val = String(env[key] || "").trim().toLowerCase();
