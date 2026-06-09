@@ -50,7 +50,7 @@ const BOT_PERSONA = "권오혁 담당님의 개인 업무 비서 AI OS";
 const BOT_DB_NAME = "6r-ai-db";
 const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
-const BUILD_VERSION = "koh-v2-component-refactor-20260609-1600";
+const BUILD_VERSION = "koh-final-natural-router-canonical-output-20260609-2000";
 
 function readBoolEnv(env, key, defaultValue = false) {
   const val = String(env[key] || "").trim().toLowerCase();
@@ -1012,14 +1012,21 @@ async function handleCurrentContentSummary(env, message, query, chatId, userId) 
 
 // ── 소스 텍스트 정제 ──────────────────────────────────────────────────────────
 function cleanSourceTextForSummary(text) {
-  const noNoise = removeChatNoiseLines(text);
-  return String(noNoise || "")
-    .split(/\n+/)
-    .map(l => l.trim())
+  return String(text || "")
+    .split(/\n+|\/+/)
+    .map(s => s.trim())
     .filter(Boolean)
-    .filter(l => !/저장된 파일 \d+건입니다/.test(l))
-    .filter(l => !/관련 파일 \d+건/.test(l))
-    .filter(l => !/📌\s*</.test(l))
+    .filter(s => !/^(네|넵|알겠습니다|확인하겠습니다|반영하겠습니다|수정하겠습니다|진행하겠습니다|검토하겠습니다|전달하겠습니다)/.test(s))
+    .filter(s => !/^(그러하겠습니다|그리하겠습니다|말씀드립니다|보고드립니다)/.test(s))
+    .filter(s => !/^(담당님|사장님|팀장님)[,\s]*$/.test(s))
+    .filter(s => !/(올려드립니다|첨부와 같이|파일로도 올려|보내주셔도 될 것|마이너한 얘기지만)/.test(s))
+    .filter(s => !/^photo[_@.-]/i.test(s))
+    .filter(s => !/Telegram export file/i.test(s))
+    .filter(s => !/저장된 파일 \d+건입니다/.test(s))
+    .filter(s => !/관련 파일 \d+건/.test(s))
+    .filter(s => !/🧩 내용|📎 자료 위치|👤 공유자/.test(s))
+    .filter(s => !/📌\s*</.test(s))
+    .filter(s => !/제공된 파일 내용이 없어/.test(s))
     .join("\n")
     .trim();
 }
