@@ -69,6 +69,20 @@ function getKstDayRange() {
   return { kstDate, startIso: toIso(startMs), endIso: toIso(endMs) };
 }
 
+// 이번주(월~일) KST 날짜 범위 (YYYY-MM-DD)
+function getKstWeekRange() {
+  const kstOffset = 9 * 60 * 60 * 1000;
+  const kstNow = new Date(Date.now() + kstOffset);
+  const day = kstNow.getUTCDay(); // 0=Sun..6=Sat
+  const monOffset = (day + 6) % 7; // days since Monday
+  const monday = new Date(kstNow);
+  monday.setUTCDate(kstNow.getUTCDate() - monOffset);
+  const sunday = new Date(monday);
+  sunday.setUTCDate(monday.getUTCDate() + 6);
+  const fmt = (d) => d.toISOString().slice(0, 10);
+  return { start: fmt(monday), end: fmt(sunday) };
+}
+
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
@@ -1811,6 +1825,53 @@ async function retrieveRecentMaterialCandidates(plan, message, env) {
     .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
 }
 
+// 현재 방에 공유된 파일들의 본문(extracted_text)을 기준으로 요약
+async function handleRoomFileSummary(env, chatId, files, currentRoomId, roomTitle) {
+  const display = files.slice(0, 5);
+  console.log("ROOM_FILE_SUMMARY", {
+    roomId: currentRoomId,
+    roomTitle,
+    filesCount: display.length,
+    fileNames: display.map(f => f.file_name),
+    extractedLengths: display.map(f => (f.extracted_text || f.content || "").length),
+  });
+
+  if (!display.length) {
+    await kohSendHtml(env, chatId, "이 방에 공유된 자료를 찾지 못했습니다.");
+    return true;
+  }
+
+  const blocks = [];
+  for (const f of display) {
+    const body = String(f.extracted_text || f.content || "").trim();
+    const fileName = f.file_name || "파일명 미확인";
+    const uploader = f.uploader_name || f.sender_name || f.from_name || "미확인";
+    const date = kohFormatDate(f.created_at);
+
+    if (body.length < 30) {
+      blocks.push(`[${fileName}]\n상태: 본문 추출 실패\n사유: 텍스트가 없거나 파일 추출 로직 미작동`);
+      continue;
+    }
+
+    try {
+      const query = TONE_RULE +
+        `다음은 "${fileName}" 파일에서 추출된 본문입니다. 이 본문 내용만 바탕으로 핵심 내용을 3개의 불릿으로 요약해줘.\n\n` +
+        `[형식]\n- 핵심 내용 1\n- 핵심 내용 2\n- 핵심 내용 3\n\n` +
+        `마크다운(*, #) 금지. 다른 자료나 지식 베이스 참고 금지. 오직 아래 본문 내용만 사용.\n\n` +
+        `[본문]\n${body.slice(0, 6000)}`;
+      const result = await difyChat(env, { query, user: "koh", conversationId: "" });
+      const bullets = (result?.answer || "").trim() || "- 요약 생성 실패";
+      blocks.push(`[${fileName}]\n업로드: ${uploader} / ${date}\n요약:\n${bullets}`);
+    } catch (e) {
+      console.error("handleRoomFileSummary dify:", e);
+      blocks.push(`[${fileName}]\n업로드: ${uploader} / ${date}\n요약: 요약 생성 실패`);
+    }
+  }
+
+  await kohSendHtml(env, chatId, blocks.join("\n\n"));
+  return true;
+}
+
 async function handleRecentMaterialBrief(items, chatId, env) {
   const filtered = (items || [])
     .filter(c => !isBotGeneratedOutput(c.text || c.content || c.summary, c._resolvedName || c.sender_name || c.uploader_name))
@@ -2490,7 +2551,7 @@ function kohDetectIntent(text = "") {
   if (/(액션\s*아이템|해야\s*할\s*(일|것|과제)|챙겨야\s*할|다음\s*단계|확인\s*필요\s*사항|내가\s*해야|마감.*언제|담당\s*(확인|정리))/.test(n)) return KOH_INTENT.ACTION_ITEM_CHECK;
 
   // SCHEDULE_CHECK: schedule
-  if (/(이번주\s*(일정|챙겨야|할\s*것)|오늘\s*(일정|해야)|일정.*어때|일정.*어떻게|보고\s*일정|회의\s*일정|마감\s*일정)/.test(n)) return KOH_INTENT.SCHEDULE_CHECK;
+  if (/(이번주\s*(일정|챙겨야|할\s*것)|오늘\s*(일정|해야)|일정.*(어때|어떻게|알려|보여|확인|요약|정리)|보고\s*일정|회의\s*일정|마감\s*일정|이\s*방.*일정|사진.*일정|이미지.*일정)/.test(n)) return KOH_INTENT.SCHEDULE_CHECK;
 
   // MATERIAL_FIND: locating specific material
   if (/(자료\s*어디|파일\s*어디|어디\s*있어|어느\s*방에|그\s*문서|그\s*발표자료|어느\s*파일|찾아줘.*자료|자료.*찾아줘)/.test(n)) return KOH_INTENT.MATERIAL_FIND;
@@ -2885,8 +2946,13 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
     }
 
     if (!scoredFiles.length) {
-      await kohSendHtml(env, chatId, "최근 저장 기록에서 관련 자료를 찾지 못했습니다.");
+      await kohSendHtml(env, chatId, currentRoomOnly ? "이 방에 공유된 자료를 찾지 못했습니다." : "최근 저장 기록에서 관련 자료를 찾지 못했습니다.");
       return true;
+    }
+
+    if (/(요약|정리)/.test(text)) {
+      const roomTitle = scoredFiles[0]?.room_title || "";
+      return await handleRoomFileSummary(env, chatId, scoredFiles, currentRoomId, roomTitle);
     }
 
     const display = scoredFiles.slice(0, 5);
@@ -3049,22 +3115,64 @@ if (intent === KOH_INTENT.MEETING_SUMMARY) {
   if (intent === KOH_INTENT.SCHEDULE_CHECK || intent === KOH_INTENT.ACTION_ITEM_CHECK) {
     const allItems = [...scoredFiles.slice(0, 10), ...filteredMsgs.slice(0, 20)];
     if (!allItems.length) {
-      await kohSendHtml(env, chatId, "관련 일정·액션아이템을 찾지 못했습니다.");
+      await kohSendHtml(env, chatId, currentRoomOnly ? "이 방에서 일정 정보를 찾지 못했습니다." : "관련 일정·액션아이템을 찾지 못했습니다.");
       return true;
     }
+
+    if (intent === KOH_INTENT.SCHEDULE_CHECK) {
+      const { kstDate } = getKstDayRange();
+      const { start: weekStart, end: weekEnd } = getKstWeekRange();
+      const isTodayOnly = /오늘/.test(text) && !/이번주|주간/.test(text);
+      const scopeLabel = isTodayOnly ? `오늘(${kstDate}) 하루` : `이번주(${weekStart} ~ ${weekEnd})`;
+      const imageFiles = scoredFiles.filter(f => /\.(jpe?g|png|gif|webp)$/i.test(f.file_name || ""));
+      const corpus = [
+        ...scoredFiles.slice(0, 10).map(f => `[자료] ${f.room_title || ""} | ${f.file_name || ""}: ${String(f.summary || f.extracted_text || f.content || "").slice(0, 500)}`),
+        ...filteredMsgs.slice(0, 20).map(m => `[대화] ${m.room_title || ""} | ${m.sender_name || ""}: ${String(m.content || "").slice(0, 200)}`),
+      ].join("\n");
+      try {
+        const q = TONE_RULE +
+          `이미지 또는 자료에서 일정 정보를 추출할 때는 날짜와 회의명만 간결하게 정리하세요. 액션아이템, 담당자, 상세 설명은 사용자가 별도로 요청하지 않는 한 출력하지 마세요.\n\n` +
+          `오늘 날짜(KST): ${kstDate}\n` +
+          `이번주 범위(KST): ${weekStart} ~ ${weekEnd}\n\n` +
+          `아래 자료에서 ${scopeLabel}에 해당하는 일정만 추출해서 정리해줘.\n\n` +
+          `[출력 형식]\n` +
+          (isTodayOnly
+            ? `오늘 주요 일정\n- MM/DD 회의명\n- MM/DD 회의명\n`
+            : `오늘 주요 일정\n- MM/DD 회의명\n\n이번주 주요 일정\n- MM/DD 회의명\n- MM/DD 회의명\n`) +
+          `\n날짜를 알 수 없는 항목은 "날짜 미확인"으로 표시.\n` +
+          `일정이 없는 날짜/구간은 출력하지 마세요.\n` +
+          `위 형식 외의 텍스트(인사말, 설명 등)는 출력하지 마세요.\n\n` +
+          `[자료]\n${corpus.slice(0, 6000)}\n\n요청: ${text}`;
+        const r = await difyChat(env, { query: q, user: "koh", conversationId: "" });
+        const answer = (r.answer || "").trim();
+        if (imageFiles.length) {
+          console.log("IMAGE_SCHEDULE_EXTRACT", {
+            roomId: currentRoomId,
+            roomTitle: imageFiles[0]?.room_title || "",
+            imageFileId: imageFiles.map(f => f.telegram_file_id || f.file_name),
+            extractedScheduleCount: (answer.match(/^- /gm) || []).length,
+          });
+        }
+        if (answer) { await kohSendHtml(env, chatId, answer); return true; }
+      } catch (e) { console.error("SCHEDULE_CHECK:", e); }
+      await kohSendHtml(env, chatId, "일정 추출 실패. 다시 시도해주세요.");
+      return true;
+    }
+
+    // ACTION_ITEM_CHECK
     const corpus = [
       ...scoredFiles.slice(0, 10).map(f => `[파일] ${f._resolvedRoom || f.room_title || ""} | ${f.file_name || ""}: ${String(f.summary || f.content || "").slice(0, 300)}`),
       ...filteredMsgs.slice(0, 20).map(m => `[대화] ${m._resolvedRoom || m.room_title || ""} | ${m.sender_name || ""}: ${String(m.content || "").slice(0, 200)}`),
     ].join("\n");
     try {
       const q = TONE_RULE +
-        `아래 자료에서 ${intent === KOH_INTENT.SCHEDULE_CHECK ? "일정과 회의 일정" : "액션아이템과 해야 할 일"}을 추출해줘.\n\n` +
-        `[추출 형식]\n⏰ 일정/마감: 날짜 | 내용 | 담당자\n📋 액션: 할 일 | 담당자 (불명확하면 "확인 필요")\n\n` +
+        `아래 자료에서 액션아이템과 해야 할 일을 추출해줘.\n\n` +
+        `[추출 형식]\n📋 액션: 할 일 | 담당자 (불명확하면 "확인 필요")\n\n` +
         `[자료]\n${corpus.slice(0, 6000)}\n\n요청: ${text}`;
       const r = await difyChat(env, { query: q, user: "koh", conversationId: "" });
       if (r.answer) { await kohSendHtml(env, chatId, r.answer); return true; }
-    } catch (e) { console.error("SCHEDULE/ACTION:", e); }
-    await kohSendHtml(env, chatId, "일정·액션아이템 추출 실패. 다시 시도해주세요.");
+    } catch (e) { console.error("ACTION_ITEM_CHECK:", e); }
+    await kohSendHtml(env, chatId, "액션아이템 추출 실패. 다시 시도해주세요.");
     return true;
   }
 
@@ -8098,6 +8206,14 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
       try { extractedText = await extractTextFromFile(fileType, fileBuffer); } catch (e) { console.error("extract:", e); }
     }
 
+    console.log("FILE_EXTRACT_RESULT", {
+      roomId,
+      roomTitle,
+      fileName,
+      fileType,
+      extractedLength: extractedText?.length || 0,
+    });
+
     // Dify 텍스트 쿼리로 요약 (파일 업로드 API 사용 안 함)
     let result;
     const caption = message.caption || "";
@@ -8167,100 +8283,181 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
 }
 
 // PDF 텍스트 추출 (Cloudflare Workers 환경)
+// DEFLATE/zlib 압축 해제 (Workers 내장 DecompressionStream 사용)
+async function inflateBytes(data, format = "deflate") {
+  try {
+    const ds = new DecompressionStream(format);
+    const writer = ds.writable.getWriter();
+    writer.write(data);
+    writer.close();
+    const buf = await new Response(ds.readable).arrayBuffer();
+    return new Uint8Array(buf);
+  } catch (e) {
+    return null;
+  }
+}
+
+// ZIP(PPTX/DOCX) 내부 엔트리 추출 (Central Directory 기반)
+async function unzipEntries(arrayBuffer, namePredicate) {
+  const bytes = new Uint8Array(arrayBuffer);
+  const view = new DataView(arrayBuffer);
+  let eocdOffset = -1;
+  for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 22 - 65557); i--) {
+    if (view.getUint32(i, true) === 0x06054b50) { eocdOffset = i; break; }
+  }
+  if (eocdOffset < 0) return [];
+  const cdEntries = view.getUint16(eocdOffset + 10, true);
+  let offset = view.getUint32(eocdOffset + 16, true);
+  const results = [];
+  for (let i = 0; i < cdEntries; i++) {
+    if (view.getUint32(offset, true) !== 0x02014b50) break;
+    const compMethod = view.getUint16(offset + 10, true);
+    const compSize = view.getUint32(offset + 20, true);
+    const nameLen = view.getUint16(offset + 28, true);
+    const extraLen = view.getUint16(offset + 30, true);
+    const commentLen = view.getUint16(offset + 32, true);
+    const localHeaderOffset = view.getUint32(offset + 42, true);
+    const name = new TextDecoder("utf-8").decode(bytes.subarray(offset + 46, offset + 46 + nameLen));
+    if (namePredicate(name)) {
+      const lhNameLen = view.getUint16(localHeaderOffset + 26, true);
+      const lhExtraLen = view.getUint16(localHeaderOffset + 28, true);
+      const dataStart = localHeaderOffset + 30 + lhNameLen + lhExtraLen;
+      const compData = bytes.subarray(dataStart, dataStart + compSize);
+      let data;
+      if (compMethod === 0) data = compData;
+      else if (compMethod === 8) data = (await inflateBytes(compData, "deflate-raw")) || new Uint8Array(0);
+      else data = new Uint8Array(0);
+      results.push({ name, data });
+    }
+    offset += 46 + nameLen + extraLen + commentLen;
+  }
+  return results;
+}
+
+// PDF 텍스트 추출 (압축 스트림 포함)
 async function extractTextFromPdf(env, arrayBuffer) {
   try {
-    // PDF 바이너리에서 텍스트 스트림 직접 추출
     const bytes = new Uint8Array(arrayBuffer);
     const decoder = new TextDecoder("latin1");
     const raw = decoder.decode(bytes);
 
-    // PDF 텍스트 객체 추출 (BT...ET 블록)
-    const textBlocks = [];
-    const btEtRegex = /BT([\s\S]*?)ET/g;
-    let match;
-    while ((match = btEtRegex.exec(raw)) !== null) {
-      const block = match[1];
-      // Tj, TJ 연산자에서 텍스트 추출
-      const tjRegex = /\(([^)]*)\)\s*Tj|\[([^\]]*)\]\s*TJ/g;
-      let tjMatch;
-      while ((tjMatch = tjRegex.exec(block)) !== null) {
-        const text = (tjMatch[1] || tjMatch[2] || "")
-          .replace(/\\(\d{3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)))
-          .replace(/\\\\/g, "\\")
-          .replace(/\\n/g, "\n")
-          .replace(/\\r/g, "")
-          .trim();
-        if (text.length > 1) textBlocks.push(text);
+    const extractFromText = (text) => {
+      const blocks = [];
+      const btEtRegex = /BT([\s\S]*?)ET/g;
+      let m;
+      while ((m = btEtRegex.exec(text)) !== null) {
+        const block = m[1];
+        const tjRegex = /\(((?:[^()\\]|\\.)*)\)\s*Tj|\[((?:[^\[\]\\]|\\.)*)\]\s*TJ/g;
+        let tjMatch;
+        while ((tjMatch = tjRegex.exec(block)) !== null) {
+          const t = (tjMatch[1] || tjMatch[2] || "")
+            .replace(/\\(\d{3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)))
+            .replace(/\\\\/g, "\\")
+            .replace(/\\n/g, "\n")
+            .replace(/\\r/g, "")
+            .replace(/\\\(/g, "(")
+            .replace(/\\\)/g, ")")
+            .trim();
+          if (t.length > 1) blocks.push(t);
+        }
       }
-    }
+      return blocks.join(" ").replace(/\s+/g, " ").trim();
+    };
 
-    const extracted = textBlocks.join(" ").replace(/\s+/g, " ").trim();
-    if (extracted.length > 50) return extracted.slice(0, 8000);
-
-    // 직접 추출 실패 시 스트림에서 재시도
-    const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
-    const streamTexts = [];
+    // 스트림 객체 순회: /FlateDecode면 압축 해제 후, 아니면 원본 그대로 텍스트 추출
+    const allTexts = [];
+    const streamRegex = /stream\r?\n/g;
+    let match;
     while ((match = streamRegex.exec(raw)) !== null) {
-      const stream = match[1];
-      const readable = stream.replace(/[^\x20-\x7E\n]/g, " ").replace(/\s+/g, " ").trim();
-      if (readable.length > 20) streamTexts.push(readable);
+      const streamStart = match.index + match[0].length;
+      const endIdx = raw.indexOf("endstream", streamStart);
+      if (endIdx < 0) break;
+      let dataEnd = endIdx;
+      if (raw[dataEnd - 1] === "\n") dataEnd--;
+      if (raw[dataEnd - 1] === "\r") dataEnd--;
+
+      const dictStart = Math.max(0, match.index - 1000);
+      const dict = raw.slice(dictStart, match.index);
+
+      const streamBytes = bytes.subarray(streamStart, dataEnd);
+      if (/\/Filter\s*\/FlateDecode/.test(dict)) {
+        const inflated = await inflateBytes(streamBytes, "deflate");
+        if (inflated) {
+          const text = new TextDecoder("latin1").decode(inflated);
+          const extracted = extractFromText(text);
+          if (extracted) allTexts.push(extracted);
+        }
+      } else if (!/\/Filter/.test(dict)) {
+        const text = new TextDecoder("latin1").decode(streamBytes);
+        const extracted = extractFromText(text);
+        if (extracted) allTexts.push(extracted);
+      }
+
+      streamRegex.lastIndex = endIdx + "endstream".length;
     }
-    return streamTexts.join(" ").slice(0, 8000) || "";
+
+    let extracted = allTexts.join(" ").replace(/\s+/g, " ").trim();
+    if (extracted.length > 30) return extracted.slice(0, 8000);
+
+    // 최종 폴백: 압축되지 않은 본문 전체에서 직접 추출
+    extracted = extractFromText(raw);
+    return extracted.slice(0, 8000) || "";
   } catch (e) {
     console.error("extractTextFromPdf:", e);
     return "";
   }
 }
 
-// PPTX 텍스트 추출 (ZIP 구조 파싱)
+// PPTX 텍스트 추출 (ZIP 구조 파싱, 슬라이드 순서대로)
 async function extractTextFromPptx(arrayBuffer) {
   try {
-    const bytes = new Uint8Array(arrayBuffer);
+    const entries = await unzipEntries(arrayBuffer, (name) => /^ppt\/slides\/slide\d+\.xml$/.test(name));
+    entries.sort((a, b) => {
+      const na = parseInt(a.name.match(/slide(\d+)\.xml$/)[1], 10);
+      const nb = parseInt(b.name.match(/slide(\d+)\.xml$/)[1], 10);
+      return na - nb;
+    });
+
+    const slideTexts = [];
     const decoder = new TextDecoder("utf-8", { fatal: false });
-    const raw = decoder.decode(bytes);
-
-    // ZIP 내부 XML에서 텍스트 추출
-    const texts = [];
-    // <a:t> 태그에서 텍스트 추출 (PowerPoint XML)
-    const tagRegex = /<a:t[^>]*>([^<]+)<\/a:t>/g;
-    let match;
-    while ((match = tagRegex.exec(raw)) !== null) {
-      const text = match[1].trim();
-      if (text.length > 1) texts.push(text);
+    for (const entry of entries) {
+      const xml = decoder.decode(entry.data);
+      const texts = [];
+      const tagRegex = /<a:t[^>]*>([^<]*)<\/a:t>/g;
+      let m;
+      while ((m = tagRegex.exec(xml)) !== null) {
+        const t = m[1].trim();
+        if (t.length > 0) texts.push(t);
+      }
+      if (texts.length > 0) slideTexts.push(texts.join(" "));
     }
 
-    if (texts.length > 0) return texts.join(" ").slice(0, 8000);
-
-    // <t> 태그 fallback
-    const tRegex = /<t[^>]*>([^<]{2,})<\/t>/g;
-    while ((match = tRegex.exec(raw)) !== null) {
-      texts.push(match[1].trim());
-    }
-    return texts.join(" ").slice(0, 8000) || "";
+    return slideTexts.join("\n").slice(0, 8000);
   } catch (e) {
     console.error("extractTextFromPptx:", e);
     return "";
   }
 }
 
-// DOCX 텍스트 추출 (ZIP 구조 파싱)
+// DOCX 텍스트 추출 (ZIP 구조 파싱, 단락 구분 유지)
 async function extractTextFromDocx(arrayBuffer) {
   try {
-    const bytes = new Uint8Array(arrayBuffer);
-    const decoder = new TextDecoder("utf-8", { fatal: false });
-    const raw = decoder.decode(bytes);
+    const entries = await unzipEntries(arrayBuffer, (name) => name === "word/document.xml");
+    if (!entries.length) return "";
 
-    // <w:t> 태그에서 텍스트 추출 (Word XML)
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+    const xml = decoder.decode(entries[0].data);
+    const normalized = xml.replace(/<\/w:p>/g, "\n");
+
     const texts = [];
-    const tagRegex = /<w:t[^>]*>([^<]+)<\/w:t>/g;
-    let match;
-    while ((match = tagRegex.exec(raw)) !== null) {
-      const text = match[1].trim();
-      if (text.length > 0) texts.push(text);
+    const regex = /<w:t[^>]*>([^<]*)<\/w:t>|(\n)/g;
+    let m;
+    while ((m = regex.exec(normalized)) !== null) {
+      if (m[1] !== undefined) texts.push(m[1]);
+      else texts.push("\n");
     }
 
-    if (texts.length > 0) return texts.join(" ").slice(0, 8000);
-    return "";
+    return texts.join("").replace(/\n{3,}/g, "\n\n").trim().slice(0, 8000);
   } catch (e) {
     console.error("extractTextFromDocx:", e);
     return "";
