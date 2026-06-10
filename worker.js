@@ -1368,12 +1368,9 @@ function cleanReportSummary(text = "", card = {}) {
 function formatReportSourceLocation(card = {}) {
   const roomName = card.original_room || card.source_room || card.room_title || card.source || "알 수 없는 방";
   const room = `[${escapeHtml(roomName)}]`;
-<<<<<<< HEAD
   const actor = card.mixed_actors
     ? "여러 명"
     : (card.from_name || card.sender_name || "미확인");
-=======
->>>>>>> 3d0fdb7 (Revert "Improve briefing judgement and output routing")
   const date = card.date || card.dateStr || formatShortDateFromValue(card.created_at || "");
   const imageCount = Number(card.image_count || (card.source_type === "image" ? 1 : 0));
   if (imageCount > 0 || card.source_type === "image_group" || card.source_type === "image") {
@@ -1890,10 +1887,6 @@ async function handleRoomFileSummary(env, chatId, files, currentRoomId, roomTitl
 }
 
 // 텍스트에서 URL 추출
-function extractUrls(text) {
-  return [...String(text || "").matchAll(/https?:\/\/[^\s)>\]]+/g)].map(m => m[0]);
-}
-
 const NEWS_DOMESTIC_DOMAINS = [
   "naver.com", "news.naver.com", "daum.net", "chosun.com", "joins.com",
   "donga.com", "hankyung.com", "mk.co.kr", "yna.co.kr", "newsis.com",
