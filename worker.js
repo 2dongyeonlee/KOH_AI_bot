@@ -1835,6 +1835,13 @@ async function handleRoomFileSummary(env, chatId, files, currentRoomId, roomTitl
     fileNames: display.map(f => f.file_name),
     extractedLengths: display.map(f => (f.extracted_text || f.content || "").length),
   });
+  console.log("ROOM_FILE_SUMMARY_QUERY", {
+    roomId: currentRoomId,
+    roomTitle,
+    filesCount: files.length,
+    fileNames: files.map(f => f.file_name),
+    extractedLengths: files.map(f => (f.extracted_text || "").length),
+  });
 
   if (!display.length) {
     await kohSendHtml(env, chatId, "이 방에 공유된 자료를 찾지 못했습니다.");
@@ -1869,6 +1876,136 @@ async function handleRoomFileSummary(env, chatId, files, currentRoomId, roomTitl
   }
 
   await kohSendHtml(env, chatId, blocks.join("\n\n"));
+  return true;
+}
+
+// 텍스트에서 URL 추출
+function extractUrls(text) {
+  return [...String(text || "").matchAll(/https?:\/\/[^\s)>\]]+/g)].map(m => m[0]);
+}
+
+const NEWS_DOMESTIC_DOMAINS = [
+  "naver.com", "news.naver.com", "daum.net", "chosun.com", "joins.com",
+  "donga.com", "hankyung.com", "mk.co.kr", "yna.co.kr", "newsis.com",
+  "edaily.co.kr", "etnews.com", "zdnet.co.kr", "bloter.net",
+  "digitaltoday.co.kr", "businesspost.co.kr",
+];
+
+const NEWS_FOREIGN_DOMAINS = [
+  "reuters.com", "bloomberg.com", "wsj.com", "ft.com", "nikkei.com",
+  "cnbc.com", "theverge.com", "techcrunch.com", "apnews.com", "cnn.com",
+  "bbc.com", "scmp.com",
+];
+
+// 도메인 기준 내신/외신/기타 분류
+function classifyNewsDomain(hostname) {
+  const host = String(hostname || "").toLowerCase().replace(/^www\./, "");
+  const matches = (list) => list.some(d => host === d || host.endsWith("." + d));
+  if (matches(NEWS_DOMESTIC_DOMAINS)) return "내신";
+  if (matches(NEWS_FOREIGN_DOMAINS)) return "외신";
+  return "기타";
+}
+
+// URL의 og:title 또는 <title>을 가져온다. 실패 시 도메인+경로 기반 제목 생성
+async function fetchArticleTitle(url) {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch(url, { signal: controller.signal, headers: { "User-Agent": "Mozilla/5.0" } });
+    clearTimeout(timeout);
+    if (!res.ok) throw new Error(`fetch failed: ${res.status}`);
+    const html = (await res.text()).slice(0, 50000);
+    const ogMatch = html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i)
+      || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i);
+    if (ogMatch) return ogMatch[1].trim();
+    const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+    if (titleMatch) return titleMatch[1].trim();
+  } catch (e) {
+    // fall through to fallback
+  }
+  try {
+    const u = new URL(url);
+    return `${u.hostname}${u.pathname}`.replace(/\/$/, "");
+  } catch (e) {
+    return url;
+  }
+}
+
+// 현재 방에 공유된 뉴스/기사 링크를 내신/외신/기타로 구분해 제목+URL만 정리
+async function handleNewsLinkList(env, chatId, currentRoomId, text) {
+  const isTodayOnly = /오늘/.test(text);
+  let since;
+  if (isTodayOnly) {
+    since = getKstDayRange().startIso;
+  } else {
+    since = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 19).replace("T", " ");
+  }
+
+  const rows = await env.DB.prepare(`
+    SELECT content, room_title, created_at
+    FROM messages
+    WHERE CAST(room_id AS TEXT) = ?
+      AND created_at >= ?
+      AND content LIKE '%http%'
+    ORDER BY created_at DESC
+    LIMIT 200
+  `).bind(String(currentRoomId), since).all();
+
+  const messages = rows.results || [];
+  const roomTitle = messages[0]?.room_title || "";
+
+  const seen = new Set();
+  const urls = [];
+  for (const m of messages) {
+    for (const url of extractUrls(m.content)) {
+      const clean = url.replace(/[.,)\]]+$/, "");
+      if (!seen.has(clean)) {
+        seen.add(clean);
+        urls.push(clean);
+      }
+    }
+  }
+
+  console.log("NEWS_LINK_LIST", {
+    roomId: currentRoomId,
+    roomTitle,
+    urlsCount: urls.length,
+    domains: urls.map(u => { try { return new URL(u).hostname; } catch (e) { return ""; } }),
+    mode: "title_url_only",
+  });
+
+  if (!urls.length) {
+    await kohSendHtml(env, chatId, "이 방에 공유된 뉴스/기사 링크를 찾지 못했습니다.");
+    return true;
+  }
+
+  const TOTAL_LIMIT = 20;
+  const targetUrls = urls.slice(0, TOTAL_LIMIT);
+  const omitted = urls.length - targetUrls.length;
+
+  const articles = await Promise.all(targetUrls.map(async (url) => {
+    let hostname = "";
+    try { hostname = new URL(url).hostname; } catch (e) {}
+    const title = await fetchArticleTitle(url);
+    return { url, title, category: classifyNewsDomain(hostname) };
+  }));
+
+  const groups = { "내신": [], "외신": [], "기타": [] };
+  for (const a of articles) {
+    if (groups[a.category].length < 10) groups[a.category].push(a);
+  }
+
+  const sections = [];
+  for (const cat of ["내신", "외신", "기타"]) {
+    if (!groups[cat].length) continue;
+    const lines = groups[cat].map(a => `- ${escapeHtml(a.title)} &lt;${escapeHtml(a.url)}&gt;`);
+    sections.push(`${cat}\n${lines.join("\n")}`);
+  }
+
+  let output = sections.join("\n\n");
+  if (omitted > 0) output += `\n\n외 ${omitted}건은 생략했습니다.`;
+
+  await kohSendHtml(env, chatId, output);
   return true;
 }
 
@@ -2414,6 +2551,7 @@ const KOH_INTENT = {
   SCHEDULE_CHECK:         "SCHEDULE_CHECK",
   ACTION_ITEM_CHECK:      "ACTION_ITEM_CHECK",
   NEWS_SEARCH:            "NEWS_SEARCH",
+  NEWS_LIST:              "NEWS_LIST",
   STRATEGIC_6R_JUDGMENT:  "STRATEGIC_6R_JUDGMENT",
   BRIEFING_SUMMARY:       "BRIEFING_SUMMARY",
 };
@@ -2456,6 +2594,7 @@ function buildAnswerPlan(text) {
     [KOH_INTENT.ACTION_ITEM_CHECK]:     "FILES_AND_MESSAGES",
     [KOH_INTENT.PRIORITY]:              "FILES_AND_MESSAGES",
     [KOH_INTENT.NEWS_SEARCH]:           "EXTERNAL_SEARCH",
+    [KOH_INTENT.NEWS_LIST]:             "MESSAGES",
     [KOH_INTENT.STRATEGIC_6R_JUDGMENT]: "FILES_AND_MESSAGES",
     [KOH_INTENT.BRIEFING_SUMMARY]:      "FILES_AND_MESSAGES",
   };
@@ -2540,6 +2679,11 @@ function kohDetectIntent(text = "") {
   // NEWS_SEARCH: external news query
   if (/(뉴스.*확인|기사.*찾아|최신.*동향|외신.*확인|bloomberg|reuters|nikkei.*뉴스|언론.*보도.*어때|sk하이닉스.*뉴스|hbm.*기사)/.test(n) &&
       !/(방|대화|공유|자료|파일|보고된|내가)/.test(n)) return KOH_INTENT.NEWS_SEARCH;
+
+  // NEWS_LIST: 공유된 뉴스/기사 링크를 제목+URL 목록으로 정리 (본문 요약 요청은 제외)
+  if (/(뉴스|기사|뉴스\s*링크)/.test(n) &&
+      /(요약해|정리해|목록|리스트|보여줘|정리해줘|요약해줘)/.test(n) &&
+      !/(본문|기사\s*내용|내용\s*요약|핵심\s*내용|이\s*기사|위\s*기사|기사.*요약해줘.*본문)/.test(n)) return KOH_INTENT.NEWS_LIST;
 
   // STRATEGIC_6R_JUDGMENT: 6R analysis
   if (/(어느\s*[rR]에서|[gGpPiIcCbBeE][rR]\s*(이야|야|인가|관련|해당|맞아|담당)|6r.*분류|6r.*판단|이해관계자.*정리|커뮤니케이션.*전략|어디서.*대응|입장.*정리해줘)/.test(n)) return KOH_INTENT.STRATEGIC_6R_JUDGMENT;
@@ -2841,6 +2985,12 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
   // BRIEFING_SUMMARY: on-demand briefing from recent shared content
   if (intent === KOH_INTENT.BRIEFING_SUMMARY) {
     await handleBriefingSummary(env, chatId, text, currentRoomId);
+    return true;
+  }
+
+  // NEWS_LIST: 현재 방에 공유된 뉴스/기사 링크를 제목+URL 목록으로 정리
+  if (intent === KOH_INTENT.NEWS_LIST) {
+    await handleNewsLinkList(env, chatId, currentRoomId, text);
     return true;
   }
 
@@ -8163,14 +8313,17 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
     const roomId = room.roomId;
     const roomTitle = room.roomTitle;
     const senderName = await getCanonicalUserName(env, message.from);
+    const fileType = getDocumentFileType(fileName, mimeType);
 
-    const fileInfo = await tgGetFile(env, fileId);
-    const fileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
+    if (message.document) {
+      console.log("DOCUMENT_RECEIVED", { roomId, roomTitle, fileName, fileId, fileType });
+    }
 
     // 이미지는 Gemini Vision으로 처리
     if (mimeType.startsWith("image/")) {
-      const buffer = await fetch(fileUrl).then((r) => r.arrayBuffer());
+      const buffer = await downloadTelegramFile(env, fileId);
       const answer = await analyzeImageWithClaude(env, buffer, mimeType, message.caption || "");
+      console.log("PHOTO_EXTRACTED", { roomId, fileId, extractedLength: answer?.length || 0 });
       await dbSaveFile(env, {
         telegram_file_id: fileId,
         telegram_file_unique_id: message.document?.file_unique_id || message.photo?.[message.photo.length - 1]?.file_unique_id || "",
@@ -8185,6 +8338,7 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
         mimeType,
         fileSize: message.document?.file_size || 0,
         sourceType: room.sourceType,
+        extracted_text: answer,
         summary: answer,
         tags: ["image", "analysis", ...room.tags],
       });
@@ -8192,9 +8346,10 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
       return;
     }
 
-    const fileBuffer = await fetch(fileUrl).then((r) => r.arrayBuffer());
+    const fileBuffer = await downloadTelegramFile(env, fileId);
+    console.log("DOCUMENT_DOWNLOADED", { fileName, bytes: fileBuffer.byteLength });
+
     const fileBlob = new Blob([fileBuffer]);
-    const fileType = getDocumentFileType(fileName, mimeType);
     let extractedText = "";
 
     // 텍스트 추출
@@ -8206,6 +8361,7 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
       try { extractedText = await extractTextFromFile(fileType, fileBuffer); } catch (e) { console.error("extract:", e); }
     }
 
+    console.log("DOCUMENT_EXTRACTED", { fileName, extractedLength: extractedText?.length || 0 });
     console.log("FILE_EXTRACT_RESULT", {
       roomId,
       roomTitle,
@@ -8214,30 +8370,24 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
       extractedLength: extractedText?.length || 0,
     });
 
-    // Dify 텍스트 쿼리로 요약 (파일 업로드 API 사용 안 함)
-    let result;
-    const caption = message.caption || "";
-    const baseContent = extractedText.length > 50
-      ? extractedText.slice(0, 6000)
-      : (caption || `파일명: ${fileName}`);
+    const hasExtractedText = (extractedText || "").trim().length >= 30;
 
-    const query =
-      TONE_RULE +
-      `다음 파일(${fileName})의 내용을 업무 안건 형식으로 정리해줘.\n\n` +
-      `[형식]\n` +
-      `📌 [카테고리] 안건명\n` +
-      `· 요약: 핵심 내용 1~2줄\n` +
-      `· 공유자: ${senderName}\n` +
-      `· 액션플랜: 다음에 해야 할 것 (없으면 생략)\n` +
-      `· 마감: 날짜 (있으면)\n\n` +
-      `카테고리: [이슈] [보고] [대외컴]\n` +
-      `여러 안건이 있으면 각각 별도 📌로 분리.\n` +
-      `볼드(<b>) 금지. 마크다운(*, #) 금지.\n\n` +
-      `[파일 내용]\n${baseContent}`;
+    // 본문이 추출된 경우에만 Dify로 3줄 요약 생성
+    let summary = "";
+    if (hasExtractedText) {
+      try {
+        const query = TONE_RULE +
+          `다음은 "${fileName}" 파일에서 추출된 본문입니다. 이 본문 내용만 바탕으로 핵심 내용을 3개의 불릿으로 요약해줘.\n\n` +
+          `[형식]\n- 핵심 내용 1\n- 핵심 내용 2\n- 핵심 내용 3\n\n` +
+          `마크다운(*, #) 금지. 다른 자료나 지식 베이스 참고 금지. 오직 아래 본문 내용만 사용.\n\n` +
+          `[본문]\n${extractedText.slice(0, 6000)}`;
+        const result = await difyChat(env, { query, user: String(userId), conversationId: "" });
+        summary = (result?.answer || "").trim();
+      } catch (e) {
+        console.error("handleFile summary:", e);
+      }
+    }
 
-    result = await difyChat(env, { query, user: String(userId), conversationId: "" });
-
-    const summary = result.answer || extractedText || "요약 미생성 / 파일 저장 완료";
     await dbSaveFile(env, {
       telegram_file_id: fileId,
       telegram_file_unique_id: message.document?.file_unique_id || "",
@@ -8248,13 +8398,20 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
       uploaderId: userId,
       uploaderName: senderName,
       fileName,
-      fileType: getDocumentFileType(fileName, mimeType),
+      fileType,
       mimeType,
       fileSize: message.document?.file_size || 0,
       sourceType: room.sourceType,
       extracted_text: extractedText,
       summary,
       tags: ["document", ...room.tags],
+    });
+
+    console.log("DOCUMENT_SAVED", {
+      roomId,
+      fileName,
+      hasText: hasExtractedText,
+      textLength: extractedText?.length || 0,
     });
 
     // Advanced Parser: cache parsed result for this file (non-blocking, best-effort)
@@ -8275,7 +8432,14 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
       );
     } catch (_) {}
 
-    await sendMessage(env, chatId, summary || "파일은 저장됐으나 요약은 아직 미생성임.");
+    // 업로드 직후 응답: 본문 추출 성공 여부만 간단히 안내
+    let response;
+    if (hasExtractedText) {
+      response = `[${fileName}] 저장 완료\n본문 추출: 성공\n추출 글자 수: ${extractedText.length}자`;
+    } else {
+      response = `[${fileName}] 저장 완료\n본문 추출: 실패\n사유: 현재 파일 파서가 이 형식을 지원하지 않음`;
+    }
+    await sendMessage(env, chatId, response);
   } catch (e) {
     console.error("handleFile error:", e);
     await sendMessage(env, chatId, `파일 처리 오류.\n핵심: ${e.message}\n확인: /db_status 필요.`);
@@ -8862,6 +9026,22 @@ async function tgGetFile(env, fileId) {
   );
   const data = await res.json();
   return data.result;
+}
+
+// Telegram getFile API로 실제 다운로드 URL 생성
+async function getTelegramFileUrl(env, fileId) {
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`);
+  const data = await res.json();
+  if (!data.ok || !data.result?.file_path) throw new Error("Telegram getFile failed");
+  return `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${data.result.file_path}`;
+}
+
+// Telegram 파일을 ArrayBuffer로 다운로드
+async function downloadTelegramFile(env, fileId) {
+  const url = await getTelegramFileUrl(env, fileId);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Telegram file download failed: ${res.status}`);
+  return await res.arrayBuffer();
 }
 
 function sanitizeTelegramHtml(value) {
