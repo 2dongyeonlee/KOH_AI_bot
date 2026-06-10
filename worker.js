@@ -6350,28 +6350,40 @@ async function fetchDigestRows(env, days = 2, limit = 120) {
 function buildDigestCorpus(rows) {
   if (!rows?.length) return "";
   return rows.map((r, idx) => {
-    const typeLabel =
-      r.type === "message" ? "대화" :
-      r.type === "file" ? "파일" : "자료";
+    const typeLabel = r.type === "message" ? "대화" : r.type === "file" ? "파일" : "자료";
 
-    const actor = r.actor && r.actor !== "unknown"
-      ? r.actor
-      : r.uploader_name || r.sender_name || "공유자 미확인";
+    // 전달(forward) 메시지에서 원래 공유자 추출
+    const rawText = String(r.text || "");
+    const forwardMatch = rawText.match(/^\[Forwarded from ([^\]]+)\]/);
+    const originalAuthor = forwardMatch ? forwardMatch[1].trim() : null;
 
-    const roomLabel = r.source && r.source !== "1:1"
-      ? r.source
-      : `1:1(${actor})`;
+    // 공유자 우선순위: 원래 공유자 > users 테이블 이름 > sender_name
+    const actor = originalAuthor
+      || (r.actor && r.actor !== "unknown" ? r.actor : null)
+      || r.uploader_name || r.sender_name || "공유자 미확인";
 
+    // 전달자와 원래 공유자 다를 때만 "(전달자 전달)" 표시
+    const forwarder = (originalAuthor && r.actor && r.actor !== "unknown" && r.actor !== originalAuthor)
+      ? r.actor : null;
+
+    const roomLabel = r.source && r.source !== "1:1" ? r.source : `1:1(${actor})`;
     const extra = r.file_name ? ` / 파일: ${r.file_name}` : "";
+    const actorLabel = forwarder ? `${actor} (${forwarder} 전달)` : actor;
 
     const msgLink = r.telegram_message_id && r.room_id && String(r.room_id).startsWith("-")
       ? ` / 링크: https://t.me/c/${String(r.room_id).replace("-100", "")}/${r.telegram_message_id}`
       : "";
 
+    // [Forwarded from ...] 텍스트 제거 후 본문만
+    const cleanText = rawText
+      .replace(/^\[Forwarded from [^\]]+\]\n?/, "")
+      .replace(/Telegram export file[^\n]*/g, "")
+      .trim().slice(0, 700);
+
     return `[${idx + 1}] ${typeLabel}
-출처: [${roomLabel}] ${actor} (${(r.created_at || "").slice(0, 16)})${extra}${msgLink}
+출처: [${roomLabel}] ${actorLabel} (${(r.created_at || "").slice(0, 16)})${extra}${msgLink}
 내용:
-${String(r.text || "").replace(/Telegram export file[^\n]*/g, "").trim().slice(0, 700)}`;
+${cleanText}`;
   }).join("\n\n");
 }
 
@@ -8025,8 +8037,8 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
     const fileInfo = await tgGetFile(env, fileId);
     const fileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
 
-    // 이미지는 Gemini로, 문서는 Dify로 처리
-    if (false && mimeType.startsWith("image/")) {
+    // 이미지는 Gemini Vision으로 처리
+    if (mimeType.startsWith("image/")) {
       const buffer = await fetch(fileUrl).then((r) => r.arrayBuffer());
       const answer = await analyzeImageWithClaude(env, buffer, mimeType, message.caption || "");
       await dbSaveFile(env, {
@@ -8050,41 +8062,42 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
       return;
     }
 
-    const fileBlob = await fetch(fileUrl).then((r) => r.blob());
+    const fileBuffer = await fetch(fileUrl).then((r) => r.arrayBuffer());
+    const fileBlob = new Blob([fileBuffer]);
+    const fileType = getDocumentFileType(fileName, mimeType);
     let extractedText = "";
-    if (getDocumentFileType(fileName, mimeType) === "txt") {
-      extractedText = (await fileBlob.text()).slice(0, 4000);
-    } else if (getDocumentFileType(fileName, mimeType) === "html") {
-      extractedText = htmlToPlainText(await fileBlob.text()).slice(0, 4000);
+
+    // 텍스트 추출
+    if (fileType === "txt") {
+      extractedText = (await fileBlob.text()).slice(0, 8000);
+    } else if (fileType === "html") {
+      extractedText = htmlToPlainText(await fileBlob.text()).slice(0, 8000);
+    } else if (["pdf", "pptx", "docx"].includes(fileType)) {
+      try { extractedText = await extractTextFromFile(fileType, fileBuffer); } catch (e) { console.error("extract:", e); }
     }
-    const uploaded = await difyUploadFile(env, fileBlob, fileName, mimeType, userId);
-    if (!uploaded.id) throw new Error("Dify 파일 업로드 실패: " + JSON.stringify(uploaded));
 
-    const conversationId = isAdmin
-      ? (await env.CONVERSATIONS.get(`conv_${userId}`)) || ""
-      : "";
-
-    const filePayload = {
-      query: SUMMARY_PROMPT,
-      user: userId,
-      files: [{ type: difyFileType(mimeType), transfer_method: "local_file", upload_file_id: uploaded.id }],
-    };
-
+    // Dify 텍스트 쿼리로 요약 (파일 업로드 API 사용 안 함)
     let result;
-    try {
-      result = await difyChat(env, { ...filePayload, conversationId });
-    } catch (e) {
-      if (e.message.includes("not_found") || e.message.includes("Conversation Not Exists")) {
-        await env.CONVERSATIONS.delete(`conv_${userId}`);
-        result = await difyChat(env, { ...filePayload, conversationId: "" });
-      } else {
-        throw e;
-      }
-    }
+    const caption = message.caption || "";
+    const baseContent = extractedText.length > 50
+      ? extractedText.slice(0, 6000)
+      : (caption || `파일명: ${fileName}`);
 
-    if (isAdmin && result.conversation_id) {
-      await env.CONVERSATIONS.put(`conv_${userId}`, result.conversation_id);
-    }
+    const query =
+      TONE_RULE +
+      `다음 파일(${fileName})의 내용을 업무 안건 형식으로 정리해줘.\n\n` +
+      `[형식]\n` +
+      `📌 [카테고리] 안건명\n` +
+      `· 요약: 핵심 내용 1~2줄\n` +
+      `· 공유자: ${senderName}\n` +
+      `· 액션플랜: 다음에 해야 할 것 (없으면 생략)\n` +
+      `· 마감: 날짜 (있으면)\n\n` +
+      `카테고리: [이슈] [보고] [대외컴]\n` +
+      `여러 안건이 있으면 각각 별도 📌로 분리.\n` +
+      `볼드(<b>) 금지. 마크다운(*, #) 금지.\n\n` +
+      `[파일 내용]\n${baseContent}`;
+
+    result = await difyChat(env, { query, user: String(userId), conversationId: "" });
 
     const summary = result.answer || extractedText || "요약 미생성 / 파일 저장 완료";
     await dbSaveFile(env, {
@@ -8131,6 +8144,115 @@ async function handleFile(message, userId, chatId, isAdmin, env) {
   }
 }
 
+// PDF 텍스트 추출 (Cloudflare Workers 환경)
+async function extractTextFromPdf(env, arrayBuffer) {
+  try {
+    // PDF 바이너리에서 텍스트 스트림 직접 추출
+    const bytes = new Uint8Array(arrayBuffer);
+    const decoder = new TextDecoder("latin1");
+    const raw = decoder.decode(bytes);
+
+    // PDF 텍스트 객체 추출 (BT...ET 블록)
+    const textBlocks = [];
+    const btEtRegex = /BT([\s\S]*?)ET/g;
+    let match;
+    while ((match = btEtRegex.exec(raw)) !== null) {
+      const block = match[1];
+      // Tj, TJ 연산자에서 텍스트 추출
+      const tjRegex = /\(([^)]*)\)\s*Tj|\[([^\]]*)\]\s*TJ/g;
+      let tjMatch;
+      while ((tjMatch = tjRegex.exec(block)) !== null) {
+        const text = (tjMatch[1] || tjMatch[2] || "")
+          .replace(/\\(\d{3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)))
+          .replace(/\\\\/g, "\\")
+          .replace(/\\n/g, "\n")
+          .replace(/\\r/g, "")
+          .trim();
+        if (text.length > 1) textBlocks.push(text);
+      }
+    }
+
+    const extracted = textBlocks.join(" ").replace(/\s+/g, " ").trim();
+    if (extracted.length > 50) return extracted.slice(0, 8000);
+
+    // 직접 추출 실패 시 스트림에서 재시도
+    const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
+    const streamTexts = [];
+    while ((match = streamRegex.exec(raw)) !== null) {
+      const stream = match[1];
+      const readable = stream.replace(/[^\x20-\x7E\n]/g, " ").replace(/\s+/g, " ").trim();
+      if (readable.length > 20) streamTexts.push(readable);
+    }
+    return streamTexts.join(" ").slice(0, 8000) || "";
+  } catch (e) {
+    console.error("extractTextFromPdf:", e);
+    return "";
+  }
+}
+
+// PPTX 텍스트 추출 (ZIP 구조 파싱)
+async function extractTextFromPptx(arrayBuffer) {
+  try {
+    const bytes = new Uint8Array(arrayBuffer);
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+    const raw = decoder.decode(bytes);
+
+    // ZIP 내부 XML에서 텍스트 추출
+    const texts = [];
+    // <a:t> 태그에서 텍스트 추출 (PowerPoint XML)
+    const tagRegex = /<a:t[^>]*>([^<]+)<\/a:t>/g;
+    let match;
+    while ((match = tagRegex.exec(raw)) !== null) {
+      const text = match[1].trim();
+      if (text.length > 1) texts.push(text);
+    }
+
+    if (texts.length > 0) return texts.join(" ").slice(0, 8000);
+
+    // <t> 태그 fallback
+    const tRegex = /<t[^>]*>([^<]{2,})<\/t>/g;
+    while ((match = tRegex.exec(raw)) !== null) {
+      texts.push(match[1].trim());
+    }
+    return texts.join(" ").slice(0, 8000) || "";
+  } catch (e) {
+    console.error("extractTextFromPptx:", e);
+    return "";
+  }
+}
+
+// DOCX 텍스트 추출 (ZIP 구조 파싱)
+async function extractTextFromDocx(arrayBuffer) {
+  try {
+    const bytes = new Uint8Array(arrayBuffer);
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+    const raw = decoder.decode(bytes);
+
+    // <w:t> 태그에서 텍스트 추출 (Word XML)
+    const texts = [];
+    const tagRegex = /<w:t[^>]*>([^<]+)<\/w:t>/g;
+    let match;
+    while ((match = tagRegex.exec(raw)) !== null) {
+      const text = match[1].trim();
+      if (text.length > 0) texts.push(text);
+    }
+
+    if (texts.length > 0) return texts.join(" ").slice(0, 8000);
+    return "";
+  } catch (e) {
+    console.error("extractTextFromDocx:", e);
+    return "";
+  }
+}
+
+// 파일 타입별 텍스트 추출 통합
+async function extractTextFromFile(fileType, arrayBuffer) {
+  if (fileType === "pdf")  return extractTextFromPdf(null, arrayBuffer);
+  if (fileType === "pptx") return extractTextFromPptx(arrayBuffer);
+  if (fileType === "docx") return extractTextFromDocx(arrayBuffer);
+  return "";
+}
+
 function arrayBufferToBase64(buffer) {
   let binary = "";
   const bytes = new Uint8Array(buffer);
@@ -8173,7 +8295,35 @@ async function analyzeImageWithOpenAI(env, imageBuffer, contentType, userPrompt 
 }
 
 async function analyzeImageWithClaude(env, buffer, mimeType, userPrompt = "") {
-  return "";
+  // Gemini Vision으로 이미지 분석
+  try {
+    const apiKey = env.GEMINI_API_KEY;
+    if (!apiKey) throw new Error("GEMINI_API_KEY 없음");
+    const base64Data = arrayBufferToBase64(buffer);
+    const body = {
+      contents: [{
+        parts: [
+          {
+            text: userPrompt ||
+              "이 이미지를 업무 문서 관점에서 분석해줘.\n" +
+              "구성: 핵심 내용 / 주요 안건 / 일정·마감 / 확인할 일.\n" +
+              "보고 메모체로 작성. 문장 끝은 ~임, ~필요, ~확인 필요 형식."
+          },
+          { inline_data: { mime_type: mimeType, data: base64Data } },
+        ],
+      }],
+    };
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+    );
+    const data = await res.json();
+    return data.candidates?.[0]?.content?.parts?.[0]?.text
+      || "이미지 분석 결과를 가져오지 못했습니다.";
+  } catch (e) {
+    console.error("analyzeImageWithClaude(Gemini):", e);
+    return "이미지 분석 오류: " + e.message;
+  }
 }
 
 async function sendDailyBriefingOld_DISABLED(env) {
