@@ -2505,7 +2505,14 @@ function kohDetectIntent(text = "") {
   if (/(먼저\s*챙길|우선순위|챙겨야\s*할|이번주\s*안건|제일\s*급한|오늘\s*챙길|확인\s*필요한\s*일|뭐부터\s*봐야|뭐부터\s*해야|내가\s*먼저\s*볼|보고\s*전에\s*확인)/.test(n)) return KOH_INTENT.PRIORITY;
 
   // MESSAGE_SUMMARY: discussion/meeting summary
-  if (/(보고된\s*내용|단체방|단톡방|포함된\s*방|다른\s*방|무슨\s*얘기|이번주\s*주요|논의\s*내용|회의\s*내용|주요\s*안건|이번주.*정리|최근.*논의|방에서.*나온|여기\s*방|아까.*그거|오늘\s*나온\s*얘기|방에.*보고된)/.test(n)) return KOH_INTENT.MESSAGE_SUMMARY;
+  const isSummaryRequest =
+    /(요약|정리|안건|논의|얘기|내용|공유|올라온|나온|보고된|주요|이슈|과제|챙겨야|뭐\s*있|뭐가\s*있|뭐\s*나왔|뭐\s*올라)/.test(n) &&
+    /(해줘|해주세요|정리해|요약해|알려줘|보여줘|뭐야|있어|있었어|있나|됐어|됐나)/.test(n);
+
+  const isExplicitSummary =
+    /(보고된\s*내용|단체방|단톡방|포함된\s*방|다른\s*방|무슨\s*얘기|이번주\s*주요|논의\s*내용|회의\s*내용|주요\s*안건|이번주.*정리|최근.*논의|방에서.*나온|여기\s*방|오늘.*내용|어제.*내용|이번주.*내용|최근.*내용|안건.*정리|내용.*정리|대화.*정리|자료.*정리)/.test(n);
+
+  if (isSummaryRequest || isExplicitSummary) return KOH_INTENT.MESSAGE_SUMMARY;
 
   // Ambiguous / low confidence → null
   return null;
@@ -2699,7 +2706,7 @@ function kohDedupFiles(files) {
   });
 }
 
-async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomId = "") {
+async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomId = "", userId = "") {
   if (!env.DB) {
     await kohSendHtml(env, chatId, "DB 연결이 없어 저장 기록을 확인할 수 없음.");
     return true;
@@ -2828,9 +2835,28 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
 
   // Low confidence intent — ask user what they mean (no LLM call to stay within CPU limit)
   if (intent === null) {
-    await kohSendHtml(env, chatId,
-      `좀 더 구체적으로 알려주시면 도와드릴게요.\n\n예시:\n· "이번주 공유된 자료 정리해줘"\n· "오늘 챙겨야 할 안건 뭐야"\n· "방별로 안건 정리해줘"`
-    );
+    try {
+      const rows = await fetchDigestRows(env, 7, 100);
+      const corpus = buildDigestCorpus(rows);
+      const senderName = (await getUser(userId, env))?.name || "담당자";
+      const query =
+        TONE_RULE + SUMMARY_RULE +
+        `당신은 권오혁 담당의 AI 비서입니다.\n` +
+        `아래는 최근 7일간 팀 자료입니다.\n\n` +
+        `[팀 자료]\n${corpus.slice(0, 6000)}\n\n` +
+        `[${senderName}의 요청]\n${text}\n\n` +
+        `위 자료를 참고해서 요청에 직접 답해줘.\n` +
+        `SUMMARY_RULE 형식으로 안건별 정리.\n` +
+        `"메뉴 선택" 안내 절대 금지.`;
+      const result = await difyChat(env, { query, user: String(userId), conversationId: "" });
+      if (result?.answer) {
+        await kohSendHtml(env, chatId, result.answer);
+        return true;
+      }
+    } catch (e) {
+      console.error("intent null dify fallback:", e);
+    }
+    await kohSendHtml(env, chatId, `질문을 이해하지 못했습니다.\n예시: "오늘 자료 정리해줘"`);
     return true;
   }
 
@@ -7392,7 +7418,7 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
 
   // internal knowledge: digest/file/priority 앞에서 먼저 처리
   if (kohIsInternalKnowledgeRequest(text)) {
-    const handled = await kohHandleInternalKnowledgeRequest(env, chatId, text, "");
+    const handled = await kohHandleInternalKnowledgeRequest(env, chatId, text, "", userId);
     if (handled) return;
   }
 
@@ -7824,7 +7850,7 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
 
   // internal knowledge: digest/file/priority 앞에서 먼저 처리
   if (kohIsInternalKnowledgeRequest(cleanText)) {
-    const handled = await kohHandleInternalKnowledgeRequest(env, chatId, cleanText, String(chatId));
+    const handled = await kohHandleInternalKnowledgeRequest(env, chatId, cleanText, String(chatId), userId);
     if (handled) return;
   }
 
