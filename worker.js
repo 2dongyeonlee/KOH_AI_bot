@@ -2007,7 +2007,10 @@ function kohIsFileSendRequest(text = "") {
 }
 
 function kohIsCurrentRoomOnly(text = "") {
-  return /(이 방만|여기만|현재 방만|이 단체방만)/.test(String(text || ""));
+  const t = String(text || "");
+  const crossRoom = /(다른\s*방|타\s*방|전체\s*방|모든\s*방|여러\s*방|방들|단체방들|단톡방들|각\s*방|각종\s*방|방\s*전체|방별|내가\s*포함된\s*방)/.test(t);
+  if (crossRoom) return false;
+  return /(이\s*방|이\s*단체방|이\s*단톡방|여기|현재\s*방|우리\s*방)/.test(t);
 }
 
 function kohIsGroupRoomPreferred(text = "") {
@@ -3144,7 +3147,7 @@ if (intent === KOH_INTENT.MEETING_SUMMARY) {
       person: m._resolvedName,
       date: kohFormatDate(m.created_at),
     })).join("\n\n");
-    await kohSendHtml(env, chatId, `<b>포함된 방 최근 기록입니다.</b>\n\n${body}`);
+    await kohSendHtml(env, chatId, `<b>${currentRoomOnly ? "이 방" : "포함된 방"} 최근 기록입니다.</b>\n\n${body}`);
     return true;
   }
 
@@ -3159,11 +3162,11 @@ if (intent === KOH_INTENT.MEETING_SUMMARY) {
       date: kohFormatDate(f.created_at),
     })).join("\n\n");
     const canSend = items.some(f => f.telegram_file_id);
-    await kohSendHtml(env, chatId, `<b>관련 파일 기록입니다.</b>\n\n${body}${canSend ? "\n\n파일을 받으려면 파일명 언급 후 '보내줘'라고 해주세요." : ""}`);
+    await kohSendHtml(env, chatId, `<b>${currentRoomOnly ? "이 방" : "관련"} 파일 기록입니다.</b>\n\n${body}${canSend ? "\n\n파일을 받으려면 파일명 언급 후 '보내줘'라고 해주세요." : ""}`);
     return true;
   }
 
-  await kohSendHtml(env, chatId, "최근 저장 기록에서 관련 내용을 찾지 못했습니다.");
+  await kohSendHtml(env, chatId, currentRoomOnly ? "이 방에 공유된 자료를 찾지 못했습니다." : "최근 저장 기록에서 관련 내용을 찾지 못했습니다.");
   return true;
 }
 
