@@ -2006,10 +2006,13 @@ function kohIsFileSendRequest(text = "") {
   return /(보내줘|공유해줘|첨부해줘|올려줘)/.test(String(text || ""));
 }
 
+function kohIsCrossRoomRequest(text = "") {
+  return /(다른\s*방|타\s*방|전체\s*방|모든\s*방|여러\s*방|방들|단체방들|단톡방들|각\s*방|각종\s*방|방\s*전체|방별|내가\s*포함된\s*방|포함된\s*단체방)/.test(String(text || ""));
+}
+
 function kohIsCurrentRoomOnly(text = "") {
   const t = String(text || "");
-  const crossRoom = /(다른\s*방|타\s*방|전체\s*방|모든\s*방|여러\s*방|방들|단체방들|단톡방들|각\s*방|각종\s*방|방\s*전체|방별|내가\s*포함된\s*방)/.test(t);
-  if (crossRoom) return false;
+  if (kohIsCrossRoomRequest(t)) return false;
   return /(이\s*방|이\s*단체방|이\s*단톡방|여기|현재\s*방|우리\s*방)/.test(t);
 }
 
@@ -2717,8 +2720,11 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
 
   const intent          = kohDetectIntent(text);
   const terms           = kohExtractSearchTerms(text);
-  const currentRoomOnly = kohIsCurrentRoomOnly(text);
   const roomAliasTitle  = kohResolveRoomAliasFromText(text);
+  // 그룹방에서의 요청은 "다른 방/방들/방별/포함된 단체방" 등 명시적 교차-방 요청이거나
+  // 특정 다른 방 별칭을 지목한 경우가 아니면 항상 현재 방(room_id) 기준으로만 조회한다.
+  const crossRoomRequest = kohIsCrossRoomRequest(text) || !!roomAliasTitle;
+  const currentRoomOnly = !!currentRoomId && !crossRoomRequest;
   const groupPreferred  = kohIsGroupRoomPreferred(text) || !!roomAliasTitle;
   const hasTerms        = terms.length > 0;
   const MIN_SCORE       = hasTerms ? 5 : 0;
@@ -2822,6 +2828,14 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
   const initDays = (intent === KOH_INTENT.FILE_LIST && !hasTerms) ? 7 : 14;
   const { files: rawFiles, messages } = await kohFetchRecentFilesAndMessages(env, currentRoomId, currentRoomOnly, initDays, roomAliasTitle);
   const files = kohDedupFiles(rawFiles);
+
+  console.log("kohHandleInternalKnowledgeRequest fetch", {
+    roomId: currentRoomId,
+    currentRoomOnly,
+    intent,
+    filesFound: files.length,
+    fileNames: files.map((f) => f.file_name).filter(Boolean).slice(0, 20),
+  });
 
   let scoredFiles = scoreFiles(files);
   const scoredMsgs = scoreMsgs(messages);
@@ -3301,6 +3315,7 @@ async function dbInsert(env, { roomId, roomTitle, senderId, senderName, content,
       content: content.slice(0, 4000),
       saved_by: savedBy || "koh",
       source_type: sourceType || "telegram_group",
+      source_status: "active",
     };
     const columns = Object.keys(values).filter((name) => existing.has(name));
     const placeholders = columns.map(() => "?").join(", ");
@@ -4656,6 +4671,7 @@ async function dbSaveFile(env, data, options = {}) {
       mime_type: data.mime_type || data.mimeType || data.file_type || data.fileType || "",
       file_size: Number(data.file_size || data.fileSize || 0) || 0,
       source_type: data.source_type || data.sourceType || "",
+      source_status: "active",
       extracted_text: String(data.extracted_text || "").slice(0, 50000),
       summary: String(data.summary || "").slice(0, 3000),
       tags_json: JSON.stringify(data.tags || []),
@@ -7157,14 +7173,16 @@ async function saveIncomingFileIfAny(message, env) {
       ).bind(uniqueId).first();
       if (prev?.id) {
         // Update telegram_file_id even if previously missing (fixes import-then-live scenario)
+        const hasSourceStatusUpd = await columnExists(env, "files", "source_status");
         await env.DB.prepare(
-          `UPDATE files SET telegram_file_id = ?, uploader_name = ?, room_id = ?, room_title = ? WHERE id = ?`
+          `UPDATE files SET telegram_file_id = ?, uploader_name = ?, room_id = ?, room_title = ?${hasSourceStatusUpd ? ", source_status = 'active'" : ""} WHERE id = ?`
         ).bind(fileId, canonicalName, String(room.roomId), room.roomTitle, prev.id).run();
         message._filePersisted = true;
         return;
       }
     }
 
+    const hasSourceStatus = await columnExists(env, "files", "source_status");
     await env.DB.prepare(`
       INSERT INTO files (
         telegram_file_id, telegram_file_unique_id,
@@ -7172,8 +7190,8 @@ async function saveIncomingFileIfAny(message, env) {
         uploader_id, uploader_name,
         sender_id, sender_name,
         file_name, file_type, mime_type, file_size,
-        source_type, extracted_text, summary, tags_json, saved_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)
+        source_type, extracted_text, summary, tags_json, saved_by${hasSourceStatus ? ", source_status" : ""}
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?${hasSourceStatus ? ", ?" : ""})
     `).bind(
       fileId,
       uniqueId,
@@ -7190,7 +7208,8 @@ async function saveIncomingFileIfAny(message, env) {
       room.sourceType,
       meta.kind === "photo" ? "" : "분석 중...",
       JSON.stringify([meta.kind, ...(room.tags || [])]),
-      BOT_KEY
+      BOT_KEY,
+      ...(hasSourceStatus ? ["active"] : [])
     ).run();
 
     message._filePersisted = true;
