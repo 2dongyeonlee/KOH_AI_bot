@@ -186,6 +186,33 @@ function hashText(value) {
   return crypto.createHash("sha1").update(String(value || "")).digest("hex").slice(0, 16);
 }
 
+const CANONICAL_EXPORT_NAME_BY_ID = new Map([
+  ["user5748267778", "권오혁"],
+  ["user1225481333", "성봉구"],
+  ["user7922137485", "위예슬"],
+  ["user762285613", "이기두"],
+  ["user628592383", "김민아"],
+  ["user8765431174", "황성욱"],
+  ["user5983360765", "구정모"],
+]);
+
+const CANONICAL_EXPORT_NAME_BY_ALIAS = new Map([
+  ["오혁 권", "권오혁"],
+  ["Bonggu Sung", "성봉구"],
+  ["예슬 위", "위예슬"],
+  ["Kidu Lee", "이기두"],
+  ["민아 김", "김민아"],
+  ["성욱 황", "황성욱"],
+  ["석윤 홍", "홍석윤"],
+  ["선영 김", "김선영"],
+]);
+
+function canonicalExportName(id, name) {
+  return CANONICAL_EXPORT_NAME_BY_ID.get(String(id || "").trim()) ||
+    CANONICAL_EXPORT_NAME_BY_ALIAS.get(String(name || "").trim()) ||
+    String(name || id || "");
+}
+
 function userFromMessage(message) {
   const id = message.from_id || message.actor_id || "";
   const name = message.from || message.actor || "";
@@ -193,7 +220,8 @@ function userFromMessage(message) {
   const fallback = String(name || "").toLowerCase().replace(/\s+/g, "_").replace(/[^\w가-힣]/g, "");
   return {
     id: String(id || `export:${fallback || hashText(name)}`),
-    name: String(name || id),
+    name: canonicalExportName(id, name),
+    rawName: String(name || id),
   };
 }
 
@@ -309,7 +337,7 @@ function processRoom(dbName, room, messageCols, fileCols, dryRun) {
           sender_id: user?.id || "",
           sender_name: user?.name || "",
           from_id: String(message.from_id || message.actor_id || user?.id || ""),
-          from_name: String(message.from || message.actor || user?.name || ""),
+          from_name: String(message.from || message.actor || user?.rawName || user?.name || ""),
           content: content.slice(0, 4000),
           saved_by: "telegram_export_importer",
           source_type: "telegram_export",
@@ -358,7 +386,7 @@ function processRoom(dbName, room, messageCols, fileCols, dryRun) {
         sender_id: user?.id || "",
         sender_name: user?.name || "",
         from_id: String(message.from_id || message.actor_id || user?.id || ""),
-        from_name: String(message.from || message.actor || user?.name || ""),
+        from_name: String(message.from || message.actor || user?.rawName || user?.name || ""),
         file_name: file.fileName,
         file_type: file.fileType,
         mime_type: file.mimeType,

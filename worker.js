@@ -86,7 +86,46 @@ function getKstWeekRange() {
 const ALLOWED_NAMES = new Set([
   "권오혁", "염성진", "황무연", "함동균",
   "손경배", "한혜승", "박호현", "양서진", "원정호",
+  "성봉구", "위예슬", "이기두", "김민아", "황성욱", "홍석윤", "구정모", "김선영",
+  "Bonggu Sung", "예슬 위", "Kidu Lee", "민아 김", "성욱 황", "석윤 홍", "선영 김", "오혁 권",
 ]);
+
+const TEAM_CANONICAL_NAME_ALIASES = new Map([
+  ["Bonggu Sung", "성봉구"],
+  ["오혁 권", "권오혁"],
+  ["예슬 위", "위예슬"],
+  ["Kidu Lee", "이기두"],
+  ["민아 김", "김민아"],
+  ["김민아", "김민아"],
+  ["성욱 황", "황성욱"],
+  ["석윤 홍", "홍석윤"],
+  ["선영 김", "김선영"],
+  ["구정모", "구정모"],
+]);
+
+const TEAM_CANONICAL_NAME_BY_ID = new Map([
+  ["user1225481333", "성봉구"],
+  ["user5748267778", "권오혁"],
+  ["5748267778", "권오혁"],
+  ["1225481333", "성봉구"],
+  ["user7922137485", "위예슬"],
+  ["7922137485", "위예슬"],
+  ["user762285613", "이기두"],
+  ["762285613", "이기두"],
+  ["user628592383", "김민아"],
+  ["628592383", "김민아"],
+  ["user8765431174", "황성욱"],
+  ["8765431174", "황성욱"],
+  ["user5983360765", "구정모"],
+  ["5983360765", "구정모"],
+]);
+
+function canonicalizeTeamMemberName(name, id = "") {
+  const idHit = TEAM_CANONICAL_NAME_BY_ID.get(String(id || "").trim());
+  if (idHit) return idHit;
+  const raw = String(name || "").trim();
+  return TEAM_CANONICAL_NAME_ALIASES.get(raw) || raw;
+}
 
 const PRIVATE_GREETING =
   "";
@@ -4696,6 +4735,54 @@ async function handleDebugToday(env, chatId) {
     const latestFile = await env.DB.prepare(
       `SELECT file_name, file_type, telegram_file_id, created_at FROM files ORDER BY created_at DESC LIMIT 1`
     ).first();
+    const msgCols = await tableColumns(env, "messages");
+    const fileCols = await tableColumns(env, "files");
+    const exportLines = [];
+    if (msgCols.has("source_type") && msgCols.has("source_status") && msgCols.has("original_room")) {
+      const exportMsgCount = (await env.DB.prepare(
+        `SELECT COUNT(*) AS c
+         FROM messages
+         WHERE source_type = 'telegram_export'
+           AND source_status = 'active'
+           AND (room_title LIKE '%6R%' OR original_room LIKE '%6R%')`
+      ).first())?.c || 0;
+      const latestExportMsg = await env.DB.prepare(
+        `SELECT sender_name, sender_id, SUBSTR(content,1,60) AS content, created_at
+         FROM messages
+         WHERE source_type = 'telegram_export'
+           AND source_status = 'active'
+           AND (room_title LIKE '%6R%' OR original_room LIKE '%6R%')
+         ORDER BY created_at DESC
+         LIMIT 1`
+      ).first();
+      exportLines.push(`- export messages active(6R): ${exportMsgCount}`);
+      if (latestExportMsg) {
+        exportLines.push(`- latest export message: ${canonicalizeTeamMemberName(latestExportMsg.sender_name, latestExportMsg.sender_id)} / ${latestExportMsg.content || ""} / ${String(latestExportMsg.created_at || "").slice(0, 16)}`);
+      }
+    }
+    if (fileCols.has("source_type") && fileCols.has("source_status") && fileCols.has("original_room")) {
+      const exportFileCount = (await env.DB.prepare(
+        `SELECT COUNT(*) AS c
+         FROM files
+         WHERE source_type = 'telegram_export'
+           AND source_status = 'active'
+           AND (room_title LIKE '%6R%' OR original_room LIKE '%6R%')`
+      ).first())?.c || 0;
+      const latestExportFile = await env.DB.prepare(
+        `SELECT file_name, file_type, uploader_name, uploader_id, created_at
+         FROM files
+         WHERE source_type = 'telegram_export'
+           AND source_status = 'active'
+           AND (room_title LIKE '%6R%' OR original_room LIKE '%6R%')
+         ORDER BY created_at DESC
+         LIMIT 1`
+      ).first();
+      exportLines.push(`- export files active(6R): ${exportFileCount}`);
+      if (latestExportFile) {
+        exportLines.push(`- latest export file: ${latestExportFile.file_name || ""} / ${canonicalizeTeamMemberName(latestExportFile.uploader_name, latestExportFile.uploader_id)} / ${String(latestExportFile.created_at || "").slice(0, 16)}`);
+      }
+    }
+    const exportDebug = exportLines.length ? `\n\n[6R export active]\n${exportLines.join("\n")}` : "";
     await sendMessage(env, chatId,
       `오늘 적재 현황 (${kstDate} KST)\n` +
       `UTC 기준: ${startIso} ~ ${endIso}\n\n` +
@@ -4706,6 +4793,7 @@ async function handleDebugToday(env, chatId) {
       `- latest message: ${latestMsg ? `${latestMsg.sender_name} / ${latestMsg.content} / ${String(latestMsg.created_at || "").slice(0, 16)}` : "없음"}\n` +
       `- latest file: ${latestFile ? `${latestFile.file_name} (${latestFile.file_type}) file_id=${latestFile.telegram_file_id ? "있음" : "없음"} / ${String(latestFile.created_at || "").slice(0, 16)}` : "없음"}`
     );
+    if (exportDebug) await sendMessage(env, chatId, exportDebug);
   } catch (e) {
     await sendMessage(env, chatId, `debug_today 오류: ${String(e?.message || e).slice(0, 200)}`);
   }
