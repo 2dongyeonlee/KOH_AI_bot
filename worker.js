@@ -262,7 +262,8 @@ async function getUserNameColumnInfo(env) {
 }
 
 async function getCanonicalNameByTelegramId(env, telegramId, fallback = "") {
-  if (!env.DB || !telegramId) return fallback || "";
+  const mappedFallback = canonicalizeTeamMemberName(fallback, telegramId);
+  if (!env.DB || !telegramId) return mappedFallback || "";
   try {
     const { hasCanonical } = await getUserNameColumnInfo(env);
     const selectName = hasCanonical
@@ -273,11 +274,11 @@ async function getCanonicalNameByTelegramId(env, telegramId, fallback = "") {
       FROM users
       WHERE telegram_id = ?
       LIMIT 1
-    `).bind(fallback || "", String(telegramId)).first();
-    return String(row?.name || fallback || "").trim();
+    `).bind(mappedFallback || "", String(telegramId)).first();
+    return canonicalizeTeamMemberName(row?.name || mappedFallback || "", telegramId);
   } catch (e) {
     console.error("getCanonicalNameByTelegramId:", e);
-    return fallback || "";
+    return mappedFallback || "";
   }
 }
 
@@ -331,7 +332,7 @@ async function handleCanonicalNameChoice(env, message, text) {
 async function getCanonicalUserName(env, telegramUser) {
   if (!telegramUser?.id) return getSenderName(telegramUser);
   const telegramId = String(telegramUser.id);
-  const displayName = getSenderName(telegramUser);
+  const displayName = canonicalizeTeamMemberName(getSenderName(telegramUser), telegramId);
   if (!env.DB) return displayName;
   try {
     const { hasCanonical } = await getUserNameColumnInfo(env);
@@ -345,7 +346,7 @@ async function getCanonicalUserName(env, telegramUser) {
       .first();
     const canonicalName = String(row?.canonical_name || "").trim();
     const storedName = String(row?.name || "").trim();
-    const canonical = canonicalName || (isBetterUserName(displayName, storedName) ? displayName : (storedName || displayName || (telegramUser.username ? `@${telegramUser.username}` : telegramId)));
+    const canonical = canonicalizeTeamMemberName(canonicalName || (isBetterUserName(displayName, storedName) ? displayName : (storedName || displayName || (telegramUser.username ? `@${telegramUser.username}` : telegramId))), telegramId);
     if (canonical && (canonical !== storedName || (hasCanonical && canonical !== canonicalName))) {
       await env.DB.prepare(`
         UPDATE users
@@ -509,8 +510,8 @@ async function resolveUserName(env, userId, fallbackName = "") {
     const row = await env.DB.prepare(
       `SELECT ${nameExpr} AS name FROM users WHERE CAST(telegram_id AS TEXT) = ? LIMIT 1`
     ).bind(String(userId)).first();
-    return String(row?.name || fallback).trim() || fallback;
-  } catch (_) { return fallback; }
+    return canonicalizeTeamMemberName(row?.name || fallback, userId) || fallback;
+  } catch (_) { return canonicalizeTeamMemberName(fallback, userId) || fallback; }
 }
 
 // 안건 카테고리 자동 분류
@@ -2208,10 +2209,19 @@ function kohRoomAliasMatches(rowOrTitle, aliasTitle = "") {
   if (!aliasTitle) return false;
   const row = typeof rowOrTitle === "object" && rowOrTitle ? rowOrTitle : { room_title: rowOrTitle };
   const target = kohNormalizeRoomAlias(aliasTitle);
-  const values = [row.room_title, row._resolvedRoom, row.source_room, row.room_id].filter(Boolean);
+  const values = [row.room_title, row.original_room, row._resolvedRoom, row.source_room, row.joined_room_title, row.room_id].filter(Boolean);
   return values.some(v => {
     const n = kohNormalizeRoomAlias(v);
     return n && (n.includes(target) || target.includes(n) || (target.includes("6r전략") && n.includes("6r전략")));
+  });
+}
+
+function is6RStrategyRoom(rowOrTitle = "") {
+  const row = typeof rowOrTitle === "object" && rowOrTitle ? rowOrTitle : { room_title: rowOrTitle };
+  const values = [row.room_title, row.original_room, row._resolvedRoom, row.source_room, row.joined_room_title].filter(Boolean);
+  return values.some((value) => {
+    const n = kohNormalizeRoomAlias(value);
+    return n.includes("6r전략w권") || n.includes("6r전략권") || n.includes("ai컴기획팀과권");
   });
 }
 
