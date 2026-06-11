@@ -8885,18 +8885,20 @@ async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) 
   let msgCount = 0;
   let fileCount = 0;
   try {
-    const { files, messages } = await kohFetchRecentFilesAndMessages(env, "", false, 30);
-    msgCount = messages.length;
-    fileCount = files.length;
+    const { files, messages } = await kohFetchRecentFilesAndMessages(env, "", false, 30, "6R전략_w/권_2026");
+    const teamMessages = (messages || []).filter((m) => is6RStrategyRoom(m) && !isInfoRoomTitle(m.room_title));
+    const teamFiles = (files || []).filter((f) => is6RStrategyRoom(f) && !isInfoRoomTitle(f.room_title));
+    msgCount = teamMessages.length;
+    fileCount = teamFiles.length;
     let corpus = "";
-    if (messages.length > 0) {
-      corpus += "[대화]\n" + messages.slice(0, 100)
-        .map((m) => `[${m.room_title}] ${m.sender_name} (${(m.created_at||"").slice(0,16)}): ${(m.content||"").slice(0,100)}`)
+    if (teamMessages.length > 0) {
+      corpus += "[대화]\n" + teamMessages.slice(0, 120)
+        .map((m) => `[${m.room_title}] ${canonicalizeTeamMemberName(m.sender_name, m.sender_id)} (${(m.created_at||"").slice(0,16)}): ${(m.content||"").slice(0,100)}`)
         .join("\n") + "\n\n";
     }
-    if (files.length > 0) {
-      corpus += "[파일]\n" + files.slice(0, 50)
-        .map((f) => `[${f.room_title}] ${f.uploader_name} - ${f.file_name}: ${(f.summary||f.content||"").slice(0,150)}`)
+    if (teamFiles.length > 0) {
+      corpus += "[파일]\n" + teamFiles.slice(0, 60)
+        .map((f) => `[${f.room_title}] ${canonicalizeTeamMemberName(f.uploader_name || f.sender_name, f.uploader_id || f.sender_id)} - ${f.file_name}: ${(f.summary||f.content||"").slice(0,150)}`)
         .join("\n");
     }
     if (corpus.trim()) digestText = corpus.slice(0, 8000);
