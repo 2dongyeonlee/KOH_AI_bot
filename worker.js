@@ -3501,6 +3501,113 @@ async function dbInsert(env, { roomId, roomTitle, senderId, senderName, content,
 }
 
 // 멤버십 기록
+async function ensureInfoItemsTable(env) {
+  if (!env.DB) return false;
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS info_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_message_id TEXT,
+      message_key TEXT,
+      room_id TEXT,
+      room_title TEXT,
+      category TEXT,
+      person_tag TEXT,
+      reporter TEXT,
+      title TEXT,
+      summary TEXT,
+      implication TEXT,
+      source_text TEXT,
+      sender_id TEXT,
+      sender_name TEXT,
+      message_time TEXT,
+      raw_text TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+  return true;
+}
+
+function parseInfoItem(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+  const firstLine = raw.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "";
+  const tags = firstLine.match(/#[^\s#]+/g) || [];
+  const category = tags[0] || "";
+  const allowed = new Set(["#정책", "#국회", "#BH", "#글로벌"]);
+  if (!allowed.has(category)) return null;
+
+  const field = (label) => {
+    const labels = "보고자|안건|주요\\s*내용|시사점|원출처";
+    const re = new RegExp(`(?:^|\\n)\\s*(?:[*-]\\s*)?${label}\\s*[:：]\\s*([\\s\\S]*?)(?=\\n\\s*(?:[*-]\\s*)?(?:${labels})\\s*[:：]|$)`, "i");
+    const match = raw.match(re);
+    return match ? match[1].trim() : "";
+  };
+
+  const item = {
+    category,
+    person_tag: tags[1] || "",
+    reporter: field("보고자").replace(/^#/, "").trim(),
+    title: field("안건"),
+    summary: field("주요\\s*내용"),
+    implication: field("시사점"),
+    source_text: field("원출처"),
+    raw_text: raw,
+  };
+  return (item.title || item.summary) ? item : null;
+}
+
+async function saveInfoItem(env, item) {
+  if (!env.DB || !item) return false;
+  await ensureInfoItemsTable(env);
+  if (item.message_key) {
+    const prev = await env.DB.prepare(`SELECT id FROM info_items WHERE message_key = ? LIMIT 1`).bind(item.message_key).first();
+    if (prev?.id) return false;
+  }
+  await env.DB.prepare(`
+    INSERT INTO info_items (
+      source_message_id, message_key, room_id, room_title,
+      category, person_tag, reporter, title, summary, implication, source_text,
+      sender_id, sender_name, message_time, raw_text
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    item.source_message_id || "",
+    item.message_key || "",
+    item.room_id || "",
+    item.room_title || "",
+    item.category || "",
+    item.person_tag || "",
+    item.reporter || "",
+    item.title || "",
+    item.summary || "",
+    item.implication || "",
+    item.source_text || "",
+    item.sender_id || "",
+    item.sender_name || "",
+    item.message_time || "",
+    item.raw_text || ""
+  ).run();
+  return true;
+}
+
+async function maybeSaveInfoItem(env, message, text, messageKey) {
+  try {
+    if (!env.DB || !message || message.from?.is_bot) return false;
+    const item = parseInfoItem(text);
+    if (!item) return false;
+    item.source_message_id = String(message.message_id || "");
+    item.message_key = String(messageKey || `${message.chat?.id || ""}:${message.message_id || ""}`);
+    item.room_id = String(message.chat?.id || "");
+    item.room_title = getRoomTitleForMessage(message);
+    item.sender_id = String(message.from?.id || "");
+    item.sender_name = getSenderName(message.from);
+    item.message_time = message.date ? new Date(message.date * 1000).toISOString() : "";
+    return await saveInfoItem(env, item);
+  } catch (e) {
+    console.error("maybeSaveInfoItem:", e);
+    return false;
+  }
+}
+
 async function dbUpsertMember(env, roomId, userId, botName) {
   if (!env.DB) return;
   try {
@@ -7406,6 +7513,7 @@ async function handleUpdate(update, env, isRelay = false) {
 
   await handleNewChatMembers(env, message);
   await persistIncomingMessage(env, message);
+  await maybeSaveInfoItem(env, message, text, `${chatId}:${message.message_id || ""}`);
   await saveIncomingFileIfAny(message, env);
   if (!message._persisted) {
     await upsertUser(env, message.from, chatType === "private" ? chatId : message.from.id, chatType === "private" ? "private_dm" : "group_message");
