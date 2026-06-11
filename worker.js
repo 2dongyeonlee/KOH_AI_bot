@@ -9265,7 +9265,7 @@ async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) 
     .map(r => {
       const { taskName, milestone } = parseWorkReportFields(r.content);
       const name = taskName || r.content.split("\n")[0].replace(/#\S+/g, "").trim().slice(0, 30);
-      return `· ${name}${milestone ? " → " + milestone : ""}`;
+      return `· ${name}${milestone ? " → " + milestone : ""} (${r.sender_name || "미확인"})`;
     });
 
   // [보고] #보고 태그 - D-7 이내 마감
@@ -9281,7 +9281,7 @@ async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) 
     .slice(0, 5)
     .map(r => {
       const d = r.daysLeft === 0 ? "오늘" : r.daysLeft < 0 ? `D+${Math.abs(r.daysLeft)}` : `D-${r.daysLeft}`;
-      return `· [${d}] ${r.taskName || "업무명 확인"}${r.milestone ? " (" + r.milestone + ")" : ""}`;
+      return `· [${d}] ${r.taskName || "업무명 확인"}${r.milestone ? " (" + r.milestone + ")" : ""} (${r.sender || "미확인"})`;
     });
 
   // [공유] #공유 태그 - 최근 2일
@@ -9293,7 +9293,7 @@ async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) 
     .map(r => {
       const { taskName, progress } = parseWorkReportFields(r.content);
       const name = taskName || r.content.split("\n")[0].replace(/#\S+/g, "").trim().slice(0, 30);
-      return `· ${name}${progress ? " — " + progress.slice(0, 40) : ""}`;
+      return `· ${name}${progress ? " — " + progress.slice(0, 40) : ""} (${r.sender_name || "미확인"})`;
     });
 
   // [Fup] #Fup 태그 - 최근 2일
@@ -9303,7 +9303,7 @@ async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) 
     .map(r => {
       const { taskName, progress } = parseWorkReportFields(r.content);
       const name = taskName || r.content.split("\n")[0].replace(/#\S+/g, "").trim().slice(0, 30);
-      return `· ${name}${progress ? " — " + progress.slice(0, 40) : ""}`;
+      return `· ${name}${progress ? " — " + progress.slice(0, 40) : ""} (${r.sender_name || "미확인"})`;
     });
 
   // [정보방] 어제 내용 - 태그별
