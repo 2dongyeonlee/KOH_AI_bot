@@ -6,7 +6,7 @@ keep_vars = true
 # Secrets (set via `wrangler secret put`, never commit values here):
 #   TELEGRAM_BOT_TOKEN, DIFY_API_KEY, TAVILY_API_KEY,
 #   ADMIN_TELEGRAM_ID, ADMIN_CHAT_ID, DAILY_BRIEFING_CHAT_ID,
-#   DYLEE_CHAT_ID, GEMINI_API_KEY
+#   DYLEE_CHAT_ID, GEMINI_API_KEY, WORK_REPORT_CHAT_ID
 
 [vars]
 DIFY_API_URL = "https://api.dify.ai/v1"

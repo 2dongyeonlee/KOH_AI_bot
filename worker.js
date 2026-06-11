@@ -233,7 +233,7 @@ function shouldRespondInGroup(message, text, env) {
   if (textMentionsOtherKnownBot(text, env)) return false;
   if (textMentionsThisBot(text, env)) return true;
   if (isReplyToThisBot(message, env)) return true;
-  return /봇아|비서야|요약해줘|정리해줘|알려줘|찾아줘|전달해줘|전해줘|보고내용|확인해야\s*할\s*안건|확인해야할\s*안건/.test(text || "");
+  return false;
 }
 
 function cleanBotMention(text, env) {
@@ -2269,6 +2269,152 @@ function kohIsExcludedRoomTitle(title = "") {
   return KOH_EXCLUDED_ROOM_TITLES.some(t => n === kohNormalizeRoomAlias(t));
 }
 
+// ===== 업무보고방 입력 검증 =====
+const WORK_REPORT_STATUS_TAGS = ["#보고", "#Fup", "#공유", "#일정"];
+const WORK_REPORT_FIELD_TAGS = ["#6R리뷰", "#6RMonthly", "#우군화", "#AI", "#KPI", "#기획"];
+const WORK_REPORT_MILESTONE_REQUIRED_TAGS = ["#보고", "#일정"];
+
+const WORK_REPORT_TAG_GUIDE_MESSAGE =
+  "양식을 확인해 주세요. 첫 줄에 상태태그 1개와 분야태그 1개 이상이 필요합니다.\n\n" +
+  "상태태그(1개) : #보고 #Fup #공유 #일정\n" +
+  "분야태그(1개 이상) : #6R리뷰 #6RMonthly #우군화 #AI #KPI #기획\n\n" +
+  "본문 양식\n" +
+  "- 업무명 :\n" +
+  "- 진행내용 :\n" +
+  "- 마일스톤 : (#보고·#일정은 필수, YYYY-MM-DD)";
+
+const WORK_REPORT_MILESTONE_GUIDE_MESSAGE =
+  "#보고 또는 #일정 보고에는 마일스톤이 필요합니다. 날짜를 YYYY-MM-DD 형식으로 추가해 주세요.\n" +
+  "예시) 마일스톤 : 담당님 재보고 (2026-06-12)";
+
+function isWorkReportRoom(env, chatId) {
+  const target = String(env.WORK_REPORT_CHAT_ID || "").trim();
+  return !!target && String(chatId) === target;
+}
+
+function kohIsWorkReportValidationExempt(text = "") {
+  const t = String(text || "").trim();
+  if (!t) return true;
+  if (/^\/\w+/.test(t)) return true;
+  if (/@KOH_AI_bot/i.test(t)) return true;
+  return false;
+}
+
+// 첫 줄의 상태태그/분야태그, 마일스톤(#보고·#일정 필수)을 검증
+function validateWorkReportFirstLine(text = "") {
+  const firstLine = String(text || "").split(/\r?\n/)[0] || "";
+  const tokens = firstLine.split(/\s+/).filter(Boolean);
+  const statusTags = tokens.filter(t => WORK_REPORT_STATUS_TAGS.includes(t));
+  const fieldTags = tokens.filter(t => WORK_REPORT_FIELD_TAGS.includes(t));
+
+  if (statusTags.length !== 1 || fieldTags.length === 0) {
+    return { ok: false, reason: "tags" };
+  }
+
+  const statusTag = statusTags[0];
+  const milestoneLine = String(text || "")
+    .split(/\r?\n/)
+    .find(line => /마일스톤\s*[:：]/.test(line)) || "";
+  const milestoneMatch = milestoneLine.match(/(\d{4}-\d{2}-\d{2})/);
+  const milestoneDate = milestoneMatch ? milestoneMatch[1] : "";
+
+  if (WORK_REPORT_MILESTONE_REQUIRED_TAGS.includes(statusTag) && !milestoneDate) {
+    return { ok: false, reason: "milestone", statusTag, fieldTags };
+  }
+
+  return { ok: true, statusTag, fieldTags, milestoneDate };
+}
+
+function extractWorkReportField(text, label) {
+  const re = new RegExp(`^\\s*[-*•]?\\s*${label}\\s*[:：]\\s*(.*)$`, "m");
+  const m = String(text || "").match(re);
+  return m ? m[1].trim() : "";
+}
+
+async function ensureWorkReportsTable(env) {
+  if (!env.DB) return;
+  try {
+    await env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS work_reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        room_id TEXT NOT NULL,
+        status_tag TEXT DEFAULT '',
+        field_tags TEXT DEFAULT '',
+        task_name TEXT DEFAULT '',
+        progress TEXT DEFAULT '',
+        milestone_date TEXT DEFAULT '',
+        owner TEXT DEFAULT '',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `).run();
+  } catch (e) {
+    console.error("ensureWorkReportsTable:", e);
+  }
+}
+
+async function saveWorkReport(env, report) {
+  if (!env.DB) return false;
+  try {
+    await ensureWorkReportsTable(env);
+    await env.DB.prepare(`
+      INSERT INTO work_reports (room_id, status_tag, field_tags, task_name, progress, milestone_date, owner)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      String(report.roomId),
+      report.statusTag || "",
+      report.fieldTags || "",
+      report.taskName || "",
+      report.progress || "",
+      report.milestoneDate || "",
+      report.owner || ""
+    ).run();
+    return true;
+  } catch (e) {
+    console.error("saveWorkReport:", e);
+    return false;
+  }
+}
+
+async function kohSendReply(env, chatId, text, replyToMessageId) {
+  const token = env.TELEGRAM_BOT_TOKEN;
+  if (!token) return;
+  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      reply_to_message_id: replyToMessageId,
+      allow_sending_without_reply: true,
+    })
+  });
+}
+
+// 양식 검증. 실패 시 되묻고 true(처리 종료) 반환, 통과 시 work_reports 저장 후 false 반환
+async function handleWorkReportValidation(env, message, text) {
+  const validation = validateWorkReportFirstLine(text);
+  if (!validation.ok) {
+    const guide = validation.reason === "milestone"
+      ? WORK_REPORT_MILESTONE_GUIDE_MESSAGE
+      : WORK_REPORT_TAG_GUIDE_MESSAGE;
+    await kohSendReply(env, message.chat.id, guide, message.message_id);
+    message._persisted = true;
+    return true;
+  }
+
+  const owner = await getCanonicalUserName(env, message.from);
+  await saveWorkReport(env, {
+    roomId: message.chat.id,
+    statusTag: validation.statusTag,
+    fieldTags: validation.fieldTags.join(" "),
+    taskName: extractWorkReportField(text, "업무명"),
+    progress: extractWorkReportField(text, "진행내용"),
+    milestoneDate: validation.milestoneDate,
+    owner,
+  });
+  return false;
+}
+
 function kohIsRequestLikeForBriefing(content = "") {
   const t = String(content || "").trim();
   if (!t) return true;
@@ -2676,10 +2822,10 @@ function kohDetectIntent(text = "") {
   if (/(뉴스.*확인|기사.*찾아|최신.*동향|외신.*확인|bloomberg|reuters|nikkei.*뉴스|언론.*보도.*어때|sk하이닉스.*뉴스|hbm.*기사)/.test(n) &&
       !/(방|대화|공유|자료|파일|보고된|내가)/.test(n)) return KOH_INTENT.NEWS_SEARCH;
 
-  // NEWS_LIST: 공유된 뉴스/기사 링크를 제목+URL 목록으로 정리 (본문 요약 요청은 제외)
-  if (/(뉴스|기사|뉴스\s*링크)/.test(n) &&
-      /(요약해|정리해|목록|리스트|보여줘|정리해줘|요약해줘)/.test(n) &&
-      !/(본문|기사\s*내용|내용\s*요약|핵심\s*내용|이\s*기사|위\s*기사|기사.*요약해줘.*본문)/.test(n)) return KOH_INTENT.NEWS_LIST;
+  // NEWS_LIST: 뉴스/기사 "링크 목록"을 명시적으로 요청할 때만 (요약/정리는 본문 요약 경로로 넘김)
+  if (/(뉴스|기사)/.test(n) &&
+      /(목록|리스트|링크\s*(목록|정리|모아|보여)|url\s*(목록|정리))/.test(n) &&
+      !/(본문|내용\s*요약|핵심\s*내용|요약해|정리해)/.test(n)) return KOH_INTENT.NEWS_LIST;
 
   // STRATEGIC_6R_JUDGMENT: 6R analysis
   if (/(어느\s*[rR]에서|[gGpPiIcCbBeE][rR]\s*(이야|야|인가|관련|해당|맞아|담당)|6r.*분류|6r.*판단|이해관계자.*정리|커뮤니케이션.*전략|어디서.*대응|입장.*정리해줘)/.test(n)) return KOH_INTENT.STRATEGIC_6R_JUDGMENT;
@@ -3399,7 +3545,7 @@ async function kohHandleInternalKnowledgeRequest(env, chatId, text, currentRoomI
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     // 이동연봇에서 전달받는 relay 처리
@@ -3424,7 +3570,7 @@ export default {
     const isRelay = request.headers.get("X-Bot-Relay") === "true";
     try {
       const update = await request.json();
-      await handleUpdate(update, env, isRelay);
+      ctx.waitUntil(handleUpdate(update, env, isRelay));
     } catch (e) {
       console.error("handleUpdate error:", e);
     }
@@ -7608,6 +7754,16 @@ async function handleUpdate(update, env, isRelay = false) {
   const chatType = message.chat.type;
   const text = message.text || message.caption || "";
   const hasFile = !!(message.document || message.photo);
+
+  if (
+    !message.from?.is_bot &&
+    chatType !== "private" &&
+    !hasFile &&
+    isWorkReportRoom(env, chatId) &&
+    !kohIsWorkReportValidationExempt(text)
+  ) {
+    if (await handleWorkReportValidation(env, message, text)) return;
+  }
 
   await handleNewChatMembers(env, message);
   await persistIncomingMessage(env, message);
