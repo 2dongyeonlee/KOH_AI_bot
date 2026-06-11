@@ -52,6 +52,18 @@ const BOT_KEY = "koh";
 const BOT_USERNAME = "KOH_AI_bot";
 const BUILD_VERSION = "koh-cpu-limit-fix-lightweight-20260609";
 
+// 방 타입
+const INFO_ROOM_KEYWORD = "💡정보방";
+
+// 정보방 태그
+const INFO_ROOM_TAGS = ["#국회", "#정책", "#정국", "#글로벌"];
+
+// 팀방 상태태그
+const STATUS_TAGS = ["#보고", "#Fup", "#공유", "#일정"];
+
+// 팀방 분야태그
+const FIELD_TAGS = ["#6R리뷰", "#6RMonthly", "#AI", "#KPI", "#기획"];
+
 function readBoolEnv(env, key, defaultValue = false) {
   const val = String(env[key] || "").trim().toLowerCase();
   if (val === "true" || val === "1" || val === "yes") return true;
@@ -2267,6 +2279,45 @@ function is6RStrategyRoom(rowOrTitle = "") {
 function kohIsExcludedRoomTitle(title = "") {
   const n = kohNormalizeRoomAlias(title);
   return KOH_EXCLUDED_ROOM_TITLES.some(t => n === kohNormalizeRoomAlias(t));
+}
+
+// 방 타입 감지
+function isInfoRoom(roomTitle) {
+  return String(roomTitle || "").includes(INFO_ROOM_KEYWORD);
+}
+
+// 메시지에서 태그 파싱 (첫 줄 기준)
+function parseMessageTags(text) {
+  const firstLine = String(text || "").split("\n")[0];
+  const statusTag = STATUS_TAGS.find(t => firstLine.includes(t)) || null;
+  const fieldTags = FIELD_TAGS.filter(t => firstLine.includes(t));
+  const infoTags = INFO_ROOM_TAGS.filter(t => firstLine.includes(t));
+  return { statusTag, fieldTags, infoTags };
+}
+
+// 업무명, 진행내용, 마일스톤 추출
+function parseWorkReportFields(text) {
+  const extract = (label) => {
+    const m = String(text || "").match(
+      new RegExp(`^\\s*-\\s*${label}\\s*[:：]\\s*(.*)$`, "m")
+    );
+    return m ? m[1].trim() : "";
+  };
+  return {
+    taskName:   extract("업무명"),
+    progress:   extract("진행내용"),
+    milestone:  extract("마일스톤"),
+  };
+}
+
+// 마일스톤 날짜에서 D-N 계산
+function calcDaysLeft(milestoneText) {
+  const m = String(milestoneText || "").match(/(\d{4}-\d{2}-\d{2})/);
+  if (!m) return null;
+  const diff = Math.ceil(
+    (Date.parse(m[1]) - Date.now()) / 86400000
+  );
+  return diff;
 }
 
 // ===== 업무보고방 입력 검증 =====
@@ -9105,94 +9156,202 @@ async function sendDailyBriefingCurrent_DISABLED(env, { targetChatId = "", mock 
 }
 
 async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) {
-  const today = new Date().toLocaleDateString("ko-KR", {
-    timeZone: "Asia/Seoul",
-    year: "numeric", month: "long", day: "numeric", weekday: "long",
-  });
+  const { kstDate } = getKstDayRange();
 
-  let calText = "(캘린더 미연결)";
-  try {
-    const events = await getCalendarEvents(env, 1);
-    if (events && events.length > 0) {
-      calText = events.map((e) => {
-        const dt = e.start
-          ? new Date(e.start).toLocaleString("ko-KR", { timeZone: "Asia/Seoul", hour: "2-digit", minute: "2-digit" })
-          : "";
-        return `${dt} ${e.title}${e.location ? " (" + e.location + ")" : ""}`;
-      }).join("\n");
-    } else {
-      calText = "(오늘 등록된 일정 없음)";
+  // ── 데이터 수집 ──────────────────────────────────────────
+  // 팀방: 7일 내
+  const teamSince = new Date(Date.now() - 7 * 86400000)
+    .toISOString().slice(0, 19).replace("T", " ");
+
+  // 정보방: 어제
+  const { startIso: infoStart, endIso: infoEnd } = (() => {
+    const kstOffset = 9 * 60 * 60 * 1000;
+    const yesterday = new Date(Date.now() + kstOffset - 86400000);
+    const d = yesterday.toISOString().slice(0, 10);
+    const startMs = Date.parse(d + "T00:00:00Z") - kstOffset;
+    const endMs   = Date.parse(d + "T23:59:59Z") - kstOffset;
+    return {
+      startIso: new Date(startMs).toISOString().replace("T", " ").slice(0, 19),
+      endIso:   new Date(endMs).toISOString().replace("T", " ").slice(0, 19),
+    };
+  })();
+
+  let teamRows = [], infoRows = [];
+  if (env.DB) {
+    try {
+      // 팀방 메시지 (상태태그 포함된 것만)
+      const teamRes = await env.DB.prepare(`
+        SELECT content, sender_name, room_title, created_at
+        FROM messages
+        WHERE created_at >= ?
+          AND content NOT LIKE '/%'
+          AND content NOT LIKE '%@KOH_AI_bot%'
+          AND (
+            content LIKE '%#보고%' OR content LIKE '%#Fup%'
+            OR content LIKE '%#공유%' OR content LIKE '%#일정%'
+          )
+        ORDER BY created_at DESC
+        LIMIT 100
+      `).bind(teamSince).all();
+      teamRows = teamRes.results || [];
+    } catch (e) { console.error("briefing teamRows:", e); }
+
+    try {
+      // 정보방 메시지 (어제 날짜)
+      const infoRes = await env.DB.prepare(`
+        SELECT content, sender_name, room_title, created_at
+        FROM messages
+        WHERE created_at >= ? AND created_at <= ?
+          AND (room_title LIKE '%💡정보방%')
+        ORDER BY created_at DESC
+        LIMIT 100
+      `).bind(infoStart, infoEnd).all();
+      infoRows = infoRes.results || [];
+    } catch (e) { console.error("briefing infoRows:", e); }
+  }
+
+  // ── 섹션 생성 ──────────────────────────────────────────
+
+  // [일정] #일정 태그 - 이번주 일정
+  const scheduleItems = teamRows
+    .filter(r => r.content.includes("#일정"))
+    .slice(0, 5)
+    .map(r => {
+      const { taskName, milestone } = parseWorkReportFields(r.content);
+      const name = taskName || r.content.split("\n")[0].replace(/#\S+/g, "").trim().slice(0, 30);
+      return `· ${name}${milestone ? " → " + milestone : ""}`;
+    });
+
+  // [보고] #보고 태그 - D-7 이내 마감
+  const reportItems = teamRows
+    .filter(r => r.content.includes("#보고"))
+    .map(r => {
+      const { taskName, milestone, progress } = parseWorkReportFields(r.content);
+      const daysLeft = calcDaysLeft(milestone);
+      return { taskName, milestone, progress, daysLeft, sender: r.sender_name };
+    })
+    .filter(r => r.daysLeft !== null && r.daysLeft <= 7)
+    .sort((a, b) => (a.daysLeft ?? 99) - (b.daysLeft ?? 99))
+    .slice(0, 5)
+    .map(r => {
+      const d = r.daysLeft === 0 ? "오늘" : r.daysLeft < 0 ? `D+${Math.abs(r.daysLeft)}` : `D-${r.daysLeft}`;
+      return `· [${d}] ${r.taskName || "업무명 확인"}${r.milestone ? " (" + r.milestone + ")" : ""}`;
+    });
+
+  // [공유] #공유 태그 - 최근 2일
+  const shareSince = new Date(Date.now() - 2 * 86400000)
+    .toISOString().slice(0, 19).replace("T", " ");
+  const shareItems = teamRows
+    .filter(r => r.content.includes("#공유") && r.created_at >= shareSince)
+    .slice(0, 5)
+    .map(r => {
+      const { taskName, progress } = parseWorkReportFields(r.content);
+      const name = taskName || r.content.split("\n")[0].replace(/#\S+/g, "").trim().slice(0, 30);
+      return `· ${name}${progress ? " — " + progress.slice(0, 40) : ""}`;
+    });
+
+  // [Fup] #Fup 태그 - 최근 2일
+  const fupItems = teamRows
+    .filter(r => r.content.includes("#Fup") && r.created_at >= shareSince)
+    .slice(0, 5)
+    .map(r => {
+      const { taskName, progress } = parseWorkReportFields(r.content);
+      const name = taskName || r.content.split("\n")[0].replace(/#\S+/g, "").trim().slice(0, 30);
+      return `· ${name}${progress ? " — " + progress.slice(0, 40) : ""}`;
+    });
+
+  // [정보방] 어제 내용 - 태그별
+  const infoByTag = {};
+  for (const tag of INFO_ROOM_TAGS) {
+    const items = infoRows
+      .filter(r => r.content.includes(tag))
+      .slice(0, 3)
+      .map(r => `· ${r.content.split("\n")[0].replace(/#\S+/g, "").trim().slice(0, 50)}`);
+    if (items.length) infoByTag[tag] = items;
+  }
+
+  // ── 브리핑 조립 ──────────────────────────────────────────
+  const lines = [`📅 ${kstDate} 아침 브리핑\n`];
+
+  // 정보방
+  if (Object.keys(infoByTag).length) {
+    lines.push("💡 정보방 (어제 요약)");
+    for (const [tag, items] of Object.entries(infoByTag)) {
+      lines.push(`${tag}`);
+      lines.push(...items);
     }
-  } catch (e) { calText = "(캘린더 연동 확인 필요)"; }
+    lines.push("");
+  }
 
-  let digestText = "(최근 자료 없음)";
-  let msgCount = 0;
-  let fileCount = 0;
-  try {
-    const { files, messages } = await kohFetchRecentFilesAndMessages(env, "", false, 30, "6R전략_w/권_2026");
-    const teamMessages = (messages || []).filter((m) => is6RStrategyRoom(m) && !isInfoRoomTitle(m.room_title));
-    const teamFiles = (files || []).filter((f) => is6RStrategyRoom(f) && !isInfoRoomTitle(f.room_title));
-    msgCount = teamMessages.length;
-    fileCount = teamFiles.length;
-    let corpus = "";
-    if (teamMessages.length > 0) {
-      corpus += "[대화]\n" + teamMessages.slice(0, 120)
-        .map((m) => `[${m.room_title}] ${canonicalizeTeamMemberName(m.sender_name, m.sender_id)} (${(m.created_at||"").slice(0,16)}): ${(m.content||"").slice(0,100)}`)
-        .join("\n") + "\n\n";
-    }
-    if (teamFiles.length > 0) {
-      corpus += "[파일]\n" + teamFiles.slice(0, 60)
-        .map((f) => `[${f.room_title}] ${canonicalizeTeamMemberName(f.uploader_name || f.sender_name, f.uploader_id || f.sender_id)} - ${f.file_name}: ${(f.summary||f.content||"").slice(0,150)}`)
-        .join("\n");
-    }
-    if (corpus.trim()) digestText = corpus.slice(0, 8000);
-  } catch (e) { console.error("브리핑 자료 오류:", e.message); }
+  // 일정
+  if (scheduleItems.length) {
+    lines.push("📆 이번주 일정");
+    lines.push(...scheduleItems);
+    lines.push("");
+  }
 
-  const sectionLabel = "최근 30일 공유 자료·대화";
-  const totalItems = msgCount + fileCount;
+  // 보고 임박
+  if (reportItems.length) {
+    lines.push("📣 보고 임박");
+    lines.push(...reportItems);
+    lines.push("");
+  }
 
-  const query =
-    TONE_RULE + SUMMARY_RULE +
-    `당신은 권오혁 담당의 개인 비서입니다. ${today} 아침 업무 브리핑을 작성하세요.\n\n` +
-    `[데이터]\n` +
-    `오늘 회의(캘린더):\n${calText}\n\n` +
-    `${sectionLabel} (전체 방 통합, ${totalItems}건):\n${digestText}\n\n` +
-    `[작성 형식]\n` +
-    `📅 오늘 회의\n` +
-    `(일정 있으면: 시간 · 제목. 없으면 섹션 생략)\n\n` +
-    `📋 ${sectionLabel}\n` +
-    `(SUMMARY_RULE 형식으로 안건별 정리. 모든 방 포함 필수)\n\n` +
-    `⚡ 마감·기한\n` +
-    `(날짜·기한 언급된 것만. 없으면 생략)\n\n` +
-    `전체 1400자 이내.`;
+  // 공유
+  if (shareItems.length) {
+    lines.push("🔄 최근 공유");
+    lines.push(...shareItems);
+    lines.push("");
+  }
 
-  let briefing = "브리핑 생성 오류";
-  try {
-    const result = await difyChat(env, { query, user: "briefing", conversationId: "" });
-    briefing = result.answer || briefing;
-  } catch (e) { console.error("브리핑 Dify 오류:", e.message); }
+  // Fup
+  if (fupItems.length) {
+    lines.push("⏩ Fup 현황");
+    lines.push(...fupItems);
+    lines.push("");
+  }
 
-  const HTML = { parseMode: "HTML" };
+  if (lines.length <= 1) {
+    lines.push("최근 7일 내 업무 기록이 없습니다.");
+  }
 
+  const briefing = lines.join("\n").trim();
+
+  // ── 발송 ──────────────────────────────────────────────
   if (targetChatId) {
-    await sendMessage(env, targetChatId, briefing, HTML);
+    await sendMessage(env, targetChatId, briefing);
     return;
   }
 
   // 권오혁 개인 DM
   if (env.ADMIN_TELEGRAM_ID) {
-    await sendMessage(env, env.ADMIN_TELEGRAM_ID, briefing, HTML);
+    await sendMessage(env, env.ADMIN_TELEGRAM_ID, briefing);
   }
 
-  // 브리핑 발송 단체방 (허용된 방만)
-  const allowedRoomIds = [
-    "-5287392652", // AI 컴기획팀과 권
-    "-5156923133", // 테스트방임
-  ];
+  // 이동연 DM
+  if (env.DYLEE_CHAT_ID) {
+    await sendMessage(env, env.DYLEE_CHAT_ID, briefing);
+  }
+
+  // 봇이 들어가 있는 단체방 (rooms 테이블에서 자동 조회)
+  let allowedRoomIds = [];
+  if (env.DB) {
+    try {
+      const roomsRes = await env.DB.prepare(`
+        SELECT room_id, room_title FROM rooms
+        WHERE room_type IN ('group', 'supergroup')
+      `).all();
+      allowedRoomIds = (roomsRes.results || [])
+        .filter(r => !kohIsExcludedRoomTitle(r.room_title || ""))
+        .map(r => r.room_id);
+    } catch (e) { console.error("briefing rooms 조회:", e); }
+  }
   for (const roomId of allowedRoomIds) {
     try {
-      await sendMessage(env, roomId, `[아침 브리핑]\n\n${briefing}`, HTML);
-    } catch (e) { console.error(`브리핑 발송 실패 ${roomId}:`, e.message); }
+      await sendMessage(env, roomId, `[아침 브리핑]\n\n${briefing}`);
+    } catch (e) {
+      console.error(`브리핑 발송 실패 ${roomId}:`, e.message);
+    }
   }
 }
 
