@@ -4638,6 +4638,7 @@ function getHelpText() {
     "/users - 등록 사용자 목록 확인",
     "/search_status - 외부검색 설정 확인",
     "/web_test 검색어 - Tavily 검색 테스트",
+    "/debug_briefing_tags - 브리핑 태그별 메시지 현황/중복 확인",
   ].join("\n");
 }
 
@@ -4681,6 +4682,51 @@ async function routeSlashCommand(env, message, text, chatId) {
       );
     } catch (e) {
       await sendMessage(env, chatId, `DB 조회 오류: ${e.message}`);
+    }
+    return true;
+  }
+  if (/^\/debug_briefing_tags\b/.test(t)) {
+    try {
+      const teamSince = new Date(Date.now() - 7 * 86400000)
+        .toISOString().slice(0, 19).replace("T", " ");
+      const tagCounts = {};
+      for (const tag of ["#보고", "#Fup", "#공유", "#일정"]) {
+        const row = await env.DB.prepare(`
+          SELECT COUNT(*) as cnt FROM messages
+          WHERE created_at >= ? AND content LIKE ?
+        `).bind(teamSince, `%${tag}%`).first();
+        tagCounts[tag] = row?.cnt || 0;
+      }
+      const infoRow = await env.DB.prepare(`
+        SELECT COUNT(*) as cnt FROM messages
+        WHERE room_title LIKE '%💡정보방%'
+      `).first();
+      const dupRes = await env.DB.prepare(`
+        SELECT content, room_title, COUNT(*) as cnt, MAX(created_at) as last_at
+        FROM messages
+        WHERE created_at >= ? AND content LIKE '%#보고%'
+        GROUP BY content, room_title
+        HAVING cnt > 1
+        ORDER BY last_at DESC
+        LIMIT 5
+      `).bind(teamSince).all();
+      const dupRows = dupRes.results || [];
+      let out = `[브리핑 태그 현황 - 최근 7일]\n`;
+      for (const tag of ["#보고", "#Fup", "#공유", "#일정"]) {
+        out += `${tag}: ${tagCounts[tag]}건\n`;
+      }
+      out += `💡정보방 메시지(전체): ${infoRow?.cnt || 0}건\n\n`;
+      if (dupRows.length) {
+        out += `[#보고 중복 메시지]\n`;
+        for (const r of dupRows) {
+          out += `· (${r.cnt}회) [${r.room_title}] ${String(r.content).split("\n")[0].slice(0, 40)}\n`;
+        }
+      } else {
+        out += `중복 메시지 없음`;
+      }
+      await sendMessage(env, chatId, out);
+    } catch (e) {
+      await sendMessage(env, chatId, `조회 오류: ${e.message}`);
     }
     return true;
   }
