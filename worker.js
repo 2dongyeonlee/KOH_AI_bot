@@ -7881,8 +7881,10 @@ async function handleUpdate(update, env, isRelay = false) {
       sourceType: getSourceTypeForMessage(message),
     });
   }
-  if (!message._persisted && chatType !== "private") {
+  if (chatType !== "private") {
     await upsertRoom(env, message.chat);
+  }
+  if (!message._persisted && chatType !== "private") {
     await upsertRoomMember(env, message.chat, message.from, "message");
     await maybeUpdateUserDisplayNameFromBareName(env, message);
   }
