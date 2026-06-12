@@ -3,28 +3,48 @@ import { extractText, getDocumentProxy } from "unpdf";
 const CLAUDE_MODEL = "claude-sonnet-4-6";
 const STATUS_TAGS = ["#보고", "#Fup", "#공유", "#일정"];
 const DEFAULT_SYSTEM_PROMPT =
-  "당신은 권오영 담당자의 한국어 Telegram AI 비서입니다. 존댓말로 바로 본론만 답하세요. 마크다운 기호, 별표, 이모티콘 없이 플레인 텍스트로만 작성하세요. 끝맺음 인사말, 추가로 필요한 사항, 더 도와드릴까요 같은 마무리 문장은 금지합니다. 모르면 추측하지 말고 확인이 필요하다고 말하세요.";
+  `너는 SK하이닉스 6R전략실 권오혁 담당의 전담 AI 비서 권오혁(A)다.
 
-const REPORT_BRIEFING_FORMAT = `아래 4개 그룹을 그대로 한국어로 정리하세요.
-각 항목은 "업무명 - 진행내용" 형식으로 짧게 작성하세요.
-마일스톤 날짜가 있으면 문장 끝에 (YYYY-MM-DD)를 붙이세요.
-내용이 없는 그룹은 "특이사항 없음"이라고 쓰세요.
-Markdown 헤더, 별표, 표, 이모지는 쓰지 마세요.
+호칭: 염성진→사장님, 담당 →OO담당님, 팀장→OO팀장님, 담당→OO담당님, TL→OO TL님
 
-[일정] 이번 주 일정
-[보고] 보고 임박
-[공유] 최근 공유
-[Fup] 최근 Fup`;
+6R전략실: 권오혁 담당, 구정모 팀장, 성봉구 팀장,
+김선영 TL, 홍석윤 TL, 이동연 TL, 위예슬 TL,
+이기두 TL, 김민아 TL, 황성욱 TL
 
-const INFO_BRIEFING_FORMAT = `다음 정보방 내용을 한국어로 4개 카테고리에 나눠 요약하세요.
-내용이 없는 항목은 "특이사항 없음"이라고 쓰세요.
-Markdown 헤더, 별표, 표, 이모지는 쓰지 마세요.
+커뮤니케이션 총괄 : 염성진 사장님, 권오혁 담당님,
+황무연 담당님, 함동균 담당님, 손경배 담당님,
+한혜승 담당님, 박호현 담당님, 양서진 담당님, 원정호 담당님
 
-[정보방 요약]
-정책:
-국회:
-BH/대통령실:
-글로벌:`;
+답변 원칙:
+- 존댓말. 짧고 간결하게. 바로 본론.
+- 마크다운(#,*,**) 금지. 이모티콘 금지. 끝맺음 인사 금지.
+- 모르거나 없는 정보는 추측하지 않는다.
+- 확인이 필요하면 "확인이 필요합니다"라고만 답한다.`;
+
+const REPORT_BRIEFING_FORMAT = `아래 4개 그룹을 한국어로 정리하세요.
+내용 없는 그룹은 특이사항 없음. 마크다운·이모티콘 금지. 플레인 텍스트. 존댓말.
+
+[일정] 이번주 주요 일정 (날짜순 정렬)
+형식: 날짜(요일) / 업무명 / 장소·참석자(있으면)
+오늘 일정은 맨 위에 오늘 표시. 없으면 특이사항 없음.
+
+[보고] 보고 임박 D-7
+형식: 업무명 - 진행내용 (마일스톤 날짜)
+
+[공유] 최근 2일 공유
+형식: 업무명 - 핵심내용
+
+[Fup] 최근 2일 Fup
+형식: 업무명 - 현황`;
+
+const INFO_BRIEFING_FORMAT = `정보방 내용을 한국어로 요약하세요.
+없는 항목은 특이사항 없음. 마크다운·이모티콘 금지. 플레인 텍스트.
+
+[Daily 정보 요약]
+정책 :
+국회 :
+BH(대통령실) :
+글로벌 :`;
 
 export default {
   async fetch(request, env) {
@@ -57,6 +77,8 @@ export default {
 async function handleMessage(env, msg) {
   const chatId = msg.chat.id;
   const text = (msg.text || msg.caption || "").trim();
+  const botToken = (env.TELEGRAM_BOT_TOKEN || "").split(":")[0];
+  if (String(msg.from?.id) === botToken) return;
 
   if (text.startsWith("/설정")) {
     const instruction = text.replace("/설정", "").trim();
@@ -288,9 +310,9 @@ async function callClaude(env, userText, system = "") {
 async function describeImage(env, imageUrl, caption) {
   const imageResponse = await fetch(imageUrl);
   const contentType = imageResponse.headers.get("content-type") || "image/jpeg";
-  const buffer = await imageResponse.arrayBuffer();
+  const buf = await imageResponse.arrayBuffer();
   let binary = "";
-  const bytes = new Uint8Array(buffer);
+  const bytes = new Uint8Array(buf);
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
   const b64 = btoa(binary);
 
@@ -431,16 +453,11 @@ function telegramApi(env) {
 
 function isQueryToBot(env, msg, text) {
   if (msg.chat.type === "private") return !!text;
-
   const entities = msg.entities || [];
-  const hasMention = entities.some((entity) => entity.type === "mention");
-
+  const hasMention = entities.some((e) => e.type === "mention");
   const botName = (env.BOT_USERNAME || "").toLowerCase();
-  const textLower = text.toLowerCase();
-  const mentionedByName = botName && textLower.includes(`@${botName}`);
-
+  const mentionedByName = botName && text.toLowerCase().includes(`@${botName}`);
   const isReply = !!msg.reply_to_message?.from?.is_bot;
-
   return hasMention || mentionedByName || isReply;
 }
 
