@@ -79,7 +79,7 @@ async function handleMessage(env, msg) {
   const chatId = msg.chat.id;
   const text = (msg.text || msg.caption || "").trim();
   const botToken = (env.TELEGRAM_BOT_TOKEN || "").split(":")[0];
-  if (String(msg.from?.id) === botToken) return;
+  if (msg.from && String(msg.from.id) === botToken) return;
 
   if (text.startsWith("/설정")) {
     const instruction = text.replace("/설정", "").trim();
@@ -472,24 +472,35 @@ async function saveMessage(env, msg, content) {
 async function insertMessage(env, options) {
   const { msg, content, statusTag = "", fieldTag = "", milestoneDate = "", fileId = "", fileName = "" } = options;
 
-  await env.DB.prepare(
-    `INSERT INTO messages (
-      telegram_message_id, room_id, room_title, sender_id, sender_name, content,
-      status_tag, field_tag, milestone_date, file_id, file_name
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(
-    String(msg.message_id || ""),
-    String(msg.chat.id),
-    msg.chat.title || "DM",
-    String(msg.from?.id || ""),
-    senderName(msg.from),
-    content || "",
-    statusTag,
-    fieldTag,
-    milestoneDate,
-    fileId,
-    fileName
-  ).run();
+  try {
+    await env.DB.prepare(
+      `INSERT INTO messages (
+        telegram_message_id, room_id, room_title, sender_id, sender_name, content,
+        status_tag, field_tag, milestone_date, file_id, file_name
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      String(msg.message_id || ""),
+      String(msg.chat?.id || "0"),
+      msg.chat?.title || "DM",
+      String(msg.from?.id || "0"),
+      senderName(msg.from),
+      content || "(내용 없음)",
+      statusTag,
+      fieldTag,
+      milestoneDate,
+      fileId,
+      fileName
+    ).run();
+  } catch (e) {
+    console.error(
+      "insertMessage error:",
+      e.message,
+      "room:",
+      msg.chat?.id,
+      "sender:",
+      msg.from?.id
+    );
+  }
 }
 
 async function searchMemory(env, query) {
