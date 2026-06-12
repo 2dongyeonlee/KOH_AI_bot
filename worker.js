@@ -8383,7 +8383,15 @@ async function handleUserMessage(userId, chatId, text, sendReply, env, userName 
 }
 
 async function handleGroupMessage(message, userId, chatId, text, hasFile, user, env) {
-  const shouldRespond = shouldRespondInGroup(message, text, env);
+  let shouldRespond = shouldRespondInGroup(message, text, env);
+
+  // 봇이 최근 응답한 방이면 연속 대화 유지 (10분)
+  if (!shouldRespond && env.CONVERSATIONS) {
+    try {
+      const active = await env.CONVERSATIONS.get(`group_active_${chatId}`);
+      if (active) shouldRespond = true;
+    } catch (_) {}
+  }
 
   if (hasFile) {
     if (!shouldRespond) return;
@@ -8449,6 +8457,13 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
   }
 
   if (!shouldRespond) return;
+
+  // 이 방 활성 대화 상태 갱신 (10분 TTL)
+  if (env.CONVERSATIONS) {
+    try {
+      await env.CONVERSATIONS.put(`group_active_${chatId}`, "1", { expirationTtl: 600 });
+    } catch (_) {}
+  }
 
   const cleanText = cleanBotMention(text, env);
 
