@@ -238,11 +238,20 @@ async function ingestAndSummarize(env, msg, chatId, caption) {
     extracted = await extractDocumentText(env, url, fileName);
   }
 
+  const parsed = {
+    summary: (extracted.match(/핵심 요약:\s*([\s\S]*)/)?.[1] || extracted.slice(0, 200)).trim(),
+    action_items: (extracted.match(/의사결정사항:\s*([\s\S]*?)(?:\n핵심 요약:|$)/)?.[1] || "").trim(),
+    needs_escalation: /사장님|임원|리스크|보고 필요/.test(extracted) ? 1 : 0,
+  };
+
   await insertMessage(env, {
     msg,
     content: extracted,
-    fileId,
-    fileName,
+    fileId: fileId,
+    fileName: fileName,
+    summary: parsed.summary || "",
+    action_items: parsed.action_items || "",
+    needs_escalation: parsed.needs_escalation || 0,
   });
 
   return sendMessage(env, chatId, extracted);
@@ -583,13 +592,14 @@ async function extractDocumentText(env, fileUrl, fileName) {
           },
           {
             type: "text",
-            text: `이 문서의 내용을 한국어로 상세히 분석해줘.
-다음 순서로 정리:
-1. 문서 목적 (1줄)
-2. 핵심 내용 (항목별)
-3. 주요 수치·일정 (있으면)
-4. 확인이 필요한 사항 (있으면)
-마크다운(#,*,**) 금지. 플레인 텍스트.`,
+            text: `이 문서를 SK하이닉스 6R전략실 권오혁 담당님 관점에서 분석해줘.
+아래 양식으로만 답해. 없는 항목은 없음.
+마크다운(#,*,**) 금지. 플레인 텍스트.
+
+일정: (문서에 나온 날짜·마감 중 캘린더에 넣을 것)
+의사결정사항: (담당님이 판단해야 할 사항.
+               사장님 보고 필요 여부도 포함해서 판단)
+핵심 요약: (문서 전체 맥락 2~3줄)`,
           },
         ],
       }],
