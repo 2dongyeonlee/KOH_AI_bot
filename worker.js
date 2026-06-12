@@ -20,7 +20,17 @@ const DEFAULT_SYSTEM_PROMPT =
 - 이모티콘은 적절히 사용 가능.
 - 끝맺음 인사 금지. 무엇을 도와드릴까요 금지.
 - 추측하지 않는다. 없는 정보는 만들지 않는다.
-- 확인이 필요하면 확인이 필요합니다 라고만 답한다.`;
+- 확인이 필요하면 확인 필요 라고만 답한다.
+
+답변 형식:
+- 문장 끝 "~입니다" 금지. 단답·단어·명사형으로 끝낼 것.
+  예) "확인 필요" "3건" "6월 15일" "완료"
+- 블릿포인트(•) 적극 사용. 텔레그램 모바일 가독성 기준.
+- 긴급·임박 항목은 앞에 🚨 표시.
+  기준: 오늘 또는 D-1 이내
+- D-7 이내 마일스톤은 앞에 ⚠️ 표시.
+- 표(|---|) 사용 금지. 블릿으로 대체.
+- HTML 태그 사용: <b>강조</b>`;
 
 const REPORT_BRIEFING_FORMAT = `아래 4개 그룹을 한국어로 정리하세요.
 담당자명 반드시 포함. 내용 없는 그룹은 특이사항 없음.
@@ -235,9 +245,11 @@ async function handleQuery(env, chatId, query) {
 
   const internalContext = hits.length
     ? hits.map((hit) =>
-        `[${hit.sender_name || ""}] ${hit.summary || hit.content.slice(0, 200)}` +
-        (hit.action_items ? `\n액션: ${hit.action_items}` : "") +
-        (hit.milestone_date ? `\n마감: ${hit.milestone_date}` : "")
+        `[저장 자료]
+- 작성자: ${hit.sender_name || ""}
+- 내용: ${hit.summary || hit.content.slice(0, 100)}
+- 마감: ${hit.milestone_date || "없음"}
+- 액션: ${hit.action_items || "없음"}`
       ).join("\n\n").slice(0, 5000)
     : "";
 
@@ -370,6 +382,10 @@ async function runReportBriefing(env) {
   const output = await callClaude(
     env,
     `${REPORT_BRIEFING_FORMAT}
+
+긴급(오늘·D-1)은 🚨, D-7 이내는 ⚠️ 표시.
+표 금지. 블릿포인트(•)만 사용.
+담당자명 반드시 포함. 명사형으로 끝낼 것.
 
 === [일정] ===
 ${joinRows(schedules)}
