@@ -9,8 +9,6 @@ keep_vars = true
 
 [vars]
 BRIEFING_CHAT_ID = ""
-INFO_ROOM_IDS = ""
-REPORT_ROOM_IDS = ""
 BOT_USERNAME = "KOH_AI_bot"
 
 [triggers]

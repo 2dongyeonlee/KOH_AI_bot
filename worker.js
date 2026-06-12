@@ -72,15 +72,11 @@ async function handleMessage(env, msg) {
     return handleQuery(env, chatId, cleanMention(text));
   }
 
-  if (isReportRoom(env, chatId) && text) {
+  if (text && parseReportTags(text).status) {
     return handleReport(env, msg, chatId, text);
   }
 
-  if (text) await saveMessage(env, msg, text, "text");
-}
-
-function isReportRoom(env, chatId) {
-  return csv(env.REPORT_ROOM_IDS).includes(String(chatId));
+  if (text) await saveMessage(env, msg, text);
 }
 
 function parseReportTags(text) {
@@ -226,17 +222,13 @@ ${joinRows(fups)}`
 async function runInfoBriefing(env) {
   if (!env.BRIEFING_CHAT_ID) return;
 
-  const ids = csv(env.INFO_ROOM_IDS);
-  if (!ids.length) return;
-
-  const placeholders = ids.map(() => "?").join(",");
   const rows = (
     await env.DB.prepare(
       `SELECT content
        FROM messages
-       WHERE room_id IN (${placeholders}) AND created_at > datetime('now', '-1 days')
+       WHERE status_tag = '' AND created_at > datetime('now', '-1 days')
        ORDER BY created_at`
-    ).bind(...ids).all()
+    ).all()
   ).results || [];
 
   if (!rows.length) return;
