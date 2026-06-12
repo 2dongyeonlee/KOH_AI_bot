@@ -109,7 +109,6 @@ async function handleReport(env, msg, chatId, text) {
   await insertMessage(env, {
     msg,
     content: text,
-    type: "report",
     statusTag: status,
     fieldTag: field,
     milestoneDate: extractMilestoneDate(text),
@@ -138,7 +137,6 @@ async function ingestAndSummarize(env, msg, chatId, caption) {
   await insertMessage(env, {
     msg,
     content: extracted,
-    type,
     fileId,
     fileName,
   });
@@ -180,16 +178,19 @@ async function runMorningBriefing(env) {
 async function runReportBriefing(env) {
   if (!env.BRIEFING_CHAT_ID) return;
 
-  const now = Date.now();
-  const today = kstDate(now);
-  const weekLater = kstDate(now + 7 * 86400000);
-  const recentCutoff = new Date(now - 2 * 86400000).toISOString();
-
   const rows = (
     await env.DB.prepare(
-      `SELECT content, status_tag, milestone_date, created_at
+      `SELECT content, status_tag, milestone_date, created_at,
+        CASE
+          WHEN milestone_date >= date('now') AND milestone_date <= date('now', '+7 days') THEN 1
+          ELSE 0
+        END AS is_due_soon,
+        CASE
+          WHEN created_at > datetime('now', '-2 days') THEN 1
+          ELSE 0
+        END AS is_recent
        FROM messages
-       WHERE type = 'report'
+       WHERE status_tag != ''
        ORDER BY created_at DESC
        LIMIT 200`
     ).all()
@@ -197,10 +198,10 @@ async function runReportBriefing(env) {
 
   const schedules = rows.filter((row) => row.status_tag === "#일정");
   const reports = rows.filter(
-    (row) => row.status_tag === "#보고" && row.milestone_date >= today && row.milestone_date <= weekLater
+    (row) => row.status_tag === "#보고" && row.is_due_soon
   );
-  const shares = rows.filter((row) => row.status_tag === "#공유" && String(row.created_at || "") >= recentCutoff);
-  const fups = rows.filter((row) => row.status_tag === "#Fup" && String(row.created_at || "") >= recentCutoff);
+  const shares = rows.filter((row) => row.status_tag === "#공유" && row.is_recent);
+  const fups = rows.filter((row) => row.status_tag === "#Fup" && row.is_recent);
 
   const output = await callClaude(
     env,
@@ -228,15 +229,14 @@ async function runInfoBriefing(env) {
   const ids = csv(env.INFO_ROOM_IDS);
   if (!ids.length) return;
 
-  const since = new Date(Date.now() - 86400000).toISOString();
   const placeholders = ids.map(() => "?").join(",");
   const rows = (
     await env.DB.prepare(
       `SELECT content
        FROM messages
-       WHERE room_id IN (${placeholders}) AND created_at >= ?
+       WHERE room_id IN (${placeholders}) AND created_at > datetime('now', '-1 days')
        ORDER BY created_at`
-    ).bind(...ids, since).all()
+    ).bind(...ids).all()
   ).results || [];
 
   if (!rows.length) return;
@@ -335,19 +335,18 @@ async function extractDocumentText(fileUrl, fileName) {
   return (text || "").trim() || "[PDF에서 텍스트를 추출하지 못했습니다. 스캔본일 수 있습니다.]";
 }
 
-async function saveMessage(env, msg, content, type) {
-  await insertMessage(env, { msg, content, type });
+async function saveMessage(env, msg, content) {
+  await insertMessage(env, { msg, content });
 }
 
 async function insertMessage(env, options) {
-  const { msg, content, type, statusTag = "", fieldTag = "", milestoneDate = "", fileId = "", fileName = "" } = options;
-  const createdAt = new Date((msg.date || Math.floor(Date.now() / 1000)) * 1000).toISOString();
+  const { msg, content, statusTag = "", fieldTag = "", milestoneDate = "", fileId = "", fileName = "" } = options;
 
   await env.DB.prepare(
     `INSERT INTO messages (
       telegram_message_id, room_id, room_title, sender_id, sender_name, content,
-      type, status_tag, field_tag, milestone_date, file_id, file_name, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      status_tag, field_tag, milestone_date, file_id, file_name
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     String(msg.message_id || ""),
     String(msg.chat.id),
@@ -355,13 +354,11 @@ async function insertMessage(env, options) {
     String(msg.from?.id || ""),
     senderName(msg.from),
     content || "",
-    type || "text",
     statusTag,
     fieldTag,
     milestoneDate,
     fileId,
-    fileName,
-    createdAt
+    fileName
   ).run();
 }
 
@@ -376,7 +373,7 @@ async function searchMemory(env, query) {
     `SELECT content, file_id, file_name
      FROM messages
      WHERE ${where}
-     ORDER BY created_at DESC
+     ORDER BY datetime(created_at) DESC
      LIMIT 8`
   ).bind(...binds).all();
 
