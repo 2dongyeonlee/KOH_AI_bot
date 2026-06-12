@@ -1223,6 +1223,13 @@ function isBriefingRequestCheck(query) {
   return /(브리핑|내일\s*오전|아침\s*보고|내일\s*보고|챙길\s*안건|확인할\s*안건|보고할\s*안건)/.test(q);
 }
 
+// 아침 브리핑에 어떤 내용이 나올지 미리 보여달라는 요청
+function isBriefingPreviewQuery(query) {
+  const q = String(query || "").trim();
+  if (!/브리핑/.test(q)) return false;
+  return /(뭐|뭔가|어떤|내용|미리|먼저|보여|확인|알려)/.test(q);
+}
+
 function isFileResendRequestCheck(query) {
   const q = String(query || "").trim();
   return /(보내줘|전달해줘|공유해줘|원본\s*보내|파일\s*보내|첨부해줘|^\d+번\s*(보내|전달|공유|원본))/.test(q);
@@ -8042,11 +8049,24 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
     return;
   }
 
+  // 아침 브리핑 미리보기 요청
+  if (isBriefingPreviewQuery(text)) {
+    try {
+      const preview = await buildDailyBriefingText(env);
+      await sendMessage(env, chatId, `[브리핑 미리보기]\n\n${preview}`);
+      return;
+    } catch (e) { console.error("briefing preview dm:", e); }
+  }
+
   // GENERAL_CHAT hard guard in DM handler
   if (isGeneralChatQuery(text)) {
     try {
+      const senderName = await getCanonicalUserName(env, message.from);
+      const ownerNote = senderName === BOT_OWNER_NAME
+        ? `상대방은 ${BOT_OWNER_NAME} 담당님입니다. '담당님'으로 불러도 됩니다.`
+        : `상대방은 '${senderName}'님입니다. ${BOT_OWNER_NAME} 담당님이 아니므로 '담당님'이라고 부르지 마세요.`;
       const result = await difyChat(env, {
-        query: `[응답 규칙: 존댓말. 자연스럽고 짧게. 보고서/목록 형식 절대 금지. 이모티콘 금지.]\n\n${text}`,
+        query: `[응답 규칙: 존댓말. 자연스럽고 짧게. 보고서/목록 형식 절대 금지. 이모티콘 금지. ${ownerNote}]\n\n${text}`,
         user: String(userId),
         conversationId: "",
       });
@@ -8494,11 +8514,24 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     return;
   }
 
+  // 아침 브리핑 미리보기 요청
+  if (isBriefingPreviewQuery(cleanText)) {
+    try {
+      const preview = await buildDailyBriefingText(env);
+      await sendMessage(env, chatId, `[브리핑 미리보기]\n\n${preview}`);
+      return;
+    } catch (e) { console.error("briefing preview group:", e); }
+  }
+
   // 일상 대화 → Dify 자연어 응답 (보고서 형식 없이)
   if (isGeneralChatQuery(cleanText)) {
     try {
+      const senderName = await getCanonicalUserName(env, message.from);
+      const ownerNote = senderName === BOT_OWNER_NAME
+        ? `상대방은 ${BOT_OWNER_NAME} 담당님입니다. '담당님'으로 불러도 됩니다.`
+        : `상대방은 '${senderName}'님입니다. ${BOT_OWNER_NAME} 담당님이 아니므로 '담당님'이라고 부르지 마세요.`;
       const result = await difyChat(env, {
-        query: `[응답 규칙: 존댓말. 자연스럽고 짧게. 보고서/목록 형식 절대 금지. 이모티콘 금지.]\n\n${cleanText}`,
+        query: `[응답 규칙: 존댓말. 자연스럽고 짧게. 보고서/목록 형식 절대 금지. 이모티콘 금지. ${ownerNote}]\n\n${cleanText}`,
         user: String(userId),
         conversationId: "",
       });
@@ -9273,7 +9306,7 @@ async function sendDailyBriefingCurrent_DISABLED(env, { targetChatId = "", mock 
   }
 }
 
-async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) {
+async function buildDailyBriefingText(env) {
   const { kstDate } = getKstDayRange();
 
   // ── 데이터 수집 ──────────────────────────────────────────
@@ -9433,7 +9466,11 @@ async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) 
     lines.push("최근 7일 내 업무 기록이 없습니다.");
   }
 
-  const briefing = lines.join("\n").trim();
+  return lines.join("\n").trim();
+}
+
+async function sendDailyBriefing(env, { targetChatId = "", mock = false } = {}) {
+  const briefing = await buildDailyBriefingText(env);
 
   // ── 발송 ──────────────────────────────────────────────
   if (targetChatId) {
