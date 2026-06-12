@@ -713,11 +713,20 @@ async function insertMessage(env, options) {
 }
 
 async function searchMemory(env, query) {
+  const dateStr = normalizeDateQuery(query);
   const terms = query.split(/\s+/).filter((term) => term.length >= 2).slice(0, 5);
-  if (!terms.length) return [];
+  if (!terms.length && !dateStr) return [];
 
-  const where = terms.map(() => "content LIKE ?").join(" OR ");
+  const whereParts = terms.map(() => "content LIKE ?");
   const binds = terms.map((term) => `%${term}%`);
+  if (dateStr) {
+    const [, month, day] = dateStr.match(/\d{4}-(\d{2})-(\d{2})/) || [];
+    whereParts.push("milestone_date = ?");
+    binds.push(dateStr);
+    whereParts.push("(content LIKE ? AND content LIKE ?)");
+    binds.push(`%${Number(month)}월%`, `%${Number(day)}일%`);
+  }
+  const where = whereParts.join(" OR ");
 
   const rows = await env.DB.prepare(
     `SELECT content, sender_name, summary, action_items, milestone_date, file_id, file_name
@@ -728,6 +737,48 @@ async function searchMemory(env, query) {
   ).bind(...binds).all();
 
   return rows.results || [];
+}
+
+function normalizeDateQuery(query) {
+  const now = new Date(Date.now() + 9 * 3600000);
+  const year = now.getFullYear();
+  const today = now.toISOString().slice(0, 10);
+
+  if (/(오늘|today)/.test(query)) return today;
+  if (/(내일|tomorrow)/.test(query)) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + 1);
+    return d.toISOString().slice(0, 10);
+  }
+  if (/(모레)/.test(query)) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + 2);
+    return d.toISOString().slice(0, 10);
+  }
+  if (/(어제)/.test(query)) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - 1);
+    return d.toISOString().slice(0, 10);
+  }
+  if (/(그저께|그제)/.test(query)) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - 2);
+    return d.toISOString().slice(0, 10);
+  }
+
+  const m1 = query.match(/(\d{1,2})\/(\d{1,2})/);
+  if (m1) return `${year}-${String(m1[1]).padStart(2, "0")}-${String(m1[2]).padStart(2, "0")}`;
+
+  const m2 = query.match(/(\d{1,2})월\s*(\d{1,2})일/);
+  if (m2) return `${year}-${String(m2[1]).padStart(2, "0")}-${String(m2[2]).padStart(2, "0")}`;
+
+  const m3 = query.match(/(\d{1,2})월\s*(\d{1,2})/);
+  if (m3) return `${year}-${String(m3[1]).padStart(2, "0")}-${String(m3[2]).padStart(2, "0")}`;
+
+  const m4 = query.match(/(\d{4})[-.](\d{1,2})[-.](\d{1,2})/);
+  if (m4) return `${m4[1]}-${String(m4[2]).padStart(2, "0")}-${String(m4[3]).padStart(2, "0")}`;
+
+  return null;
 }
 
 async function searchWeb(env, query) {
