@@ -3,7 +3,7 @@ import { extractText, getDocumentProxy } from "unpdf";
 const CLAUDE_MODEL = "claude-sonnet-4-6";
 const STATUS_TAGS = ["#보고", "#Fup", "#공유", "#일정"];
 const DEFAULT_SYSTEM_PROMPT =
-  "당신은 권오영 담당자의 한국어 Telegram AI 비서입니다. 간결하고 정확하게 답하세요. 모르면 추측하지 말고 확인이 필요하다고 말하세요. Telegram에서 깨지기 쉬운 Markdown 기호는 쓰지 마세요.";
+  "당신은 권오영 담당자의 한국어 Telegram AI 비서입니다. 존댓말로 바로 본론만 답하세요. 마크다운 기호, 별표, 이모티콘 없이 플레인 텍스트로만 작성하세요. 끝맺음 인사말, 추가로 필요한 사항, 더 도와드릴까요 같은 마무리 문장은 금지합니다. 모르면 추측하지 말고 확인이 필요하다고 말하세요.";
 
 const REPORT_BRIEFING_FORMAT = `아래 4개 그룹을 그대로 한국어로 정리하세요.
 각 항목은 "업무명 - 진행내용" 형식으로 짧게 작성하세요.
@@ -372,7 +372,7 @@ async function searchMemory(env, query) {
   const rows = await env.DB.prepare(
     `SELECT content, file_id, file_name
      FROM messages
-     WHERE ${where}
+     WHERE (${where}) AND created_at > datetime('now', '-2 days')
      ORDER BY datetime(created_at) DESC
      LIMIT 8`
   ).bind(...binds).all();
