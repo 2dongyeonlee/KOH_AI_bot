@@ -148,8 +148,15 @@ async function handleQuery(env, chatId, query) {
   const hits = await searchMemory(env, query);
   const fileHit = hits.find((hit) => hit.file_id);
 
-  if (looksLikeFileRequest(query) && fileHit) {
-    await sendDocument(env, chatId, fileHit.file_id, `요청하신 자료입니다. ${fileHit.file_name || ""}`.trim());
+  if (looksLikeFileRequest(query)) {
+    if (!hits.length) {
+      return sendMessage(env, chatId, "저장된 자료에서 찾지 못했습니다.");
+    }
+    if (fileHit) {
+      await sendDocument(env, chatId, fileHit.file_id, `요청하신 자료입니다. ${fileHit.file_name || ""}`.trim());
+    } else {
+      return sendMessage(env, chatId, "관련 내용은 찾았지만 전송할 파일은 없습니다.");
+    }
   }
 
   const context = hits
@@ -282,6 +289,10 @@ async function describeImage(env, imageUrl, caption) {
   const imageResponse = await fetch(imageUrl);
   const contentType = imageResponse.headers.get("content-type") || "image/jpeg";
   const buffer = await imageResponse.arrayBuffer();
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  const b64 = btoa(binary);
 
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -302,7 +313,7 @@ async function describeImage(env, imageUrl, caption) {
               source: {
                 type: "base64",
                 media_type: contentType,
-                data: arrayBufferToBase64(buffer),
+                data: b64,
               },
             },
             {
