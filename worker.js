@@ -245,6 +245,7 @@ function shouldRespondInGroup(message, text, env) {
   if (textMentionsOtherKnownBot(text, env)) return false;
   if (textMentionsThisBot(text, env)) return true;
   if (isReplyToThisBot(message, env)) return true;
+  if (/권오혁/.test(String(text || ""))) return true;
   return false;
 }
 
