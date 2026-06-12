@@ -36,23 +36,32 @@ const DEFAULT_SYSTEM_PROMPT =
 - 표(|---|) 사용 금지. 블릿으로 대체.
 - HTML 태그 사용: <b>강조</b>`;
 
-const REPORT_BRIEFING_FORMAT = `아래 4개 그룹을 한국어로 정리하세요.
-담당자명 반드시 포함. 내용 없는 그룹은 특이사항 없음.
-마크다운(#,*,**) 금지. 플레인 텍스트. 존댓말.
+const REPORT_BRIEFING_FORMAT = `아래 데이터를 기반으로 브리핑 작성.
+마크다운(#,**) 금지. * 금지(텔레그램 깨짐). 플레인 텍스트. 명사형.
 
-[일정] 이번주 주요 일정 (날짜순)
-형식: 날짜(요일) / 담당자 / 업무명 / 장소·참석자(있으면)
-오늘 일정은 맨 위 오늘 표시
+양식:
 
-[보고] 보고 임박 D-7
-형식: 담당자 / 업무명 / 진행내용 / 마감일
-의사결정 필요 사항 있으면 별도 표시
+📅 YYYY-MM-DD 아침 브리핑
 
-[공유] 최근 2일 공유
-형식: 담당자 / 핵심내용 1줄
+🚨 보고 임박
+- D-N 업무명 (YYYY-MM-DD) / 담당자
+(D-2부터 D-day까지만. 날짜 가까운 순. 없으면 특이사항 없음)
 
-[Fup] 최근 2일 Fup
-형식: 담당자 / 현황 1줄`;
+📌 오늘 일정
+- 날짜(요일) / 업무명 / 담당자
+(없으면 특이사항 없음)
+
+💡 의사결정 필요
+- 업무명 / 판단 필요 사항 / 담당자
+(없으면 특이사항 없음)
+
+📢 공유
+- 담당자 / 핵심내용 1줄
+(최근 3일. 없으면 특이사항 없음)
+
+🔁 Fup
+- 담당자 / 현황 1줄
+(최근 3일. 없으면 특이사항 없음)`;
 
 const INFO_BRIEFING_FORMAT = `정보방 내용을 한국어로 요약하세요.
 없는 항목은 특이사항 없음. 마크다운·이모티콘 금지. 플레인 텍스트.
@@ -420,6 +429,7 @@ async function runMorningBriefing(env) {
 
 async function runReportBriefing(env) {
   if (!env.BRIEFING_CHAT_ID) return;
+  const today = kstDateStr();
 
   const rows = (
     await env.DB.prepare(
@@ -429,7 +439,7 @@ async function runReportBriefing(env) {
           ELSE 0
         END AS is_due_soon,
         CASE
-          WHEN created_at > datetime('now', '-2 days') THEN 1
+          WHEN created_at > datetime('now', '-3 days') THEN 1
           ELSE 0
         END AS is_recent
        FROM messages
@@ -448,7 +458,8 @@ async function runReportBriefing(env) {
 
   const output = await callClaude(
     env,
-    `${REPORT_BRIEFING_FORMAT}
+    `오늘 날짜: ${today}
+${REPORT_BRIEFING_FORMAT}
 
 긴급(오늘·D-1)은 🚨, D-7 이내는 ⚠️ 표시.
 표 금지. 블릿포인트(•)만 사용.
