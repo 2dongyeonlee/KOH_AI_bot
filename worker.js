@@ -8513,9 +8513,10 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     return;
   }
 
-  // internal knowledge: digest/file/priority 앞에서 먼저 처리
+  // internal knowledge: "이 방"이라고 명시하면 현재 방만, 아니면 전체 방 조회
   if (kohIsInternalKnowledgeRequest(cleanText)) {
-    const handled = await kohHandleInternalKnowledgeRequest(env, chatId, cleanText, String(chatId), userId);
+    const roomScope = kohIsCurrentRoomOnly(cleanText) ? String(chatId) : "";
+    const handled = await kohHandleInternalKnowledgeRequest(env, chatId, cleanText, roomScope, userId);
     if (handled) return;
   }
 
