@@ -731,9 +731,9 @@ async function searchMemory(env, query) {
   const rows = await env.DB.prepare(
     `SELECT content, sender_name, summary, action_items, milestone_date, file_id, file_name
      FROM messages
-     WHERE (${where}) AND created_at > datetime('now', '-2 days')
+     WHERE (${where})
      ORDER BY datetime(created_at) DESC
-     LIMIT 8`
+     LIMIT 15`
   ).bind(...binds).all();
 
   return rows.results || [];
