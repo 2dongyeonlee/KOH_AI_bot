@@ -1,5 +1,3 @@
-import { extractText, getDocumentProxy } from "unpdf";
-
 const CLAUDE_MODEL = "claude-sonnet-4-6";
 const STATUS_TAGS = ["#보고", "#Fup", "#공유", "#일정"];
 const DEFAULT_SYSTEM_PROMPT =
@@ -123,6 +121,7 @@ function extractMilestoneDate(text) {
 
 async function handleReport(env, msg, chatId, text) {
   const { status, field } = parseReportTags(text);
+  const milestoneDate = extractMilestoneDate(text);
   if (!status) {
     return sendMessage(
       env,
@@ -136,8 +135,10 @@ async function handleReport(env, msg, chatId, text) {
     content: text,
     statusTag: status,
     fieldTag: field,
-    milestoneDate: extractMilestoneDate(text),
+    milestoneDate,
   });
+
+  await sendMilestoneAlert(env, msg, text, milestoneDate);
 }
 
 async function ingestAndSummarize(env, msg, chatId, caption) {
@@ -156,7 +157,7 @@ async function ingestAndSummarize(env, msg, chatId, caption) {
     fileId = msg.document.file_id;
     fileName = msg.document.file_name || "file";
     const url = await getFileUrl(env, fileId);
-    extracted = await extractDocumentText(url, fileName);
+    extracted = await extractDocumentText(env, url, fileName);
   }
 
   await insertMessage(env, {
@@ -165,6 +166,10 @@ async function ingestAndSummarize(env, msg, chatId, caption) {
     fileId,
     fileName,
   });
+
+  if (type === "file") {
+    return sendMessage(env, chatId, extracted);
+  }
 
   const label = type === "image" ? "이미지" : "파일";
   const summary = await callClaude(env, `${label} 내용을 한국어로 간단히 요약하세요.\n\n${extracted}`);
@@ -376,18 +381,90 @@ async function describeImage(env, imageUrl, caption) {
   return textFromClaude(data) || "[이미지에서 내용을 추출하지 못했습니다]";
 }
 
-async function extractDocumentText(fileUrl, fileName) {
+async function extractDocumentText(env, fileUrl, fileName) {
   if (!/\.pdf$/i.test(fileName)) {
-    return `[지원하지 않는 형식: ${fileName}] 현재 PDF와 이미지만 처리합니다.`;
+    return `[지원하지 않는 형식: ${fileName} — PDF와 이미지만 처리합니다]`;
   }
 
-  const response = await fetch(fileUrl);
-  const buffer = await response.arrayBuffer();
-  const pdf = await getDocumentProxy(new Uint8Array(buffer));
-  const { text } = await extractText(pdf, { mergePages: true });
-  return (text || "").trim() || "[PDF에서 텍스트를 추출하지 못했습니다. 스캔본일 수 있습니다.]";
+  const res = await fetch(fileUrl);
+  const buf = await res.arrayBuffer();
+
+  if (buf.byteLength > 32 * 1024 * 1024) {
+    return "[PDF 파일이 너무 큽니다 — 32MB 이하만 처리 가능합니다]";
+  }
+
+  let binary = "";
+  const bytes = new Uint8Array(buf);
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  const b64 = btoa(binary);
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: CLAUDE_MODEL,
+      max_tokens: 2000,
+      messages: [{
+        role: "user",
+        content: [
+          {
+            type: "document",
+            source: {
+              type: "base64",
+              media_type: "application/pdf",
+              data: b64,
+            },
+          },
+          {
+            type: "text",
+            text: `이 문서의 내용을 한국어로 상세히 분석해줘.
+다음 순서로 정리:
+1. 문서 목적 (1줄)
+2. 핵심 내용 (항목별)
+3. 주요 수치·일정 (있으면)
+4. 확인이 필요한 사항 (있으면)
+마크다운(#,*,**) 금지. 플레인 텍스트.`,
+          },
+        ],
+      }],
+    }),
+  });
+
+  const data = await response.json();
+  return (data.content || [])
+    .filter((c) => c.type === "text")
+    .map((c) => c.text)
+    .join("\n") || "[문서 분석 실패]";
 }
 
+async function sendMilestoneAlert(env, msg, text, milestoneDate) {
+  if (!milestoneDate || !env.BRIEFING_CHAT_ID) return;
+
+  const todayKst = new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10);
+  const today = new Date(`${todayKst}T00:00:00Z`);
+  const milestone = new Date(`${milestoneDate}T00:00:00Z`);
+  const daysLeft = Math.round((milestone.getTime() - today.getTime()) / 86400000);
+
+  if (daysLeft < 0 || daysLeft > 3) return;
+
+  const title = text
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line && !line.startsWith("#")) || text.split("\n")[0].trim();
+  const sender = senderName(msg.from);
+  const out = `[D-${daysLeft} 알림] ${title}
+마일스톤이 ${daysLeft}일 후입니다. (${milestoneDate})
+담당: ${sender}`;
+
+  const chatIds = (env.BRIEFING_CHAT_ID || "").split(",").filter(Boolean);
+  for (const id of chatIds) {
+    await sendMessage(env, id, out);
+  }
+}
 async function saveMessage(env, msg, content) {
   await insertMessage(env, { msg, content });
 }

@@ -8,7 +8,6 @@
   },
   "dependencies": {
     "@cloudflare/workers-types": "latest",
-    "unpdf": "latest",
     "wrangler": "latest"
   },
   "devDependencies": {}
