@@ -71,6 +71,27 @@ function readBoolEnv(env, key, defaultValue = false) {
   return defaultValue;
 }
 
+function parseScheduleDate(text) {
+  const year = new Date().getFullYear();
+  const t = String(text || "");
+
+  // 06/15, 6/15, 06.15 형식
+  const m1 = t.match(/(\d{1,2})[\/.](\d{1,2})/);
+  if (m1) {
+    return `${year}-${String(m1[1]).padStart(2,"0")}-${String(m1[2]).padStart(2,"0")}`;
+  }
+  // 6월 15일, 6월15일 형식
+  const m2 = t.match(/(\d{1,2})월\s*(\d{1,2})일/);
+  if (m2) {
+    return `${year}-${String(m2[1]).padStart(2,"0")}-${String(m2[2]).padStart(2,"0")}`;
+  }
+  // 이미 YYYY-MM-DD 형식
+  const m3 = t.match(/(\d{4}-\d{2}-\d{2})/);
+  if (m3) return m3[1];
+
+  return "";
+}
+
 function getKstDayRange() {
   const kstOffset = 9 * 60 * 60 * 1000;
   const kstNow = new Date(Date.now() + kstOffset);
@@ -8487,7 +8508,11 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
   // 자연어 일정 감지 → #일정 태그로 저장
   const isScheduleSave = /(일정\s*(메모|저장|기록|넣어|추가)|저장해줘|메모해줘|기록해줘)/.test(cleanText);
   if (isScheduleSave && cleanText.length > 5) {
-    const scheduleContent = `#일정\n- 업무명 : ${cleanText.replace(/(일정\s*(메모|저장|기록|넣어|추가)|저장해줘|메모해줘|기록해줘)/g, "").trim()}\n- 진행내용 : 수동 등록`;
+    const titleText = cleanText
+      .replace(/(일정\s*(메모|저장|기록|넣어|추가)|저장해줘|메모해줘|기록해줘)/g, "")
+      .trim();
+    const parsedDate = parseScheduleDate(titleText);
+    const scheduleContent = `#일정\n- 업무명 : ${titleText}\n- 진행내용 : 일정 등록\n- 마일스톤 : ${parsedDate || titleText}`;
     if (env.DB) {
       try {
         await dbInsert(env, {
@@ -8501,7 +8526,7 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
           sourceType: "telegram_group",
         });
         await sendMessage(env, chatId,
-          `#일정 저장 완료\n- ${cleanText.replace(/(저장해줘|메모해줘|기록해줘)/g, "").trim()}\n\n일정 조회 시 포함됩니다.`
+          `#일정 저장 완료\n- ${titleText}${parsedDate ? " (" + parsedDate + ")" : ""}\n\n일정 조회 시 포함됩니다.`
         );
         return;
       } catch (e) {
