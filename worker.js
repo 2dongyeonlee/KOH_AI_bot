@@ -1,4 +1,5 @@
-const CLAUDE_MODEL = "claude-sonnet-4-6";
+const MODEL_FAST = "claude-haiku-4-5-20251001";  // 단순 대화
+const MODEL_SMART = "claude-sonnet-4-6";          // 분석·브리핑
 const STATUS_TAGS = ["#보고", "#Fup", "#공유", "#일정"];
 const DEFAULT_SYSTEM_PROMPT =
   `너는 SK하이닉스 6R전략실 권오혁 담당의 전담 AI 비서 권오혁(A)다.
@@ -279,10 +280,19 @@ ${webContext}
   const answer = await callClaude(
     env,
     prompt,
-    systemPrompt
+    systemPrompt,
+    isComplexQuery(query, false) ? MODEL_SMART : MODEL_FAST
   );
 
   return sendMessage(env, chatId, answer);
+}
+
+function isComplexQuery(query, hasFile) {
+  if (hasFile) return true;
+  if (query.length > 100) return true;
+  const complexKeywords =
+    /(요약|분석|보고|브리핑|정리|검토|작성|전략|방향|판단|비교|예측)/;
+  return complexKeywords.test(query);
 }
 
 async function parseForStorage(env, text, statusTag) {
@@ -304,7 +314,7 @@ needs_escalation 판단 기준 (1로 설정):
 상태태그: ${statusTag || "없음"}
 텍스트: ${text.slice(0, 3000)}`;
 
-  const result = await callClaude(env, prompt);
+  const result = await callClaude(env, prompt, "", MODEL_SMART);
   try {
     const clean = result.replace(/```json|```/g, "").trim();
     const parsed = JSON.parse(clean);
@@ -397,7 +407,9 @@ ${joinRows(reports)}
 ${joinRows(shares)}
 
 === [Fup] ===
-${joinRows(fups)}`
+${joinRows(fups)}`,
+    "",
+    MODEL_SMART
   );
 
   const chatIds = (env.BRIEFING_CHAT_ID || "").split(",").filter(Boolean);
@@ -425,7 +437,9 @@ async function runInfoBriefing(env) {
     `${INFO_BRIEFING_FORMAT}
 
 === 정보방 내용 ===
-${rows.map((row) => row.summary || row.content).join("\n").slice(0, 10000)}`
+${rows.map((row) => row.summary || row.content).join("\n").slice(0, 10000)}`,
+    "",
+    MODEL_SMART
   );
 
   const chatIds = (env.BRIEFING_CHAT_ID || "").split(",").filter(Boolean);
@@ -434,7 +448,7 @@ ${rows.map((row) => row.summary || row.content).join("\n").slice(0, 10000)}`
   }
 }
 
-async function callClaude(env, userText, system = DEFAULT_SYSTEM_PROMPT) {
+async function callClaude(env, userText, system = "", model = MODEL_FAST) {
   const effectiveSystem =
     system && system !== DEFAULT_SYSTEM_PROMPT
       ? `${DEFAULT_SYSTEM_PROMPT}\n\n추가 지시:\n${system}`
@@ -447,8 +461,8 @@ async function callClaude(env, userText, system = DEFAULT_SYSTEM_PROMPT) {
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model: CLAUDE_MODEL,
-      max_tokens: 1500,
+      model: model,
+      max_tokens: model === MODEL_FAST ? 500 : 1500,
       system: effectiveSystem,
       messages: [{ role: "user", content: userText }],
     }),
@@ -480,7 +494,7 @@ async function describeImage(env, imageUrl, caption) {
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model: CLAUDE_MODEL,
+      model: MODEL_SMART,
       max_tokens: 1000,
       messages: [
         {
@@ -538,7 +552,7 @@ async function extractDocumentText(env, fileUrl, fileName) {
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model: CLAUDE_MODEL,
+      model: MODEL_SMART,
       max_tokens: 2000,
       messages: [{
         role: "user",
