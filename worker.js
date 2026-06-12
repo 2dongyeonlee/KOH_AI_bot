@@ -6,7 +6,7 @@ const SUMMARY_PROMPT =
   "다음 파일 내용을 업무 보고 메모체로 정리해줘.\n" +
   "구성: 핵심 내용 / 안건 / 일정 / 확인할 일.";
 const TONE_RULE =
-  "[응답 규칙: 존댓말 격식체 사용. ^^ 이모티콘 사용 금지. 불필요한 감탄사 사용 금지.]\n\n";
+  "[응답 규칙: 존댓말 사용. 자연스럽고 친근하게. 너무 딱딱한 보고서체 금지.]\n\n";
 const SUMMARY_TONE_RULE =
   "[요약 응답 규칙]\n" +
   "- 답변은 보고 메모체로 작성합니다.\n" +
@@ -8458,7 +8458,7 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
   // 이 방 활성 대화 상태 갱신 (10분 TTL)
   if (env.CONVERSATIONS) {
     try {
-      await env.CONVERSATIONS.put(`group_active_${chatId}`, "1", { expirationTtl: 600 });
+      await env.CONVERSATIONS.put(`group_active_${chatId}`, "1", { expirationTtl: 1800 });
     } catch (_) {}
   }
 
