@@ -256,7 +256,7 @@ async function handleQuery(env, chatId, query) {
   const SEARCH_TRIGGERS =
     /(동향|트렌드|최신|사례|정책|법안|발의|해외|글로벌|경쟁사|시장|여론|언론|뉴스)/;
   let webContext = "";
-  if (SEARCH_TRIGGERS.test(query) && env.BRAVE_API_KEY) {
+  if (SEARCH_TRIGGERS.test(query) && env.TAVILY_API_KEY) {
     const results = await searchWeb(env, query);
     if (results.length) {
       webContext = "\n\n[외부 검색]\n" +
@@ -646,24 +646,27 @@ async function searchMemory(env, query) {
 }
 
 async function searchWeb(env, query) {
-  if (!env.BRAVE_API_KEY) return [];
+  if (!env.TAVILY_API_KEY) return [];
   try {
-    const res = await fetch(
-      `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5&country=KR&lang=ko`,
-      {
-        headers: {
-          Accept: "application/json",
-          "X-Subscription-Token": env.BRAVE_API_KEY,
-        },
-      }
-    );
+    const res = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        api_key: env.TAVILY_API_KEY,
+        query: query,
+        search_depth: "basic",
+        max_results: 5,
+        include_answer: true,
+      }),
+    });
     const data = await res.json();
-    return (data.web?.results || []).map((result) => ({
+    return (data.results || []).map((result) => ({
       title: result.title,
       url: result.url,
-      snippet: result.description || "",
+      snippet: result.content || "",
     }));
-  } catch {
+  } catch (e) {
+    console.error("searchWeb error:", e.message);
     return [];
   }
 }
