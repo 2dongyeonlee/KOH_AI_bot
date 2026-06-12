@@ -89,40 +89,54 @@ export default {
 };
 
 async function handleMessage(env, msg) {
-  console.log(
-    "handleMessage:",
-    msg.chat?.id,
-    msg.from?.id,
-    (msg.text || "").slice(0, 20)
-  );
-  const chatId = msg.chat.id;
-  const text = (msg.text || msg.caption || "").trim();
+  console.log("handleMessage:", msg.chat?.id, msg.from?.id, 
+    (msg.text || "").slice(0, 20));
+
+  const chatId   = msg.chat.id;
+  const text     = (msg.text || msg.caption || "").trim();
   const botToken = (env.TELEGRAM_BOT_TOKEN || "").split(":")[0];
+
+  // 봇 자신 메시지 무시
   if (msg.from && String(msg.from.id) === botToken) return;
 
+  // /설정 명령
   if (text.startsWith("/설정")) {
     const instruction = text.replace("/설정", "").trim();
     await updateSystemPrompt(env, instruction);
     return sendMessage(env, chatId, "반영했습니다.");
   }
 
+  // 파일/이미지 → 추출·저장·요약
   if (msg.document || (msg.photo && msg.photo.length)) {
     return ingestAndSummarize(env, msg, chatId, text);
   }
 
+  // 텍스트 저장 (잡담 제외) — 라우팅과 무관하게 항상 먼저 저장
+  const junk = !text
+    || text.length < 3
+    || /^[ㄱ-ㅎㅏ-ㅣ\s]+$/.test(text)
+    || /^(ㅎㅇ|ㅋ+|ㅎ+|ㅠ+|ㅜ+|ㄷㄷ|ㅇㅇ|ㄴㄴ|ㅇㅋ|ㄱㄱ|ㄹㅇ|ㅈㄹ)$/.test(text.trim());
+
+  if (!junk) {
+    await saveMessage(env, msg, text);
+  }
+
+  // 업무보고 태그 있으면 handleReport (추가 처리)
+  if (!junk && parseReportTags(text).status) {
+    return handleReport(env, msg, chatId, text);
+  }
+
+  // 봇에게 말 거는 것이면 handleQuery (답변)
   const isShortGreeting =
     msg.chat.type !== "private" &&
     text.length <= 20 &&
     /(안녕|ㅎㅇ|하이|반가|잘있|고마|감사|수고|어떻게|뭐야|뭐해)/.test(text);
+
   if (isQueryToBot(env, msg, text) || isShortGreeting) {
     return handleQuery(env, chatId, cleanMention(text));
   }
 
-  if (text && parseReportTags(text).status) {
-    return handleReport(env, msg, chatId, text);
-  }
-
-  if (text && !isJunk(text)) await saveMessage(env, msg, text);
+  // 나머지는 저장만 (응답 없음) — 이미 위에서 저장됨
 }
 
 function isJunk(text) {
@@ -599,36 +613,36 @@ async function saveMessage(env, msg, content) {
 }
 
 async function insertMessage(env, options) {
-  try {
-    const {
-      msg,
-      content,
-      statusTag = "",
-      fieldTag = "",
-      milestoneDate = "",
-      fileId = "",
-      fileName = "",
-      summary = "",
-      action_items = "",
-      needs_escalation = 0,
-      info_tag = "",
-    } = options;
+  const {
+    msg,
+    content,
+    statusTag      = "",
+    fieldTag       = "",
+    milestoneDate  = "",
+    fileId         = "",
+    fileName       = "",
+    summary        = "",
+    action_items   = "",
+    needs_escalation = 0,
+    info_tag       = "",
+  } = options;
 
+  try {
     await env.DB.prepare(`
       INSERT INTO messages (
-        telegram_message_id, room_id, room_title, 
+        telegram_message_id, room_id, room_title,
         sender_id, sender_name, content,
-        status_tag, field_tag, milestone_date, 
+        status_tag, field_tag, milestone_date,
         file_id, file_name,
         summary, action_items, needs_escalation, info_tag
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
-      String(msg.message_id || "0"),
-      String(msg.chat?.id || "0"),
-      String(msg.chat?.title || msg.chat?.username || "DM"),
-      String(msg.from?.id || "0"),
+      String(msg.message_id   || "0"),
+      String(msg.chat?.id     || "0"),
+      String(msg.chat?.title  || msg.chat?.username || "DM"),
+      String(msg.from?.id     || "0"),
       String(msg.from?.first_name || msg.from?.username || "unknown"),
-      String(content || ""),
+      String(content          || ""),
       String(statusTag),
       String(fieldTag),
       String(milestoneDate),
@@ -640,11 +654,13 @@ async function insertMessage(env, options) {
       String(info_tag)
     ).run();
 
-    console.log("saved:", msg.chat?.id, msg.from?.first_name, content?.slice(0, 30));
+    console.log("saved ok:", msg.chat?.id, 
+      msg.from?.first_name, String(content).slice(0, 30));
+
   } catch (e) {
     console.error("insertMessage FAILED:", e.message);
-    console.error("msg.chat:", JSON.stringify(msg.chat));
-    console.error("msg.from:", JSON.stringify(msg.from));
+    console.error("chat:", JSON.stringify(msg.chat));
+    console.error("from:", JSON.stringify(msg.from));
   }
 }
 
