@@ -78,6 +78,12 @@ export default {
 };
 
 async function handleMessage(env, msg) {
+  console.log(
+    "handleMessage:",
+    msg.chat?.id,
+    msg.from?.id,
+    (msg.text || "").slice(0, 20)
+  );
   const chatId = msg.chat.id;
   const text = (msg.text || msg.caption || "").trim();
   const botToken = (env.TELEGRAM_BOT_TOKEN || "").split(":")[0];
@@ -556,51 +562,52 @@ async function saveMessage(env, msg, content) {
 }
 
 async function insertMessage(env, options) {
-  const {
-    msg,
-    content,
-    summary = "",
-    action_items = "",
-    needs_escalation = 0,
-    statusTag = "",
-    fieldTag = "",
-    milestoneDate = "",
-    fileId = "",
-    fileName = "",
-  } = options;
-
   try {
-    await env.DB.prepare(
-      `INSERT INTO messages (
-        telegram_message_id, room_id, room_title, sender_id, sender_name, content,
-        summary, action_items, needs_escalation,
-        status_tag, field_tag, milestone_date, file_id, file_name
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).bind(
-      String(msg.message_id || ""),
+    const {
+      msg,
+      content,
+      statusTag = "",
+      fieldTag = "",
+      milestoneDate = "",
+      fileId = "",
+      fileName = "",
+      summary = "",
+      action_items = "",
+      needs_escalation = 0,
+      info_tag = "",
+    } = options;
+
+    await env.DB.prepare(`
+      INSERT INTO messages (
+        telegram_message_id, room_id, room_title, 
+        sender_id, sender_name, content,
+        status_tag, field_tag, milestone_date, 
+        file_id, file_name,
+        summary, action_items, needs_escalation, info_tag
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      String(msg.message_id || "0"),
       String(msg.chat?.id || "0"),
-      msg.chat?.title || "DM",
+      String(msg.chat?.title || msg.chat?.username || "DM"),
       String(msg.from?.id || "0"),
-      senderName(msg.from),
-      content || "(내용 없음)",
-      summary || "",
-      action_items || "",
-      needs_escalation === 1 ? 1 : 0,
-      statusTag,
-      fieldTag,
-      milestoneDate,
-      fileId,
-      fileName
+      String(msg.from?.first_name || msg.from?.username || "unknown"),
+      String(content || ""),
+      String(statusTag),
+      String(fieldTag),
+      String(milestoneDate),
+      String(fileId),
+      String(fileName),
+      String(summary),
+      String(action_items),
+      Number(needs_escalation),
+      String(info_tag)
     ).run();
+
+    console.log("saved:", msg.chat?.id, msg.from?.first_name, content?.slice(0, 30));
   } catch (e) {
-    console.error(
-      "insertMessage error:",
-      e.message,
-      "room:",
-      msg.chat?.id,
-      "sender:",
-      msg.from?.id
-    );
+    console.error("insertMessage FAILED:", e.message);
+    console.error("msg.chat:", JSON.stringify(msg.chat));
+    console.error("msg.from:", JSON.stringify(msg.from));
   }
 }
 
