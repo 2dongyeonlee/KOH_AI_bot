@@ -1,11 +1,14 @@
 {
   "scripts": {
+    "check": "node --check worker.js",
+    "deploy": "wrangler deploy",
     "import:telegram": "node scripts/import_telegram_export.js",
     "ingest:export": "node scripts/ingest_export.js",
     "backfill:users": "node scripts/backfill_users.js"
   },
   "dependencies": {
     "@cloudflare/workers-types": "latest",
+    "unpdf": "latest",
     "wrangler": "latest"
   },
   "devDependencies": {}

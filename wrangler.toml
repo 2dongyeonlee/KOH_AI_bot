@@ -1,24 +1,20 @@
 name = "koh-ai-bot"
 main = "worker.js"
 compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
 keep_vars = true
 
 # Secrets (set via `wrangler secret put`, never commit values here):
-#   TELEGRAM_BOT_TOKEN, DIFY_API_KEY, TAVILY_API_KEY,
-#   ADMIN_TELEGRAM_ID, ADMIN_CHAT_ID, DAILY_BRIEFING_CHAT_ID,
-#   DYLEE_CHAT_ID, GEMINI_API_KEY, WORK_REPORT_CHAT_ID
+#   TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY
 
 [vars]
-DIFY_API_URL = "https://api.dify.ai/v1"
-EXTERNAL_SEARCH_ENABLED = "true"
-ENABLE_ADVANCED_PARSER = "true"
-ENABLE_IMAGE_INGEST = "true"
-ENABLE_RAG_CHUNKING = "false"
-ENABLE_VECTOR_SEARCH = "false"
-KST_TIMEZONE = "Asia/Seoul"
+BRIEFING_CHAT_ID = ""
+INFO_ROOM_IDS = ""
+REPORT_ROOM_IDS = ""
+BOT_USERNAME = ""
 
 [triggers]
-crons = ["0 0 * * *"]
+crons = ["0 23 * * *"]
 
 # KOH_AI_bot 전용 D1 DB입니다. Cloudflare 표시 이름은 6r-ai-db 그대로 사용합니다.
 # dylee_ai_bot과 같은 database_id를 사용하면 안 됩니다.
@@ -28,21 +24,6 @@ database_name = "6r-ai-db"
 database_id = "d55c7eaa-ef2e-40e5-8283-a50008dc5fb2"
 
 [[kv_namespaces]]
-binding = "USERS"
-id = "65a2237c4bf94cb1a24346daa9628536"
-preview_id = "65a2237c4bf94cb1a24346daa9628536"
-
-[[kv_namespaces]]
-binding = "CONVERSATIONS"
-id = "41fe286a688e4254ba25f83997d5a007"
-preview_id = "41fe286a688e4254ba25f83997d5a007"
-
-[[kv_namespaces]]
-binding = "ROOMS"
-id = "6edc67aa943043179eddd67e8d71f886"
-preview_id = "6edc67aa943043179eddd67e8d71f886"
-
-[[kv_namespaces]]
-binding = "SCHEDULES"
+binding = "PROMPT"
 id = "3e6133b2fefd4c1088e14baed49fcd1e"
 preview_id = "3e6133b2fefd4c1088e14baed49fcd1e"
