@@ -122,7 +122,14 @@ async function handleMessage(env, msg) {
     return handleReport(env, msg, chatId, text);
   }
 
-  if (text) await saveMessage(env, msg, text);
+  if (text && !isJunk(text)) await saveMessage(env, msg, text);
+}
+
+function isJunk(text) {
+  if (text.length < 5) return true;
+  if (/^[ㄱ-ㅎㅏ-ㅣ]+$/.test(text)) return true;
+  if (/^(ㅎㅇ|ㅋ+|ㅎ+|ㅠ+|ㅜ+|ㄷㄷ|ㅇㅇ|ㄴㄴ|ㅇㅋ|ㄱㄱ|ㄹㅇ)$/.test(text)) return true;
+  return false;
 }
 
 function parseReportTags(text) {
@@ -271,8 +278,8 @@ ${internalContext ? `내부 자료:\n${internalContext}\n\n` : ""}
 ${webContext}
 
 지시:
-- 내부 자료가 있으면 "OO님이 올리신 자료가 있습니다" 형식으로 먼저 언급
-- 관련 자료가 논의와 연결되면 선제적으로 요약 제공
+- 내부 자료는 답변 품질을 높이기 위한 참고자료로만 조용히 활용
+- 사용자가 명시적으로 파일/자료를 요청한 경우에만 자료 존재를 언급
 - 의사결정이 필요한 내용이면 판단 포인트 제시
 - 없는 내용은 만들지 않는다
 
@@ -741,7 +748,7 @@ function cleanMention(text) {
 }
 
 function looksLikeFileRequest(query) {
-  return /(자료|파일|문서|보내|전달|찾아)/.test(query);
+  return /(자료|파일|문서|보내|전달|찾아|올려|공유|링크)/.test(query);
 }
 
 function senderName(from) {
