@@ -17,8 +17,9 @@ const DEFAULT_SYSTEM_PROMPT =
 
 답변 원칙:
 - 존댓말. 짧고 간결하게. 바로 본론.
-- 마크다운(#,*,**,_,##) 완전 금지.
-- 이모티콘 완전 금지.
+- 강조할 내용은 <b>텍스트</b> 형식으로 표시.
+- 마크다운(**,#,*) 완전 금지. HTML 태그만 사용.
+- 이모티콘은 적절히 사용 가능.
 - 끝맺음 인사 금지. 무엇을 도와드릴까요 금지.
 - 추측하지 않는다. 없는 정보는 만들지 않는다.
 - 확인이 필요하면 확인이 필요합니다 라고만 답한다.`;
@@ -446,7 +447,11 @@ async function sendMessage(env, chatId, text) {
   await fetch(`${telegramApi(env)}/sendMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text: String(text || "").slice(0, 3900) }),
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: String(text || "").slice(0, 3900),
+      parse_mode: "HTML",
+    }),
   });
 }
 
