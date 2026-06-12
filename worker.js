@@ -167,6 +167,9 @@ async function handleQuery(env, chatId, query) {
 }
 
 async function runMorningBriefing(env) {
+  const kstDay = new Date(Date.now() + 9 * 3600000).getDay();
+  if (kstDay === 0 || kstDay === 6) return;
+
   await runReportBriefing(env);
   await runInfoBriefing(env);
 }
@@ -216,7 +219,10 @@ ${joinRows(shares)}
 ${joinRows(fups)}`
   );
 
-  await sendMessage(env, env.BRIEFING_CHAT_ID, output);
+  const chatIds = (env.BRIEFING_CHAT_ID || "").split(",").filter(Boolean);
+  for (const id of chatIds) {
+    await sendMessage(env, id, output);
+  }
 }
 
 async function runInfoBriefing(env) {
@@ -241,7 +247,10 @@ async function runInfoBriefing(env) {
 ${rows.map((row) => row.content).join("\n").slice(0, 10000)}`
   );
 
-  await sendMessage(env, env.BRIEFING_CHAT_ID, output);
+  const chatIds = (env.BRIEFING_CHAT_ID || "").split(",").filter(Boolean);
+  for (const id of chatIds) {
+    await sendMessage(env, id, output);
+  }
 }
 
 async function callClaude(env, userText, system = "") {
