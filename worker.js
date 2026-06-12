@@ -5,21 +5,23 @@ const STATUS_TAGS = ["#보고", "#Fup", "#공유", "#일정"];
 const DEFAULT_SYSTEM_PROMPT =
   `너는 SK하이닉스 6R전략실 권오혁 담당의 전담 AI 비서 권오혁(A)다.
 
-호칭: 염성진→사장님, 담당 →OO담당님, 팀장→OO팀장님, 담당→OO담당님, TL→OO TL님
+호칭: 염성진→사장님, 팀장→OO팀장님, 담당→OO담당님, TL→OO TL님
 
 6R전략실: 권오혁 담당, 구정모 팀장, 성봉구 팀장,
 김선영 TL, 홍석윤 TL, 이동연 TL, 위예슬 TL,
 이기두 TL, 김민아 TL, 황성욱 TL
 
-커뮤니케이션 총괄 : 염성진 사장님, 권오혁 담당님,
+커뮤니케이션 본부: 염성진 사장님, 권오혁 담당님,
 황무연 담당님, 함동균 담당님, 손경배 담당님,
 한혜승 담당님, 박호현 담당님, 양서진 담당님, 원정호 담당님
 
 답변 원칙:
 - 존댓말. 짧고 간결하게. 바로 본론.
-- 마크다운(#,*,**) 금지. 이모티콘 금지. 끝맺음 인사 금지.
-- 모르거나 없는 정보는 추측하지 않는다.
-- 확인이 필요하면 "확인이 필요합니다"라고만 답한다.`;
+- 마크다운(#,*,**,_,##) 완전 금지.
+- 이모티콘 완전 금지.
+- 끝맺음 인사 금지. 무엇을 도와드릴까요 금지.
+- 추측하지 않는다. 없는 정보는 만들지 않는다.
+- 확인이 필요하면 확인이 필요합니다 라고만 답한다.`;
 
 const REPORT_BRIEFING_FORMAT = `아래 4개 그룹을 한국어로 정리하세요.
 내용 없는 그룹은 특이사항 없음. 마크다운·이모티콘 금지. 플레인 텍스트. 존댓말.
@@ -90,7 +92,11 @@ async function handleMessage(env, msg) {
     return ingestAndSummarize(env, msg, chatId, text);
   }
 
-  if (isQueryToBot(env, msg, text)) {
+  const isShortGreeting =
+    msg.chat.type !== "private" &&
+    text.length <= 20 &&
+    /(안녕|ㅎㅇ|하이|반가|잘있|고마|감사|수고|어떻게|뭐야|뭐해)/.test(text);
+  if (isQueryToBot(env, msg, text) || isShortGreeting) {
     return handleQuery(env, chatId, cleanMention(text));
   }
 
@@ -182,13 +188,21 @@ async function handleQuery(env, chatId, query) {
   }
 
   const context = hits
-    .map((hit) => `- ${hit.content}`)
+    .map((hit) => hit.content)
     .join("\n")
     .slice(0, 6000);
   const systemPrompt = await getSystemPrompt(env);
+  const prompt = context
+    ? `저장된 기록을 자연스럽게 참고해서 답하세요. 없는 내용은 만들지 마세요.
+
+저장된 기록:
+${context}
+
+사용자 질문: ${query}`
+    : query;
   const answer = await callClaude(
     env,
-    `${context ? `참고 자료:\n${context}\n\n` : ""}질문: ${query}`,
+    prompt,
     systemPrompt
   );
 
@@ -282,7 +296,11 @@ ${rows.map((row) => row.content).join("\n").slice(0, 10000)}`
   }
 }
 
-async function callClaude(env, userText, system = "") {
+async function callClaude(env, userText, system = DEFAULT_SYSTEM_PROMPT) {
+  const effectiveSystem =
+    system && system !== DEFAULT_SYSTEM_PROMPT
+      ? `${DEFAULT_SYSTEM_PROMPT}\n\n추가 지시:\n${system}`
+      : DEFAULT_SYSTEM_PROMPT;
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -293,7 +311,7 @@ async function callClaude(env, userText, system = "") {
     body: JSON.stringify({
       model: CLAUDE_MODEL,
       max_tokens: 1500,
-      system: system || DEFAULT_SYSTEM_PROMPT,
+      system: effectiveSystem,
       messages: [{ role: "user", content: userText }],
     }),
   });
@@ -493,12 +511,3 @@ function textFromClaude(data) {
     .trim();
 }
 
-function arrayBufferToBase64(buffer) {
-  let binary = "";
-  const bytes = new Uint8Array(buffer);
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
-}
