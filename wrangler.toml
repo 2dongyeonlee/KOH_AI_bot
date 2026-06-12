@@ -11,7 +11,7 @@ keep_vars = true
 BRIEFING_CHAT_ID = ""
 INFO_ROOM_IDS = ""
 REPORT_ROOM_IDS = ""
-BOT_USERNAME = ""
+BOT_USERNAME = "KOH_AI_bot"
 
 [triggers]
 crons = ["0 23 * * *"]

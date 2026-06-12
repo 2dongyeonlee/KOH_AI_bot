@@ -418,10 +418,18 @@ function telegramApi(env) {
 }
 
 function isQueryToBot(env, msg, text) {
-  if (!text) return false;
-  if (msg.chat.type === "private") return true;
-  const botName = String(env.BOT_USERNAME || "").replace(/^@/, "");
-  return (botName && text.includes(`@${botName}`)) || Boolean(msg.reply_to_message?.from?.is_bot);
+  if (msg.chat.type === "private") return !!text;
+
+  const entities = msg.entities || [];
+  const hasMention = entities.some((entity) => entity.type === "mention");
+
+  const botName = (env.BOT_USERNAME || "").toLowerCase();
+  const textLower = text.toLowerCase();
+  const mentionedByName = botName && textLower.includes(`@${botName}`);
+
+  const isReply = !!msg.reply_to_message?.from?.is_bot;
+
+  return hasMention || mentionedByName || isReply;
 }
 
 function cleanMention(text) {
