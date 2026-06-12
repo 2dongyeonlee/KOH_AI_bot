@@ -2228,7 +2228,7 @@ function kohIsCrossRoomRequest(text = "") {
 function kohIsCurrentRoomOnly(text = "") {
   const t = String(text || "");
   if (kohIsCrossRoomRequest(t)) return false;
-  return /(이\s*방|이\s*단체방|이\s*단톡방|여기|현재\s*방|우리\s*방)/.test(t);
+  return /(이\s*방에서|이\s*방\s*자료|이\s*단체방|이\s*단톡방|현재\s*방|우리\s*방)/.test(t);
 }
 
 function kohIsGroupRoomPreferred(text = "") {
@@ -8467,6 +8467,32 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
 
   const cleanText = cleanBotMention(text, env);
 
+  // 자연어 일정 감지 → #일정 태그로 저장
+  const isScheduleSave = /(일정\s*(메모|저장|기록|넣어|추가)|저장해줘|메모해줘|기록해줘)/.test(cleanText);
+  if (isScheduleSave && cleanText.length > 5) {
+    const scheduleContent = `#일정\n- 업무명 : ${cleanText.replace(/(일정\s*(메모|저장|기록|넣어|추가)|저장해줘|메모해줘|기록해줘)/g, "").trim()}\n- 진행내용 : 수동 등록`;
+    if (env.DB) {
+      try {
+        await dbInsert(env, {
+          roomId: chatId,
+          roomTitle: message.chat.title || String(chatId),
+          senderId: String(message.from?.id || ""),
+          senderName: await getCanonicalUserName(env, message.from),
+          content: scheduleContent,
+          savedBy: BOT_KEY,
+          telegramMessageId: `schedule_${Date.now()}`,
+          sourceType: "telegram_group",
+        });
+        await sendMessage(env, chatId,
+          `#일정 저장 완료\n- ${cleanText.replace(/(저장해줘|메모해줘|기록해줘)/g, "").trim()}\n\n일정 조회 시 포함됩니다.`
+        );
+        return;
+      } catch (e) {
+        console.error("schedule save:", e);
+      }
+    }
+  }
+
   if (!cleanText) {
     return;
   }
@@ -8530,7 +8556,11 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
 
   // internal knowledge: "이 방"이라고 명시하면 현재 방만, 아니면 전체 방 조회
   if (kohIsInternalKnowledgeRequest(cleanText)) {
-    const roomScope = kohIsCurrentRoomOnly(cleanText) ? String(chatId) : "";
+    // 일정/우선순위 관련은 항상 전체 방 조회
+    const isScheduleOrPriority = isBriefingRequestCheck(cleanText) ||
+      /(일정|할일|다음주|이번주|브리핑|우선순위)/.test(cleanText);
+    const roomScope = (!isScheduleOrPriority && kohIsCurrentRoomOnly(cleanText))
+      ? String(chatId) : "";
     const handled = await kohHandleInternalKnowledgeRequest(env, chatId, cleanText, roomScope, userId);
     if (handled) return;
   }
