@@ -8046,6 +8046,19 @@ async function handlePrivateMessage(message, userId, chatId, text, hasFile, user
 
   // GENERAL_CHAT hard guard in DM handler
   if (isGeneralChatQuery(text)) {
+    try {
+      const result = await difyChat(env, {
+        query: `[응답 규칙: 존댓말. 자연스럽고 짧게. 보고서/목록 형식 절대 금지. 이모티콘 금지.]\n\n${text}`,
+        user: String(userId),
+        conversationId: "",
+      });
+      if (result.answer) {
+        await sendMessage(env, chatId, result.answer);
+        return;
+      }
+    } catch (e) {
+      console.error("general chat dify dm:", e);
+    }
     await sendMessage(env, chatId, makeGeneralChatReply(text));
     return;
   }
@@ -8442,8 +8455,21 @@ async function handleGroupMessage(message, userId, chatId, text, hasFile, user, 
     return;
   }
 
-  // GENERAL_CHAT hard guard — skip all retrieval
+  // 일상 대화 → Dify 자연어 응답 (보고서 형식 없이)
   if (isGeneralChatQuery(cleanText)) {
+    try {
+      const result = await difyChat(env, {
+        query: `[응답 규칙: 존댓말. 자연스럽고 짧게. 보고서/목록 형식 절대 금지. 이모티콘 금지.]\n\n${cleanText}`,
+        user: String(userId),
+        conversationId: "",
+      });
+      if (result.answer) {
+        await sendMessage(env, chatId, result.answer);
+        return;
+      }
+    } catch (e) {
+      console.error("general chat dify:", e);
+    }
     await sendMessage(env, chatId, makeGeneralChatReply(cleanText));
     return;
   }
