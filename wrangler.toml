@@ -6,6 +6,7 @@ keep_vars = true
 
 # Secrets (set via `wrangler secret put`, never commit values here):
 #   TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY
+#   Optional web search: wrangler secret put BRAVE_API_KEY
 
 [vars]
 BRIEFING_CHAT_ID = "-5156923133,-4930893560"

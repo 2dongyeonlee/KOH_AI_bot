@@ -23,20 +23,22 @@ const DEFAULT_SYSTEM_PROMPT =
 - 확인이 필요하면 확인이 필요합니다 라고만 답한다.`;
 
 const REPORT_BRIEFING_FORMAT = `아래 4개 그룹을 한국어로 정리하세요.
-내용 없는 그룹은 특이사항 없음. 마크다운·이모티콘 금지. 플레인 텍스트. 존댓말.
+담당자명 반드시 포함. 내용 없는 그룹은 특이사항 없음.
+마크다운(#,*,**) 금지. 플레인 텍스트. 존댓말.
 
-[일정] 이번주 주요 일정 (날짜순 정렬)
-형식: 날짜(요일) / 업무명 / 장소·참석자(있으면)
-오늘 일정은 맨 위에 오늘 표시. 없으면 특이사항 없음.
+[일정] 이번주 주요 일정 (날짜순)
+형식: 날짜(요일) / 담당자 / 업무명 / 장소·참석자(있으면)
+오늘 일정은 맨 위 오늘 표시
 
 [보고] 보고 임박 D-7
-형식: 업무명 - 진행내용 (마일스톤 날짜)
+형식: 담당자 / 업무명 / 진행내용 / 마감일
+의사결정 필요 사항 있으면 별도 표시
 
 [공유] 최근 2일 공유
-형식: 업무명 - 핵심내용
+형식: 담당자 / 핵심내용 1줄
 
 [Fup] 최근 2일 Fup
-형식: 업무명 - 현황`;
+형식: 담당자 / 현황 1줄`;
 
 const INFO_BRIEFING_FORMAT = `정보방 내용을 한국어로 요약하세요.
 없는 항목은 특이사항 없음. 마크다운·이모티콘 금지. 플레인 텍스트.
@@ -130,15 +132,50 @@ async function handleReport(env, msg, chatId, text) {
     );
   }
 
+  const parsed = await parseForStorage(env, text, status);
+
   await insertMessage(env, {
     msg,
     content: text,
+    summary: parsed.summary,
+    action_items: parsed.action_items,
+    needs_escalation: parsed.needs_escalation,
     statusTag: status,
     fieldTag: field,
     milestoneDate,
   });
 
-  await sendMilestoneAlert(env, msg, text, milestoneDate);
+  if (milestoneDate) {
+    const dday = Math.ceil(
+      (new Date(milestoneDate) - new Date(kstDateStr())) / 86400000
+    );
+    if (dday >= 0 && dday <= 1) {
+      const chatIds = (env.BRIEFING_CHAT_ID || "").split(",").filter(Boolean);
+      for (const id of chatIds) {
+        await sendMessage(
+          env,
+          id,
+          `[D-${dday} 알림] ${msg.from?.first_name || ""}님 보고
+${parsed.summary}
+마감: ${milestoneDate}
+(주말에도 챙겨드립니다. 죄송합니다 😅)`
+        );
+      }
+    }
+  }
+
+  if (parsed.needs_escalation === 1) {
+    const chatIds = (env.BRIEFING_CHAT_ID || "").split(",").filter(Boolean);
+    for (const id of chatIds) {
+      await sendMessage(
+        env,
+        id,
+        `[사장님 보고 검토] ${msg.from?.first_name || ""}님 보고
+${parsed.summary}
+판단 필요: ${parsed.action_items || "확인이 필요합니다"}`
+      );
+    }
+  }
 }
 
 async function ingestAndSummarize(env, msg, chatId, caption) {
@@ -160,20 +197,19 @@ async function ingestAndSummarize(env, msg, chatId, caption) {
     extracted = await extractDocumentText(env, url, fileName);
   }
 
+  const parsed = await parseForStorage(env, extracted, "");
+
   await insertMessage(env, {
     msg,
     content: extracted,
+    summary: parsed.summary,
+    action_items: parsed.action_items,
+    needs_escalation: parsed.needs_escalation,
     fileId,
     fileName,
   });
 
-  if (type === "file") {
-    return sendMessage(env, chatId, extracted);
-  }
-
-  const label = type === "image" ? "이미지" : "파일";
-  const summary = await callClaude(env, `${label} 내용을 한국어로 간단히 요약하세요.\n\n${extracted}`);
-  return sendMessage(env, chatId, summary);
+  return sendMessage(env, chatId, formatActionBriefing(parsed));
 }
 
 async function handleQuery(env, chatId, query) {
@@ -182,30 +218,46 @@ async function handleQuery(env, chatId, query) {
   const hits = await searchMemory(env, query);
   const fileHit = hits.find((hit) => hit.file_id);
 
-  if (looksLikeFileRequest(query)) {
-    if (!hits.length) {
-      return sendMessage(env, chatId, "저장된 자료에서 찾지 못했습니다.");
-    }
-    if (fileHit) {
-      await sendDocument(env, chatId, fileHit.file_id, `요청하신 자료입니다. ${fileHit.file_name || ""}`.trim());
-    } else {
-      return sendMessage(env, chatId, "관련 내용은 찾았지만 전송할 파일은 없습니다.");
+  if (looksLikeFileRequest(query) && fileHit) {
+    await sendDocument(
+      env,
+      chatId,
+      fileHit.file_id,
+      `요청하신 자료입니다. ${fileHit.file_name || ""}`.trim()
+    );
+  }
+
+  const internalContext = hits.length
+    ? hits.map((hit) =>
+        `[${hit.sender_name || ""}] ${hit.summary || hit.content.slice(0, 200)}` +
+        (hit.action_items ? `\n액션: ${hit.action_items}` : "") +
+        (hit.milestone_date ? `\n마감: ${hit.milestone_date}` : "")
+      ).join("\n\n").slice(0, 5000)
+    : "";
+
+  const SEARCH_TRIGGERS =
+    /(동향|트렌드|최신|사례|정책|법안|발의|해외|글로벌|경쟁사|시장|여론|언론|뉴스)/;
+  let webContext = "";
+  if (SEARCH_TRIGGERS.test(query) && env.BRAVE_API_KEY) {
+    const results = await searchWeb(env, query);
+    if (results.length) {
+      webContext = "\n\n[외부 검색]\n" +
+        results.map((result) => `${result.title}\n${result.snippet}\n${result.url}`).join("\n\n");
     }
   }
 
-  const context = hits
-    .map((hit) => hit.content)
-    .join("\n")
-    .slice(0, 6000);
   const systemPrompt = await getSystemPrompt(env);
-  const prompt = context
-    ? `저장된 기록을 자연스럽게 참고해서 답하세요. 없는 내용은 만들지 마세요.
+  const prompt = `
+${internalContext ? `내부 자료:\n${internalContext}\n\n` : ""}
+${webContext}
 
-저장된 기록:
-${context}
+지시:
+- 내부 자료가 있으면 "OO님이 올리신 자료가 있습니다" 형식으로 먼저 언급
+- 관련 자료가 논의와 연결되면 선제적으로 요약 제공
+- 의사결정이 필요한 내용이면 판단 포인트 제시
+- 없는 내용은 만들지 않는다
 
-사용자 질문: ${query}`
-    : query;
+질문: ${query}`;
   const answer = await callClaude(
     env,
     prompt,
@@ -213,6 +265,64 @@ ${context}
   );
 
   return sendMessage(env, chatId, answer);
+}
+
+async function parseForStorage(env, text, statusTag) {
+  const prompt = `아래 텍스트를 분석해서 JSON으로만 답해줘.
+다른 말 하지 말고 JSON만. 마크다운 코드블록도 없이 순수 JSON만.
+
+{
+  "summary": "핵심 내용 2~3줄. 담당자명 포함.",
+  "action_items": "다음 액션·의사결정·공유 필요사항. 없으면 빈 문자열.",
+  "needs_escalation": 0
+}
+
+needs_escalation 판단 기준 (1로 설정):
+- 사장님 보고/결재가 필요한 내용
+- 임원 공유가 필요한 중요 이슈
+- 대외 커뮤니케이션 방향 결정 필요
+- 리스크 또는 기회 요인 포함
+
+상태태그: ${statusTag || "없음"}
+텍스트: ${text.slice(0, 3000)}`;
+
+  const result = await callClaude(env, prompt);
+  try {
+    const clean = result.replace(/```json|```/g, "").trim();
+    const parsed = JSON.parse(clean);
+    return {
+      summary: parsed.summary || text.slice(0, 100),
+      action_items: parsed.action_items || "",
+      needs_escalation: parsed.needs_escalation === 1 ? 1 : 0,
+    };
+  } catch {
+    return { summary: text.slice(0, 100), action_items: "", needs_escalation: 0 };
+  }
+}
+
+function formatActionBriefing(parsed) {
+  const actionItems = parsed.action_items || "없음";
+  const escalation = parsed.needs_escalation === 1 ? "있음" : "없음";
+
+  return `[액션 브리핑]
+
+챙길 일정
+→ ${actionItems}
+
+의사결정 필요
+→ ${actionItems}
+
+사장님 보고 필요
+→ ${escalation}
+
+공유 필요
+→ ${parsed.needs_escalation === 1 ? actionItems : "없음"}
+
+다음 액션
+→ ${actionItems}
+
+핵심 요약
+→ ${parsed.summary || "확인이 필요합니다"}`;
 }
 
 async function runMorningBriefing(env) {
@@ -228,7 +338,7 @@ async function runReportBriefing(env) {
 
   const rows = (
     await env.DB.prepare(
-      `SELECT content, status_tag, milestone_date, created_at,
+      `SELECT content, sender_name, summary, action_items, status_tag, milestone_date, created_at,
         CASE
           WHEN milestone_date >= date('now') AND milestone_date <= date('now', '+7 days') THEN 1
           ELSE 0
@@ -279,7 +389,7 @@ async function runInfoBriefing(env) {
 
   const rows = (
     await env.DB.prepare(
-      `SELECT content
+      `SELECT content, summary
        FROM messages
        WHERE status_tag = '' AND created_at > datetime('now', '-1 days')
        ORDER BY created_at`
@@ -293,7 +403,7 @@ async function runInfoBriefing(env) {
     `${INFO_BRIEFING_FORMAT}
 
 === 정보방 내용 ===
-${rows.map((row) => row.content).join("\n").slice(0, 10000)}`
+${rows.map((row) => row.summary || row.content).join("\n").slice(0, 10000)}`
   );
 
   const chatIds = (env.BRIEFING_CHAT_ID || "").split(",").filter(Boolean);
@@ -441,43 +551,31 @@ async function extractDocumentText(env, fileUrl, fileName) {
     .join("\n") || "[문서 분석 실패]";
 }
 
-async function sendMilestoneAlert(env, msg, text, milestoneDate) {
-  if (!milestoneDate || !env.BRIEFING_CHAT_ID) return;
-
-  const todayKst = new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10);
-  const today = new Date(`${todayKst}T00:00:00Z`);
-  const milestone = new Date(`${milestoneDate}T00:00:00Z`);
-  const daysLeft = Math.round((milestone.getTime() - today.getTime()) / 86400000);
-
-  if (daysLeft < 0 || daysLeft > 3) return;
-
-  const title = text
-    .split("\n")
-    .map((line) => line.trim())
-    .find((line) => line && !line.startsWith("#")) || text.split("\n")[0].trim();
-  const sender = senderName(msg.from);
-  const out = `[D-${daysLeft} 알림] ${title}
-마일스톤이 ${daysLeft}일 후입니다. (${milestoneDate})
-담당: ${sender}`;
-
-  const chatIds = (env.BRIEFING_CHAT_ID || "").split(",").filter(Boolean);
-  for (const id of chatIds) {
-    await sendMessage(env, id, out);
-  }
-}
 async function saveMessage(env, msg, content) {
   await insertMessage(env, { msg, content });
 }
 
 async function insertMessage(env, options) {
-  const { msg, content, statusTag = "", fieldTag = "", milestoneDate = "", fileId = "", fileName = "" } = options;
+  const {
+    msg,
+    content,
+    summary = "",
+    action_items = "",
+    needs_escalation = 0,
+    statusTag = "",
+    fieldTag = "",
+    milestoneDate = "",
+    fileId = "",
+    fileName = "",
+  } = options;
 
   try {
     await env.DB.prepare(
       `INSERT INTO messages (
         telegram_message_id, room_id, room_title, sender_id, sender_name, content,
+        summary, action_items, needs_escalation,
         status_tag, field_tag, milestone_date, file_id, file_name
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       String(msg.message_id || ""),
       String(msg.chat?.id || "0"),
@@ -485,6 +583,9 @@ async function insertMessage(env, options) {
       String(msg.from?.id || "0"),
       senderName(msg.from),
       content || "(내용 없음)",
+      summary || "",
+      action_items || "",
+      needs_escalation === 1 ? 1 : 0,
       statusTag,
       fieldTag,
       milestoneDate,
@@ -511,7 +612,7 @@ async function searchMemory(env, query) {
   const binds = terms.map((term) => `%${term}%`);
 
   const rows = await env.DB.prepare(
-    `SELECT content, file_id, file_name
+    `SELECT content, sender_name, summary, action_items, milestone_date, file_id, file_name
      FROM messages
      WHERE (${where}) AND created_at > datetime('now', '-2 days')
      ORDER BY datetime(created_at) DESC
@@ -519,6 +620,29 @@ async function searchMemory(env, query) {
   ).bind(...binds).all();
 
   return rows.results || [];
+}
+
+async function searchWeb(env, query) {
+  if (!env.BRAVE_API_KEY) return [];
+  try {
+    const res = await fetch(
+      `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5&country=KR&lang=ko`,
+      {
+        headers: {
+          Accept: "application/json",
+          "X-Subscription-Token": env.BRAVE_API_KEY,
+        },
+      }
+    );
+    const data = await res.json();
+    return (data.web?.results || []).map((result) => ({
+      title: result.title,
+      url: result.url,
+      snippet: result.description || "",
+    }));
+  } catch {
+    return [];
+  }
 }
 
 async function getSystemPrompt(env) {
@@ -589,11 +713,19 @@ function csv(value) {
 }
 
 function joinRows(rows) {
-  return rows.map((row) => row.content).join("\n---\n").slice(0, 3000) || "특이사항 없음";
+  return rows.map((row) =>
+    `${row.sender_name || "담당자 미상"} - ${row.summary || row.content.slice(0, 100)}
+액션: ${row.action_items || "없음"}
+마감: ${row.milestone_date || "없음"}`
+  ).join("\n---\n").slice(0, 3000) || "특이사항 없음";
 }
 
 function kstDate(ms) {
   return new Date(ms + 9 * 3600000).toISOString().slice(0, 10);
+}
+
+function kstDateStr() {
+  return kstDate(Date.now());
 }
 
 function textFromClaude(data) {
