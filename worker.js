@@ -238,11 +238,43 @@ async function ingestAndSummarize(env, msg, chatId, caption) {
     extracted = await extractDocumentText(env, url, fileName);
   }
 
-  const parsed = {
-    summary: (extracted.match(/핵심 요약:\s*([\s\S]*)/)?.[1] || extracted.slice(0, 200)).trim(),
-    action_items: (extracted.match(/의사결정사항:\s*([\s\S]*?)(?:\n핵심 요약:|$)/)?.[1] || "").trim(),
-    needs_escalation: /사장님|임원|리스크|보고 필요/.test(extracted) ? 1 : 0,
-  };
+  const [answer, storageJson] = await Promise.all([
+    callClaude(
+      env,
+      `SK하이닉스 6R전략실 권오혁 담당님 관점에서 분석.
+아래 양식으로만. 없는 항목은 없음. 마크다운 금지.
+
+일정: (캘린더에 넣을 날짜·마감)
+의사결정사항: (담당님 판단 필요 사항. 사장님 보고 여부 포함)
+핵심 요약: (2~3줄)
+
+문서:
+${extracted.slice(0, 6000)}`,
+      "",
+      MODEL_SMART
+    ),
+    callClaude(
+      env,
+      `아래 문서를 분석해서 JSON만 반환. 다른 말 없이 JSON만.
+{
+  "summary": "파일 제목과 핵심 내용 2줄. 나중에 검색할 때 쓸 키워드 포함.",
+  "action_items": "즉시 해야 할 것 1~3가지",
+  "needs_escalation": 0
+}
+
+문서:
+${extracted.slice(0, 3000)}`,
+      "",
+      MODEL_SMART
+    ),
+  ]);
+
+  let parsed;
+  try {
+    parsed = JSON.parse(storageJson.replace(/```json|```/g, "").trim());
+  } catch {
+    parsed = { summary: extracted.slice(0, 200), action_items: "", needs_escalation: 0 };
+  }
 
   await insertMessage(env, {
     msg,
@@ -254,7 +286,7 @@ async function ingestAndSummarize(env, msg, chatId, caption) {
     needs_escalation: parsed.needs_escalation || 0,
   });
 
-  return sendMessage(env, chatId, extracted);
+  return sendMessage(env, chatId, answer);
 }
 
 async function handleQuery(env, chatId, query) {
