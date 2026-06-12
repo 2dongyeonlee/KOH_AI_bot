@@ -238,19 +238,14 @@ async function ingestAndSummarize(env, msg, chatId, caption) {
     extracted = await extractDocumentText(env, url, fileName);
   }
 
-  const parsed = await parseForStorage(env, extracted, "");
-
   await insertMessage(env, {
     msg,
     content: extracted,
-    summary: parsed.summary,
-    action_items: parsed.action_items,
-    needs_escalation: parsed.needs_escalation,
     fileId,
     fileName,
   });
 
-  return sendMessage(env, chatId, formatActionBriefing(parsed));
+  return sendMessage(env, chatId, extracted);
 }
 
 async function handleQuery(env, chatId, query) {
@@ -320,23 +315,20 @@ function isComplexQuery(query, hasFile) {
 }
 
 async function parseForStorage(env, text, statusTag) {
-  const prompt = `아래 텍스트를 분석해서 JSON으로만 답해줘.
-다른 말 하지 말고 JSON만. 마크다운 코드블록도 없이 순수 JSON만.
+  const prompt = `아래 문서를 분석해서 JSON으로만 답해줘. 
+마크다운 없이 순수 JSON만.
+각 항목은 반드시 서로 다른 내용이어야 함.
+중복 금지.
 
 {
-  "summary": "핵심 내용 2~3줄. 담당자명 포함.",
-  "action_items": "다음 액션·의사결정·공유 필요사항. 없으면 빈 문자열.",
+  "summary": "문서 전체 핵심 2줄. 무엇에 관한 문서인지.",
+  "action_items": "담당자가 당장 해야 할 구체적 행동 1~3가지. 일정·의사결정·공유와 겹치지 않는 즉시 실행 사항만.",
   "needs_escalation": 0
 }
 
-needs_escalation 판단 기준 (1로 설정):
-- 사장님 보고/결재가 필요한 내용
-- 임원 공유가 필요한 중요 이슈
-- 대외 커뮤니케이션 방향 결정 필요
-- 리스크 또는 기회 요인 포함
+needs_escalation: 사장님 보고·임원 공유·리스크 포함 시 1.
 
-상태태그: ${statusTag || "없음"}
-텍스트: ${text.slice(0, 3000)}`;
+문서: ${text.slice(0, 3000)}`;
 
   const result = await callClaude(env, prompt, "", MODEL_SMART);
   try {
