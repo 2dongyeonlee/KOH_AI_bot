@@ -720,7 +720,11 @@ async function searchMemory(env, query) {
 }
 
 async function searchWeb(env, query) {
-  if (!env.TAVILY_API_KEY) return [];
+  if (!env.TAVILY_API_KEY) {
+    console.log("searchWeb: TAVILY_API_KEY 없음");
+    return [];
+  }
+  console.log("searchWeb 호출:", query);
   try {
     const res = await fetch("https://api.tavily.com/search", {
       method: "POST",
@@ -733,7 +737,9 @@ async function searchWeb(env, query) {
         include_answer: true,
       }),
     });
+    console.log("Tavily 응답 status:", res.status);
     const data = await res.json();
+    console.log("Tavily results:", data.results?.length || 0);
     return (data.results || []).map((result) => ({
       title: result.title,
       url: result.url,
