@@ -403,15 +403,15 @@ function normalizePersonName(name) {
 async function handleForwardRequest(env, chatId, query, request, msg) {
   const sender = senderName(msg?.from) || "사용자";
   const row = await env.DB.prepare(
-    `SELECT room_id FROM messages
+    `SELECT room_id, sender_name FROM messages
      WHERE sender_name LIKE ?
      AND room_id = sender_id
      LIMIT 1`
   ).bind(`%${request.recipient}%`).first();
 
   if (row?.room_id) {
-    await sendMessage(env, row.room_id, `${sender}님이 전달: ${request.content}`);
-    return sendMessage(env, chatId, "전달 완료");
+    await sendMessage(env, row.room_id, `${sender}님 전달\n\n${request.content}\n\n— ${sender} via KOH봇`);
+    return sendMessage(env, chatId, `${formatRecipientName(row.sender_name || request.recipient)}님께 전달 완료했습니다.`);
   }
 
   const known = await env.DB.prepare(
@@ -426,6 +426,12 @@ async function handleForwardRequest(env, chatId, query, request, msg) {
   }
 
   return sendMessage(env, chatId, "전달 불가. 직접 연락 부탁드립니다.");
+}
+
+function formatRecipientName(name) {
+  const normalized = normalizePersonName(name);
+  if (normalized === "이동연") return "이동연 TL";
+  return normalized;
 }
 
 async function getChatHistory(env, chatId) {
