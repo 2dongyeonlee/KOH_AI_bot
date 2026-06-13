@@ -25,6 +25,7 @@ const DEFAULT_SYSTEM_PROMPT =
 - 짧은 감탄사·칭찬·불만 표현에는 짧게 받아칠 것. 길게 설명하거나 되묻지 않는다.
 - 발신자 이름 확인 멘트 금지.
 - 구체적 요청 없으면 되묻지 말고 짧게 답하고 끝.
+- 다른 구성원에게 메시지 전달 기능이 있음. 단, DB에 chat_id가 있는 사람만 가능. 없으면 직접 연락 부탁드립니다.
 
 답변 형식:
 - 문장 끝 "~입니다" 금지. 단답·단어·명사형으로 끝낼 것.
@@ -37,8 +38,7 @@ const DEFAULT_SYSTEM_PROMPT =
 - HTML 태그 사용: <b>강조</b>
 
 외부 검색:
-- 외부 검색(Tavily)이 연동되어 있어 실시간 정보 검색이 가능하다.
-- 검색 불가, 인터넷 접근 불가라고 답하지 말 것.
+- Tavily 외부 검색이 연동되어 있어 실시간 정보 검색 가능.
 - 검색 결과가 있으면 그 내용을 답변에 포함하고 출처 URL 2개만 제공.`;
 
 const REPORT_BRIEFING_FORMAT = `아래 데이터를 기반으로 브리핑 작성.
@@ -150,7 +150,7 @@ async function handleMessage(env, msg) {
     /(안녕|ㅎㅇ|하이|반가|잘있|고마|감사|수고|어떻게|뭐야|뭐해)/.test(text);
 
   if (isQueryToBot(env, msg, text) || isShortGreeting) {
-    return handleQuery(env, chatId, cleanMention(text));
+    return handleQuery(env, chatId, cleanMention(text), msg);
   }
 
   // 나머지는 저장만 (응답 없음) — 이미 위에서 저장됨
@@ -308,9 +308,11 @@ ${extracted.slice(0, 3000)}`,
   return sendMessage(env, chatId, answer);
 }
 
-async function handleQuery(env, chatId, query) {
+async function handleQuery(env, chatId, query, msg = null) {
   if (!query) return sendMessage(env, chatId, "질문 내용을 입력해주세요.");
   if (/브리핑/.test(query)) return runReportBriefing(env, chatId);
+  const forwardRequest = parseForwardRequest(query);
+  if (forwardRequest) return handleForwardRequest(env, chatId, query, forwardRequest, msg);
 
   const hits = await searchMemory(env, query);
   const fileHit = hits
@@ -340,17 +342,22 @@ async function handleQuery(env, chatId, query) {
 
   let webResults = [];
   let webContext = "";
-  if (env.TAVILY_API_KEY) {
-    const results = await searchWeb(env, query);
-    if (results.length) {
+  if (env.TAVILY_API_KEY && hits.length < 3) {
+    webResults = await searchWeb(env, query);
+    console.log("Tavily fired:", webResults.length);
+    if (webResults.length) {
       webContext = "\n\n[외부 검색]\n" +
-        results.map(r => r.title + "\n" + r.snippet + "\n" + r.url).join("\n\n");
-      webResults = results;
+        webResults.map(r => r.title + "\n" + r.snippet + "\n" + r.url).join("\n\n");
     }
   }
 
   const systemPrompt = await getSystemPrompt(env);
+  const history = await getChatHistory(env, chatId);
+  const historyContext = history.length
+    ? history.map((item) => `사용자: ${item.q}\n답변: ${item.a}`).join("\n\n")
+    : "";
   const prompt = `
+${historyContext ? `직전 대화:\n${historyContext}\n\n` : ""}
 ${internalContext ? `내부 자료:\n${internalContext}\n\n` : ""}
 ${webContext}
 
@@ -374,7 +381,67 @@ ${webContext}
     });
   }
 
+  await saveChatHistory(env, chatId, query, answer);
   return sendMessage(env, chatId, answer);
+}
+
+function parseForwardRequest(query) {
+  const match = String(query || "").match(/([가-힣A-Za-z0-9_]{2,20}?)(?:님)?(?:에게|한테|님께)\s*(.*?)(전해줘|전달해줘|알려줘|말해줘)/);
+  if (!match) return null;
+  const recipient = normalizePersonName(match[1]);
+  const content = match[2].replace(/라고$/, "").trim() || "전달 요청";
+  return { recipient, content };
+}
+
+function normalizePersonName(name) {
+  return String(name || "")
+    .replace(/^@/, "")
+    .replace(/(팀장님|담당님|TL님|님)$/g, "")
+    .trim();
+}
+
+async function handleForwardRequest(env, chatId, query, request, msg) {
+  const sender = senderName(msg?.from) || "사용자";
+  const row = await env.DB.prepare(
+    `SELECT room_id FROM messages
+     WHERE sender_name LIKE ?
+     AND room_id = sender_id
+     LIMIT 1`
+  ).bind(`%${request.recipient}%`).first();
+
+  if (row?.room_id) {
+    await sendMessage(env, row.room_id, `${sender}님이 전달: ${request.content}`);
+    return sendMessage(env, chatId, "전달 완료");
+  }
+
+  const known = await env.DB.prepare(
+    `SELECT sender_name FROM messages
+     WHERE sender_name LIKE ?
+     ORDER BY datetime(created_at) DESC
+     LIMIT 1`
+  ).bind(`%${request.recipient}%`).first();
+
+  if (known?.sender_name && msg?.chat?.type !== "private") {
+    return sendMessage(env, chatId, `@${request.recipient} ${sender}님이 전달: ${request.content}`);
+  }
+
+  return sendMessage(env, chatId, "전달 불가. 직접 연락 부탁드립니다.");
+}
+
+async function getChatHistory(env, chatId) {
+  const historyKey = `history:${chatId}`;
+  try {
+    return JSON.parse((await env.PROMPT.get(historyKey)) || "[]").slice(-2);
+  } catch {
+    return [];
+  }
+}
+
+async function saveChatHistory(env, chatId, query, answer) {
+  const historyKey = `history:${chatId}`;
+  const history = await getChatHistory(env, chatId);
+  history.push({ q: String(query || "").slice(0, 500), a: String(answer || "").slice(0, 1000) });
+  await env.PROMPT.put(historyKey, JSON.stringify(history.slice(-2)));
 }
 
 function isComplexQuery(query, hasFile) {
