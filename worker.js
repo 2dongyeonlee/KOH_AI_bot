@@ -300,9 +300,17 @@ ${extracted.slice(0, 3000)}`,
 
 async function handleQuery(env, chatId, query) {
   if (!query) return sendMessage(env, chatId, "질문 내용을 입력해주세요.");
+  if (/브리핑/.test(query)) return runReportBriefing(env, chatId);
 
   const hits = await searchMemory(env, query);
-  const fileHit = hits.find((hit) => hit.file_id);
+  const fileHit = hits.find((hit) => {
+    if (!hit.file_id) return false;
+    const terms = query.split(/\s+/).filter((term) => term.length >= 2);
+    return terms.some((term) =>
+      (hit.file_name || "").toLowerCase().includes(term.toLowerCase()) ||
+      (hit.summary || "").includes(term)
+    );
+  });
 
   if (looksLikeFileRequest(query) && fileHit) {
     await sendDocument(
@@ -323,14 +331,14 @@ async function handleQuery(env, chatId, query) {
       ).join("\n\n").slice(0, 5000)
     : "";
 
-  const SEARCH_TRIGGERS =
-    /(동향|트렌드|최신|사례|정책|법안|발의|해외|글로벌|경쟁사|시장|여론|언론|뉴스)/;
+  let webResults = [];
   let webContext = "";
-  if (SEARCH_TRIGGERS.test(query) && env.TAVILY_API_KEY) {
+  if (env.TAVILY_API_KEY && hits.length < 3) {
     const results = await searchWeb(env, query);
     if (results.length) {
       webContext = "\n\n[외부 검색]\n" +
-        results.map((result) => `${result.title}\n${result.snippet}\n${result.url}`).join("\n\n");
+        results.map(r => r.title + "\n" + r.snippet + "\n" + r.url).join("\n\n");
+      webResults = results;
     }
   }
 
@@ -346,12 +354,18 @@ ${webContext}
 - 없는 내용은 만들지 않는다
 
 질문: ${query}`;
-  const answer = await callClaude(
+  let answer = await callClaude(
     env,
     prompt,
     systemPrompt,
     isComplexQuery(query, false) ? MODEL_SMART : MODEL_FAST
   );
+  if (webResults && webResults.length) {
+    answer += "\n\n출처";
+    webResults.forEach(r => {
+      answer += "\n• " + r.title + ": " + r.url;
+    });
+  }
 
   return sendMessage(env, chatId, answer);
 }
@@ -869,7 +883,7 @@ function cleanMention(text) {
 }
 
 function looksLikeFileRequest(query) {
-  return /(자료|파일|문서|보내|전달|찾아|올려|공유|링크)/.test(query);
+  return /(자료 보내|파일 보내|문서 보내|전달해|올려줘|공유해줘|보내줘|찾아서 줘|다운|다운로드)/.test(query);
 }
 
 function senderName(from) {

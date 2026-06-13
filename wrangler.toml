@@ -13,7 +13,7 @@ BRIEFING_CHAT_ID = "-5156923133,-4930893560"
 BOT_USERNAME = "KOH_AI_bot"
 
 [triggers]
-crons = ["0 23 * * *"]
+crons = ["0 0 * * 1-5"]
 
 # KOH_AI_bot 전용 D1 DB입니다. Cloudflare 표시 이름은 6r-ai-db 그대로 사용합니다.
 # dylee_ai_bot과 같은 database_id를 사용하면 안 됩니다.
