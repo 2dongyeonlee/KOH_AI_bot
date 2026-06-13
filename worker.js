@@ -303,14 +303,14 @@ async function handleQuery(env, chatId, query) {
   if (/브리핑/.test(query)) return runReportBriefing(env, chatId);
 
   const hits = await searchMemory(env, query);
-  const fileHit = hits.find((hit) => {
-    if (!hit.file_id) return false;
-    const terms = query.split(/\s+/).filter((term) => term.length >= 2);
-    return terms.some((term) =>
-      (hit.file_name || "").toLowerCase().includes(term.toLowerCase()) ||
+  const _terms = query.split(/\s+/).filter((term) => term.length >= 2);
+  const fileHit =
+    hits.find((hit) => hit.file_id && _terms.some((term) =>
+      (hit.file_name || "").toLowerCase().includes(term.toLowerCase())
+    )) ||
+    hits.find((hit) => hit.file_id && _terms.some((term) =>
       (hit.summary || "").includes(term)
-    );
-  });
+    ));
 
   if (looksLikeFileRequest(query) && fileHit) {
     await sendDocument(
@@ -333,7 +333,7 @@ async function handleQuery(env, chatId, query) {
 
   let webResults = [];
   let webContext = "";
-  if (env.TAVILY_API_KEY && hits.length < 3) {
+  if (env.TAVILY_API_KEY) {
     const results = await searchWeb(env, query);
     if (results.length) {
       webContext = "\n\n[외부 검색]\n" +
