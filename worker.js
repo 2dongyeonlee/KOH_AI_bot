@@ -34,7 +34,12 @@ const DEFAULT_SYSTEM_PROMPT =
   기준: 오늘 또는 D-1 이내
 - D-7 이내 마일스톤은 앞에 ⚠️ 표시.
 - 표(|---|) 사용 금지. 블릿으로 대체.
-- HTML 태그 사용: <b>강조</b>`;
+- HTML 태그 사용: <b>강조</b>
+
+외부 검색:
+- 외부 검색(Tavily)이 연동되어 있어 실시간 정보 검색이 가능하다.
+- 검색 불가, 인터넷 접근 불가라고 답하지 말 것.
+- 검색 결과가 있으면 그 내용을 답변에 포함하고 출처 URL 2개만 제공.`;
 
 const REPORT_BRIEFING_FORMAT = `아래 데이터를 기반으로 브리핑 작성.
 마크다운(#,**) 금지. * 금지(텔레그램 깨짐). 플레인 텍스트. 명사형.
@@ -303,14 +308,17 @@ async function handleQuery(env, chatId, query) {
   if (/브리핑/.test(query)) return runReportBriefing(env, chatId);
 
   const hits = await searchMemory(env, query);
-  const _terms = query.split(/\s+/).filter((term) => term.length >= 2);
-  const fileHit =
-    hits.find((hit) => hit.file_id && _terms.some((term) =>
-      (hit.file_name || "").toLowerCase().includes(term.toLowerCase())
-    )) ||
-    hits.find((hit) => hit.file_id && _terms.some((term) =>
-      (hit.summary || "").includes(term)
-    ));
+  const fileHit = hits.find(h => {
+    if (!h.file_id) return false;
+    const terms = query
+      .replace(/(자료|파일|문서|보내줘|찾아줘|공유|있나|있어|줘|해줘)/g, "")
+      .split(/\s+/)
+      .filter(t => t.length >= 2);
+    return terms.some(t =>
+      (h.file_name || "").toLowerCase().includes(t.toLowerCase()) ||
+      (h.summary || "").includes(t)
+    );
+  });
 
   if (looksLikeFileRequest(query) && fileHit) {
     await sendDocument(
@@ -362,7 +370,7 @@ ${webContext}
   );
   if (webResults && webResults.length) {
     answer += "\n\n출처";
-    webResults.forEach(r => {
+    webResults.slice(0, 2).forEach(r => {
       answer += "\n• " + r.title + ": " + r.url;
     });
   }
