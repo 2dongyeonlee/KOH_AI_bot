@@ -672,7 +672,9 @@ async function describeImage(env, imageUrl, caption) {
             },
             {
               type: "text",
-              text: `이미지 내용을 한국어로 설명하고, 글자나 수치가 보이면 그대로 읽어주세요.${caption ? ` 설명: ${caption}` : ""}`,
+              text: `이 이미지 내용을 한국어로 설명해줘.
+마크다운(#,*,**,##,###) 완전 금지. 플레인 텍스트만.
+글자·수치 있으면 그대로 읽어줘.${caption ? ` 설명: ${caption}` : ""}`,
             },
           ],
         },
