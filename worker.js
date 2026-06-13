@@ -249,7 +249,12 @@ async function ingestAndSummarize(env, msg, chatId, caption) {
     fileId = msg.document.file_id;
     fileName = msg.document.file_name || "file";
     const url = await getFileUrl(env, fileId);
-    extracted = await extractDocumentText(env, url, fileName);
+    if (/\.(jpe?g|png|webp|gif)$/i.test(fileName)) {
+      type = "image";
+      extracted = await describeImage(env, url, caption);
+    } else {
+      extracted = await extractDocumentText(env, url, fileName);
+    }
   }
 
   const [answer, storageJson] = await Promise.all([
@@ -308,17 +313,11 @@ async function handleQuery(env, chatId, query) {
   if (/브리핑/.test(query)) return runReportBriefing(env, chatId);
 
   const hits = await searchMemory(env, query);
-  const fileHit = hits.find(h => {
-    if (!h.file_id) return false;
-    const terms = query
-      .replace(/(자료|파일|문서|보내줘|찾아줘|공유|있나|있어|줘|해줘)/g, "")
-      .split(/\s+/)
-      .filter(t => t.length >= 2);
-    return terms.some(t =>
-      (h.file_name || "").toLowerCase().includes(t.toLowerCase()) ||
-      (h.summary || "").includes(t)
-    );
-  });
+  const fileHit = hits
+    .filter((hit) => hit.file_id)
+    .map((hit) => ({ hit, score: scoreFileHit(query, hit) }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score)[0]?.hit;
 
   if (looksLikeFileRequest(query) && fileHit) {
     await sendDocument(
@@ -569,8 +568,8 @@ async function callClaude(env, userText, system = "", model = MODEL_FAST) {
 
 async function describeImage(env, imageUrl, caption) {
   const imageResponse = await fetch(imageUrl);
-  const contentType = imageResponse.headers.get("content-type") || "image/jpeg";
   const buf = await imageResponse.arrayBuffer();
+  const contentType = detectImageMediaType(imageResponse.headers.get("content-type"), imageUrl, buf);
   let binary = "";
   const bytes = new Uint8Array(buf);
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
@@ -615,6 +614,23 @@ async function describeImage(env, imageUrl, caption) {
   }
 
   return textFromClaude(data) || "[이미지에서 내용을 추출하지 못했습니다]";
+}
+
+function detectImageMediaType(contentType, imageUrl, buf) {
+  const type = String(contentType || "").split(";")[0].toLowerCase();
+  if (["image/jpeg", "image/png", "image/webp", "image/gif"].includes(type)) return type;
+
+  const bytes = new Uint8Array(buf);
+  if (bytes[0] === 0xff && bytes[1] === 0xd8) return "image/jpeg";
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
+  if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return "image/gif";
+  if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) return "image/webp";
+
+  const lowerUrl = String(imageUrl || "").toLowerCase();
+  if (lowerUrl.includes(".png")) return "image/png";
+  if (lowerUrl.includes(".webp")) return "image/webp";
+  if (lowerUrl.includes(".gif")) return "image/gif";
+  return "image/jpeg";
 }
 
 async function extractDocumentText(env, fileUrl, fileName) {
@@ -736,11 +752,14 @@ async function insertMessage(env, options) {
 
 async function searchMemory(env, query) {
   const dateStr = normalizeDateQuery(query);
-  const terms = query.split(/\s+/).filter((term) => term.length >= 2).slice(0, 5);
+  const terms = searchTerms(query).slice(0, 6);
   if (!terms.length && !dateStr) return [];
 
-  const whereParts = terms.map(() => "content LIKE ?");
-  const binds = terms.map((term) => `%${term}%`);
+  const whereParts = terms.map(() => "(content LIKE ? OR summary LIKE ? OR file_name LIKE ? OR sender_name LIKE ?)");
+  const binds = terms.flatMap((term) => {
+    const like = `%${term}%`;
+    return [like, like, like, like];
+  });
   if (dateStr) {
     const [, month, day] = dateStr.match(/\d{4}-(\d{2})-(\d{2})/) || [];
     whereParts.push("milestone_date = ?");
@@ -759,6 +778,44 @@ async function searchMemory(env, query) {
   ).bind(...binds).all();
 
   return rows.results || [];
+}
+
+function searchTerms(query) {
+  const stopWords = /^(자료|파일|문서|보내|보내줘|주세요|전달|전달해|올려줘|공유해줘|찾아줘|다운|다운로드|있나|있어|보낸자료)$/;
+  const terms = String(query || "")
+    .split(/\s+/)
+    .map((term) => term.trim())
+    .filter(Boolean)
+    .flatMap((term) => {
+      const cleaned = term
+        .replace(/[?.!,。，]/g, "")
+        .replace(/(팀장님께서|담당님께서|TL님께서|팀장님이|담당님이|TL님이|팀장님|담당님|TL님|님께서|님이|님)$/g, "")
+        .replace(/(께서|에게서|한테서|이|가|은|는|을|를|의)$/g, "");
+      return [term, cleaned];
+    })
+    .filter((term) => term.length >= 2 && !stopWords.test(term));
+
+  return [...new Set(terms)];
+}
+
+function scoreFileHit(query, hit) {
+  const terms = searchTerms(query);
+  const fileName = String(hit.file_name || "").toLowerCase();
+  const summary = String(hit.summary || "");
+  const content = String(hit.content || "");
+  const sender = String(hit.sender_name || "");
+  let score = 0;
+
+  for (const term of terms) {
+    const lower = term.toLowerCase();
+    if (fileName.includes(lower)) score += 5;
+    if (sender.includes(term)) score += 4;
+    if (summary.includes(term)) score += 3;
+    if (content.includes(term)) score += 1;
+  }
+
+  if (/(자료|파일|문서|발표자료)/.test(query) && hit.file_id) score += 1;
+  return score;
 }
 
 function normalizeDateQuery(query) {
@@ -891,7 +948,7 @@ function cleanMention(text) {
 }
 
 function looksLikeFileRequest(query) {
-  return /(자료 보내|파일 보내|문서 보내|전달해|올려줘|공유해줘|보내줘|찾아서 줘|다운|다운로드)/.test(query);
+  return /((자료|파일|문서|발표자료).*(보내|전달|올려|공유|다운|다운로드|줘|주세요)|보내줘|전달해|올려줘|공유해줘|찾아서 줘|다운로드)/.test(query);
 }
 
 function senderName(from) {
