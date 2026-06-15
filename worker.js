@@ -1028,7 +1028,7 @@ async function handleReindex(env, chatId) {
       "AI 또는 Vectorize 미설정. wrangler.toml 확인 필요.");
   }
 
-  const CHUNK = 30;
+  const CHUNK = 150;
   let offset = Number((await env.PROMPT.get("reindex:offset")) || "0");
 
   let rows = [];
