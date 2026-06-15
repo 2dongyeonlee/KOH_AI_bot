@@ -130,6 +130,11 @@ async function handleMessage(env, msg) {
     return sendMessage(env, chatId, "반영했습니다.");
   }
 
+  // /reindex 명령 (기존 메시지 Vectorize 색인)
+  if (text === "/reindex") {
+    return handleReindex(env, chatId);
+  }
+
   // 파일/이미지 → 추출·저장·요약
   if (msg.document || (msg.photo && msg.photo.length)) {
     return ingestAndSummarize(env, msg, chatId, text);
@@ -788,8 +793,9 @@ async function insertMessage(env, options) {
     info_tag       = "",
   } = options;
 
+  let lastRowId = null;
   try {
-    await env.DB.prepare(`
+    const dbResult = await env.DB.prepare(`
       INSERT INTO messages (
         telegram_message_id, room_id, room_title,
         sender_id, sender_name, content,
@@ -815,17 +821,76 @@ async function insertMessage(env, options) {
       String(info_tag)
     ).run();
 
-    console.log("saved ok:", msg.chat?.id, 
+    lastRowId = dbResult?.meta?.last_row_id || null;
+    console.log("saved ok:", msg.chat?.id,
       msg.from?.first_name, String(content).slice(0, 30));
 
   } catch (e) {
     console.error("insertMessage FAILED:", e.message);
     console.error("chat:", JSON.stringify(msg.chat));
     console.error("from:", JSON.stringify(msg.from));
+    return null;
   }
+
+  // Vectorize 색인 (실패해도 저장은 유지)
+  if (lastRowId && env.AI && env.VECTORIZE) {
+    try {
+      const textToEmbed = [fileName, summary, content]
+        .filter(Boolean).join(" ").slice(0, 2000);
+      const vector = await embedText(env, textToEmbed);
+      if (vector) {
+        await env.VECTORIZE.upsert([{
+          id: String(lastRowId),
+          values: vector,
+          metadata: {
+            file_name: String(fileName || ""),
+            status_tag: String(statusTag || ""),
+          },
+        }]);
+        console.log("vectorized rowid:", lastRowId);
+      }
+    } catch (ve) {
+      console.error("vectorize upsert error:", ve.message);
+    }
+  }
+
+  return lastRowId;
 }
 
 async function searchMemory(env, query) {
+  // 1순위: Vectorize 시맨틱 검색
+  if (env.AI && env.VECTORIZE) {
+    try {
+      const qVec = await embedText(env, query);
+      if (qVec) {
+        const vr = await env.VECTORIZE.query(qVec, { topK: 8, returnMetadata: "all" });
+        const ids = (vr.matches || [])
+          .map(m => Number(m.id))
+          .filter(n => Number.isFinite(n) && n > 0);
+        if (ids.length > 0) {
+          const ph = ids.map(() => "?").join(",");
+          const rows = await env.DB.prepare(
+            `SELECT rowid, content, sender_name, summary, action_items,
+                    milestone_date, file_id, file_name
+             FROM messages WHERE rowid IN (${ph})
+             ORDER BY rowid DESC`
+          ).bind(...ids).all();
+          if (rows.results?.length > 0) {
+            console.log("Vectorize hit:", rows.results.length);
+            return rows.results;
+          }
+        }
+      }
+    } catch (e) {
+      console.error("Vectorize search error, falling back:", e.message);
+    }
+  }
+
+  // 2순위: D1 키워드 LIKE 검색
+  return likeSearch(env, query);
+}
+
+async function likeSearch(env, query) {
   const dateStr = normalizeDateQuery(query);
   const terms = searchTerms(query).slice(0, 6);
   if (!terms.length && !dateStr) return [];
@@ -845,7 +910,8 @@ async function searchMemory(env, query) {
   const where = whereParts.join(" OR ");
 
   const rows = await env.DB.prepare(
-    `SELECT content, sender_name, summary, action_items, milestone_date, file_id, file_name
+    `SELECT rowid, content, sender_name, summary, action_items,
+            milestone_date, file_id, file_name
      FROM messages
      WHERE (${where})
      ORDER BY datetime(created_at) DESC
@@ -933,6 +999,87 @@ function normalizeDateQuery(query) {
   if (m4) return `${m4[1]}-${String(m4[2]).padStart(2, "0")}-${String(m4[3]).padStart(2, "0")}`;
 
   return null;
+}
+
+async function embedText(env, text) {
+  if (!env.AI) return null;
+  try {
+    const result = await env.AI.run("@cf/baai/bge-m3", {
+      text: [String(text || "").slice(0, 2000)],
+    });
+    return result?.data?.[0] || null;
+  } catch (e) {
+    console.error("embedText error:", e.message);
+    return null;
+  }
+}
+
+async function handleReindex(env, chatId) {
+  if (!env.AI || !env.VECTORIZE) {
+    return sendMessage(env, chatId,
+      "AI 또는 Vectorize 미설정. wrangler.toml 확인 필요.");
+  }
+  await sendMessage(env, chatId, "색인 시작... (완료까지 잠시 대기)");
+
+  let offset = 0;
+  const batchSize = 10;
+  let totalIndexed = 0;
+  let errorCount = 0;
+  const maxRecords = 200;
+
+  while (offset < maxRecords) {
+    let batch = [];
+    try {
+      const rows = await env.DB.prepare(
+        `SELECT rowid, content, summary, file_name, status_tag
+         FROM messages ORDER BY rowid LIMIT ? OFFSET ?`
+      ).bind(batchSize, offset).all();
+      batch = rows.results || [];
+    } catch (e) {
+      console.error("reindex D1 query error:", e.message);
+      break;
+    }
+    if (!batch.length) break;
+
+    const vectors = [];
+    for (const row of batch) {
+      const txt = [row.file_name, row.summary, row.content]
+        .filter(Boolean).join(" ").slice(0, 2000);
+      try {
+        const v = await embedText(env, txt);
+        if (v) {
+          vectors.push({
+            id: String(row.rowid),
+            values: v,
+            metadata: {
+              file_name: String(row.file_name || ""),
+              status_tag: String(row.status_tag || ""),
+            },
+          });
+        }
+      } catch (e) {
+        errorCount++;
+        console.error("embed error row", row.rowid, e.message);
+      }
+    }
+
+    if (vectors.length > 0) {
+      try {
+        await env.VECTORIZE.upsert(vectors);
+        totalIndexed += vectors.length;
+      } catch (e) {
+        errorCount += vectors.length;
+        console.error("vectorize batch upsert error:", e.message);
+      }
+    }
+
+    offset += batchSize;
+    if (batch.length < batchSize) break;
+  }
+
+  return sendMessage(env, chatId,
+    `색인 완료\n• 처리: ${totalIndexed}건\n• 오류: ${errorCount}건\n` +
+    (offset >= maxRecords ? `• 200건 초과 시 /reindex 재실행` : ""));
 }
 
 async function searchWeb(env, query) {

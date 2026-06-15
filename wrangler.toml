@@ -26,3 +26,10 @@ database_id = "d55c7eaa-ef2e-40e5-8283-a50008dc5fb2"
 binding = "PROMPT"
 id = "3e6133b2fefd4c1088e14baed49fcd1e"
 preview_id = "3e6133b2fefd4c1088e14baed49fcd1e"
+
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "6r-ai-vectors"
+
+[ai]
+binding = "AI"
