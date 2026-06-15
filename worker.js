@@ -219,18 +219,6 @@ ${parsed.summary}
     }
   }
 
-  if (parsed.needs_escalation === 1) {
-    const chatIds = (env.BRIEFING_CHAT_ID || "").split(",").filter(Boolean);
-    for (const id of chatIds) {
-      await sendMessage(
-        env,
-        id,
-        `[사장님 보고 검토] ${msg.from?.first_name || ""}님 보고
-${parsed.summary}
-판단 필요: ${parsed.action_items || "확인이 필요합니다"}`
-      );
-    }
-  }
 }
 
 async function ingestAndSummarize(env, msg, chatId, caption) {
@@ -527,7 +515,7 @@ async function runReportBriefing(env) {
 
   const rows = (
     await env.DB.prepare(
-      `SELECT content, sender_name, summary, action_items, status_tag, milestone_date, created_at,
+      `SELECT content, sender_name, summary, action_items, needs_escalation, status_tag, milestone_date, created_at,
         CASE
           WHEN milestone_date >= date('now') AND milestone_date <= date('now', '+7 days') THEN 1
           ELSE 0
@@ -549,13 +537,14 @@ async function runReportBriefing(env) {
   );
   const shares = rows.filter((row) => row.status_tag === "#공유" && row.is_recent);
   const fups = rows.filter((row) => row.status_tag === "#Fup" && row.is_recent);
+  const decisions = rows.filter((row) => row.needs_escalation === 1 && row.is_recent);
 
   const output = await callClaude(
     env,
     `오늘 날짜: ${today}
 ${REPORT_BRIEFING_FORMAT}
 
-긴급(오늘·D-1)은 🚨, D-7 이내는 ⚠️ 표시.
+긴급(오늘·D-1)은 🔔, D-7 이내는 📅 표시.
 표 금지. 블릿포인트(•)만 사용.
 담당자명 반드시 포함. 명사형으로 끝낼 것.
 
@@ -564,6 +553,9 @@ ${joinRows(schedules)}
 
 === [보고] ===
 ${joinRows(reports)}
+
+=== [의사결정] ===
+${joinRows(decisions)}
 
 === [공유] ===
 ${joinRows(shares)}
