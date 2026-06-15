@@ -309,9 +309,74 @@ ${extracted.slice(0, 3000)}`,
     `<b>${fileName || "파일"}</b> 저장 완료.`);
 }
 
+async function handleScheduleQuery(env, chatId, query) {
+  const dateStr = normalizeDateQuery(query);
+  const now = new Date(Date.now() + 9 * 3600000);
+  const today = now.toISOString().slice(0, 10);
+
+  let fromDate, toDate;
+  if (/(오늘|today)/.test(query)) {
+    fromDate = today; toDate = today;
+  } else if (/(내일|tomorrow)/.test(query)) {
+    const d = new Date(now); d.setDate(d.getDate() + 1);
+    fromDate = toDate = d.toISOString().slice(0, 10);
+  } else if (dateStr) {
+    fromDate = toDate = dateStr;
+  } else {
+    fromDate = today;
+    const d = new Date(now); d.setDate(d.getDate() + 7);
+    toDate = d.toISOString().slice(0, 10);
+  }
+
+  const rows = (await env.DB.prepare(
+    `SELECT sender_name, summary, content, milestone_date
+     FROM messages
+     WHERE (
+       status_tag = '#일정'
+       OR (milestone_date >= ? AND milestone_date <= ?)
+       OR content LIKE '%회의%' OR content LIKE '%미팅%'
+       OR content LIKE '%행사%' OR content LIKE '%발표%'
+       OR content LIKE '%기공식%' OR content LIKE '%보고회%'
+     )
+     AND (milestone_date IS NULL OR milestone_date >= ?)
+     ORDER BY milestone_date ASC, created_at DESC
+     LIMIT 20`
+  ).bind(fromDate, toDate, fromDate).all()).results || [];
+
+  if (!rows.length) {
+    return sendMessage(env, chatId,
+      "등록된 일정이 없습니다.\n텔레그램방에 #일정 태그로 공유 부탁드립니다.");
+  }
+
+  const DAY = ["일", "월", "화", "수", "목", "금", "토"];
+  const lines = rows.map((row) => {
+    let prefix = "";
+    if (row.milestone_date) {
+      const d = new Date(row.milestone_date + "T00:00:00+09:00");
+      const mm = String(d.getMonth() + 1).padStart(2, "0");
+      const dd = String(d.getDate()).padStart(2, "0");
+      const dow = DAY[d.getDay()];
+      prefix = `${mm}/${dd}(${dow}) / `;
+    }
+    const title = (row.summary || row.content || "").split("\n")[0].slice(0, 60);
+    const sender = row.sender_name ? ` / ${row.sender_name}` : "";
+    return `• ${prefix}${title}${sender}`;
+  });
+
+  const header = /(오늘|today)/.test(query) ? "오늘 일정"
+    : /(내일|tomorrow)/.test(query) ? "내일 일정"
+    : "이번주 주요 일정";
+
+  return sendMessage(env, chatId, `${header}\n\n${lines.join("\n")}`);
+}
+
 async function handleQuery(env, chatId, query, msg = null) {
   if (!query) return sendMessage(env, chatId, "질문 내용을 입력해주세요.");
   if (/브리핑/.test(query)) return runReportBriefing(env, chatId);
+  if (/(일정|스케줄|이번주.*(뭐|있)|오늘.*(뭐|있)|내일.*(뭐|있)|회의|행사).*(있|뭐|알려|정리|보여)?/.test(query)
+      && !/브리핑/.test(query)) {
+    return handleScheduleQuery(env, chatId, query);
+  }
   const forwardRequest = parseForwardRequest(query);
   if (forwardRequest) return handleForwardRequest(env, chatId, query, forwardRequest, msg);
 
