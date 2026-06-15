@@ -17,7 +17,7 @@
 const ACCOUNT_ID    = process.env.CLOUDFLARE_ACCOUNT_ID;
 const API_TOKEN     = process.env.CLOUDFLARE_API_TOKEN;
 const D1_DB_ID      = "d55c7eaa-ef2e-40e5-8283-a50008dc5fb2";
-const VECTORIZE_IDX = "6r-ai-vectors";
+const VECTORIZE_IDX = "koh-ai-vectors";
 const AI_MODEL      = "@cf/baai/bge-m3";
 const BATCH_SIZE    = 10;
 

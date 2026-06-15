@@ -29,7 +29,7 @@ preview_id = "3e6133b2fefd4c1088e14baed49fcd1e"
 
 [[vectorize]]
 binding = "VECTORIZE"
-index_name = "6r-ai-vectors"
+index_name = "koh-ai-vectors"
 
 [ai]
 binding = "AI"
