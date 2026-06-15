@@ -116,6 +116,13 @@ async function handleMessage(env, msg) {
   // 봇 자신 메시지 무시
   if (msg.from && String(msg.from.id) === botToken) return;
 
+  // 중복 메시지 처리 방지 (텔레그램 재시도 대응)
+  const updateId = String(msg?.message_id || "");
+  const msgKey = `msg:${msg.chat?.id}:${updateId}`;
+  const already = await env.PROMPT.get(msgKey);
+  if (already) return;
+  await env.PROMPT.put(msgKey, "1", { expirationTtl: 60 });
+
   // /설정 명령
   if (text.startsWith("/설정")) {
     const instruction = text.replace("/설정", "").trim();
@@ -293,7 +300,8 @@ ${extracted.slice(0, 3000)}`,
     needs_escalation: parsed.needs_escalation || 0,
   });
 
-  return sendMessage(env, chatId, answer);
+  return sendMessage(env, chatId,
+    `<b>${fileName || "파일"}</b> 저장 완료.`);
 }
 
 async function handleQuery(env, chatId, query, msg = null) {
