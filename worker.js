@@ -343,7 +343,10 @@ async function handleQuery(env, chatId, query, msg = null) {
 
   let webResults = [];
   let webContext = "";
-  if (env.TAVILY_API_KEY && hits.length < 3) {
+  const isInternalQuery = /(일정|스케줄|회의|미팅|행사|보고|자료|파일|문서|브리핑|우리|사내|내부|팀|담당|사장|이번주|오늘|내일|이번달)/.test(query);
+  const isExternalQuery = /(뉴스|기사|최신|동향|시장|경쟁사|업계|주가|환율|발표했|출시|보도)/.test(query);
+  const webAllowed = env.TAVILY_API_KEY && !isInternalQuery && (isExternalQuery || hits.length < 2);
+  if (webAllowed) {
     webResults = await searchWeb(env, query);
     console.log("Tavily fired:", webResults.length);
     if (webResults.length) {
@@ -1117,6 +1120,11 @@ async function searchWeb(env, query) {
         search_depth: "basic",
         max_results: 5,
         include_answer: true,
+        exclude_domains: [
+          "instagram.com", "facebook.com", "tiktok.com",
+          "youtube.com", "x.com", "twitter.com", "pinterest.com",
+          "threads.net", "blog.naver.com",
+        ],
       }),
     });
     console.log("Tavily 응답 status:", res.status);
