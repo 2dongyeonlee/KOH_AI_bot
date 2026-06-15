@@ -381,19 +381,31 @@ async function handleQuery(env, chatId, query, msg = null) {
   if (forwardRequest) return handleForwardRequest(env, chatId, query, forwardRequest, msg);
 
   const hits = await searchMemory(env, query);
-  const fileHit = hits
-    .filter((hit) => hit.file_id)
-    .map((hit) => ({ hit, score: scoreFileHit(query, hit) }))
-    .filter((item) => item.score > 0)
-    .sort((a, b) => b.score - a.score)[0]?.hit;
 
-  if (looksLikeFileRequest(query) && fileHit) {
-    await sendDocument(
-      env,
-      chatId,
-      fileHit.file_id,
-      `요청하신 자료입니다. ${fileHit.file_name || ""}`.trim()
-    );
+  // 파일 요청: 상위 3개 전송 후 종료 (LLM 답변 추가 없음)
+  if (looksLikeFileRequest(query)) {
+    const seen = new Set();
+    const fileHits = hits
+      .filter((h) => h.file_id)
+      .map((h) => ({ hit: h, score: scoreFileHit(query, h) }))
+      .filter((i) => i.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .filter((i) => {
+        const key = i.hit.file_name || i.hit.file_id;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .slice(0, 3)
+      .map((i) => i.hit);
+
+    if (fileHits.length) {
+      for (const fh of fileHits) {
+        await sendDocument(env, chatId, fh.file_id,
+          `요청하신 자료입니다. ${fh.file_name || ""}`.trim());
+      }
+      return;
+    }
   }
 
   const internalContext = hits.length
