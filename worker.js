@@ -1002,84 +1002,103 @@ function normalizeDateQuery(query) {
 }
 
 async function embedText(env, text) {
-  if (!env.AI) return null;
+  const vecs = await embedBatch(env, [String(text || "")]);
+  return vecs[0] || null;
+}
+
+// 여러 텍스트를 한 번의 AI 호출로 임베딩 (서브요청 절감)
+async function embedBatch(env, texts) {
+  if (!env.AI || !texts.length) return [];
   try {
     const result = await env.AI.run("@cf/baai/bge-m3", {
-      text: [String(text || "").slice(0, 2000)],
+      text: texts.map((t) => String(t || "").slice(0, 2000)),
     });
-    return result?.data?.[0] || null;
+    return result?.data || [];
   } catch (e) {
-    console.error("embedText error:", e.message);
-    return null;
+    console.error("embedBatch error:", e.message);
+    return [];
   }
 }
 
+// 커서 기반 청크 색인. 한 번에 CHUNK건만 처리하고 진행 위치를 KV에 저장.
+// 200건 넘는 경우에도 /reindex 를 반복 전송하면 이어서 색인된다.
 async function handleReindex(env, chatId) {
   if (!env.AI || !env.VECTORIZE) {
     return sendMessage(env, chatId,
       "AI 또는 Vectorize 미설정. wrangler.toml 확인 필요.");
   }
-  await sendMessage(env, chatId, "색인 시작... (완료까지 잠시 대기)");
 
-  let offset = 0;
-  const batchSize = 10;
-  let totalIndexed = 0;
-  let errorCount = 0;
-  const maxRecords = 200;
+  const CHUNK = 30;
+  let offset = Number((await env.PROMPT.get("reindex:offset")) || "0");
 
-  while (offset < maxRecords) {
-    let batch = [];
+  let rows = [];
+  try {
+    const r = await env.DB.prepare(
+      `SELECT rowid, content, summary, file_name, status_tag
+       FROM messages ORDER BY rowid LIMIT ? OFFSET ?`
+    ).bind(CHUNK, offset).all();
+    rows = r.results || [];
+  } catch (e) {
+    console.error("reindex D1 query error:", e.message);
+    return sendMessage(env, chatId, "D1 조회 오류: " + e.message);
+  }
+
+  if (!rows.length) {
+    await env.PROMPT.delete("reindex:offset");
+    return sendMessage(env, chatId,
+      offset > 0
+        ? `색인 완료. 총 ${offset}건 색인됨.`
+        : "색인할 데이터가 없습니다.");
+  }
+
+  const texts = rows.map((row) =>
+    [row.file_name, row.summary, row.content].filter(Boolean).join(" "));
+
+  // 청크 안에서 10건씩 나눠 임베딩 (모델 배치 한도 회피)
+  const SUB = 10;
+  const embeddings = [];
+  for (let i = 0; i < texts.length; i += SUB) {
+    const part = await embedBatch(env, texts.slice(i, i + SUB));
+    for (let j = 0; j < part.length; j++) embeddings[i + j] = part[j];
+  }
+
+  let indexed = 0;
+  let errors = 0;
+  const vectors = rows.map((row, i) => ({
+    id: String(row.rowid),
+    values: embeddings[i],
+    metadata: {
+      file_name: String(row.file_name || ""),
+      status_tag: String(row.status_tag || ""),
+    },
+  })).filter((v) => Array.isArray(v.values) && v.values.length > 0);
+
+  errors = rows.length - vectors.length;
+
+  if (vectors.length > 0) {
     try {
-      const rows = await env.DB.prepare(
-        `SELECT rowid, content, summary, file_name, status_tag
-         FROM messages ORDER BY rowid LIMIT ? OFFSET ?`
-      ).bind(batchSize, offset).all();
-      batch = rows.results || [];
+      await env.VECTORIZE.upsert(vectors);
+      indexed = vectors.length;
     } catch (e) {
-      console.error("reindex D1 query error:", e.message);
-      break;
+      errors += vectors.length;
+      indexed = 0;
+      console.error("vectorize upsert error:", e.message);
     }
-    if (!batch.length) break;
+  }
 
-    const vectors = [];
-    for (const row of batch) {
-      const txt = [row.file_name, row.summary, row.content]
-        .filter(Boolean).join(" ").slice(0, 2000);
-      try {
-        const v = await embedText(env, txt);
-        if (v) {
-          vectors.push({
-            id: String(row.rowid),
-            values: v,
-            metadata: {
-              file_name: String(row.file_name || ""),
-              status_tag: String(row.status_tag || ""),
-            },
-          });
-        }
-      } catch (e) {
-        errorCount++;
-        console.error("embed error row", row.rowid, e.message);
-      }
-    }
+  const newOffset = offset + rows.length;
+  await env.PROMPT.put("reindex:offset", String(newOffset), { expirationTtl: 3600 });
 
-    if (vectors.length > 0) {
-      try {
-        await env.VECTORIZE.upsert(vectors);
-        totalIndexed += vectors.length;
-      } catch (e) {
-        errorCount += vectors.length;
-        console.error("vectorize batch upsert error:", e.message);
-      }
-    }
-
-    offset += batchSize;
-    if (batch.length < batchSize) break;
+  const done = rows.length < CHUNK;
+  if (done) {
+    await env.PROMPT.delete("reindex:offset");
+    return sendMessage(env, chatId,
+      `색인 완료\n• 이번: ${indexed}건 (오류 ${errors})\n• 누계: ${newOffset}건`);
   }
 
   return sendMessage(env, chatId,
-    `색인 완료\n• 처리: ${totalIndexed}건\n• 오류: ${errorCount}건\n` +
-    (offset >= maxRecords ? `• 200건 초과 시 /reindex 재실행` : ""));
+    `색인 진행 중: ${indexed}건 (오류 ${errors})\n누계 ${newOffset}건\n` +
+    `계속하려면 /reindex 다시 전송`);
 }
 
 async function searchWeb(env, query) {
