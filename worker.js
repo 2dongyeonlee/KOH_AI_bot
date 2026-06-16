@@ -412,11 +412,15 @@ async function handleScheduleQuery(env, chatId, query) {
     toDate = d.toISOString().slice(0, 10);
   }
 
-  // 특정 날짜(오늘/내일) → milestone_date 필수. 범위(이번주) → 최근 2주 이내 NULL 허용
+  // 특정 날짜 → milestone_date 일치. 단 '오늘'은 날짜 미상의 최근 항목(3일내)도 포함.
+  // 범위(이번주) → 최근 2주 이내 날짜 미상 항목 포함.
   const isSpecificDate = fromDate === toDate;
-  const dateCondition = isSpecificDate
-    ? "milestone_date >= ? AND milestone_date <= ?"
-    : "(milestone_date >= ? AND milestone_date <= ?) OR (milestone_date IS NULL AND created_at >= datetime('now', '-14 days'))";
+  const isTodayQuery   = isSpecificDate && fromDate === today;
+  const dateCondition = !isSpecificDate
+    ? "(milestone_date >= ? AND milestone_date <= ?) OR (milestone_date IS NULL AND created_at >= datetime('now', '-14 days'))"
+    : isTodayQuery
+      ? "(milestone_date >= ? AND milestone_date <= ?) OR (milestone_date IS NULL AND created_at >= datetime('now', '-3 days'))"
+      : "milestone_date >= ? AND milestone_date <= ?";
 
   const rows = (await env.DB.prepare(
     `SELECT sender_name, summary, content, milestone_date, status_tag, MIN(rowid) AS rid
