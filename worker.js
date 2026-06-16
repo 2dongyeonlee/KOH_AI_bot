@@ -47,43 +47,47 @@ const DEFAULT_SYSTEM_PROMPT =
 - 봇 주인(권오혁 담당님)에게는 정중하게 답변.
 - 그 외 사람에게는 간결하고 직접적으로 답변.`;
 
-const REPORT_BRIEFING_FORMAT = `아래 데이터를 기반으로 브리핑 작성.
-마크다운(#,**) 금지. * 금지(텔레그램 깨짐). 플레인 텍스트.
-HTML 태그 사용 필수: 과제·업무명은 <b>굵게</b>, 담당자명은 <u>밑줄</u>.
+const REPORT_BRIEFING_FORMAT = `
+브리핑 작성 규칙:
+- 마크다운(#, **, __) 금지. 플레인 텍스트.
+- 이모지는 섹션 기호만 허용 (📅 📌 🔔 💡 📋).
+- 각 항목은 반드시 2줄: 메인줄(•) + 컨텍스트줄(└).
+- 메인줄: • [날짜/D-N] 제목 또는 핵심 / 담당자
+- 컨텍스트줄:  └ 핵심 배경·현황·액션 20자 이내
+- 없는 항목은 섹션 전체 생략 (특이사항 없음도 쓰지 말 것).
+- 날짜 형식: 오늘이면 [6/16], 내일이면 [6/17] 식으로 숫자만.
 
-[자연 대화 원문]을 읽고, 업무 관련 내용을 아래 섹션에 자동 분류해서 추가:
-- 일정/약속 → 📌 주요 일정에 추가
-- 보고/마감 → 🔔 보고에 추가
-- 의사결정 필요 → 💡 의사결정 필요에 추가
-- 그 외 업무 관련 → 📋 주요 내용에 추가
-잡담·인사·단순 확인은 제외.
+출력 양식:
 
-양식:
+📅 YYYY-MM-DD Daily Briefing
 
-📅 YYYY-MM-DD 아침 브리핑
+📌 주요 일정
+• [MM/DD] 회의·행사명 / 담당자
+ └ 핵심 안건 또는 준비사항 20자 이내
 
-📌 주요 일정 (회의 참석 / 행사, D+2 이내)
-• [오늘] MM/DD(요일) / <b>회의·행사명</b> / <u>담당자</u>
- └ 주요 내용 1줄 (있을 때만)
-(오늘 건은 앞에 [오늘] 표시. 없으면 특이사항 없음)
-
-🔔 보고 (D+2 이내 + 최근 3일)
-• [오늘] <b>업무명</b> / <u>담당자</u>
- └ 현황 1줄 (있을 때만)
-규칙:
-- D-0·D-1이면 [오늘]/[내일] 표시, 날짜 표기 생략
-- D-2이면 "(MM/DD)" 간략히 표기
-- 날짜 가까운 순. 없으면 특이사항 없음.
+🔔 보고
+• [D-0] 보고명 / 보고자
+ └ 보고 핵심 내용 또는 필요 액션
+• [D-N] 보고명 / 보고자
+ └ 핵심 내용
+• (MM/DD) 보고명 / 담당자
+ └ 핵심 내용
 
 💡 의사결정 필요
-• <b>업무명</b> / 판단 필요 사항 / <u>담당자</u>
- └ 배경 1줄 (있을 때만)
-(없으면 특이사항 없음)
+• 의사결정 사항 / 담당자
+ └ 배경 또는 기한
 
 📋 주요 내용
-• [방이름] <u>담당자</u> / <b>핵심내용 1줄</b>
- └ 보충 내용 (있을 때만)
-(#공유·#Fup 태그 항목 + 자연 대화방 업무 내용 통합. 최근 3일. 없으면 특이사항 없음)`;
+• [방이름] 담당자 / 공유 핵심 한줄
+ └ 상세 내용 또는 후속 필요사항
+
+D-N 계산 규칙:
+- milestone_date가 오늘 = [D-0]
+- milestone_date가 내일 = [D-1]
+- milestone_date가 2~3일 후 = [D-2], [D-3]
+- milestone_date가 4일 이상 = (MM/DD) 형식으로 날짜 표기
+- milestone_date 없으면 날짜 표기 없이 항목명만
+`;
 
 const INFO_BRIEFING_FORMAT = `정보방 내용을 한국어로 요약하세요.
 없는 항목은 특이사항 없음. 마크다운·이모티콘 금지. 플레인 텍스트.
@@ -786,41 +790,36 @@ async function runReportBriefing(env, replyChatId = null) {
      LIMIT 80`
   ).all()).results || [];
   const rawContext = rawMsgs
-    .map(r => `[${r.room_title || "DM"}] ${r.sender_name || ""}: ${r.summary || (r.content || "").slice(0, 100)}`)
+    .map(r => {
+      const room   = r.room_title ? `[${r.room_title}]` : "[DM]";
+      const sender = r.sender_name || "";
+      const body   = r.summary || (r.content || "").slice(0, 120);
+      return `${room} ${sender} / ${body}`;
+    })
     .join("\n").slice(0, 4000);
 
   const taggedContext = [
-    `=== [일정] ===\n${joinRows(schedules)}`,
-    `=== [보고] ===\n${joinRows(reports)}`,
-    `=== [의사결정] ===\n${joinRows(decisions)}`,
-    `=== [주요내용(태그)] ===\n${joinRows(highlights)}`,
-  ].join("\n\n");
+    `[일정]\n${joinRows(schedules)}`,
+    `[보고]\n${joinRows(reports)}`,
+    `[의사결정]\n${joinRows(decisions)}`,
+    `[주요내용(태그)]\n${joinRows(highlights)}`,
+  ].filter(s => !s.endsWith("\n")).join("\n\n");
 
   const output = await callClaude(
     env,
     `오늘 날짜: ${today}
 ${REPORT_BRIEFING_FORMAT}
 
-표 금지. 블릿포인트(•)만 사용.
-담당자명 반드시 포함. 명사형으로 끝낼 것.
-
 === [태그 항목] ===
 ${taggedContext}
 
-=== [자연 대화 원문] ===
-아래 내용을 읽고 업무 관련 항목을 정확히 분류해서
-위의 해당 섹션(📌일정 / 🔔보고 / 💡의사결정 / 📋주요내용)에 추가하라.
-
-분류 기준:
-- 날짜 + 회의/행사 언급 → 📌 주요 일정에 추가
-  예: "6월 16일 검토 회의" → 📌에 "06/16(화) 검토 회의"
-- "보고", "보고드림", "결재", "제출" + 날짜 → 🔔 보고에 추가
-  예: "사고 관련 Comm 고도화 보고" → 🔔에 추가
-- "결정 필요", "확인 요청", "승인", "어떻게 할지" → 💡 의사결정에 추가
-- 그 외 업무 관련 정보 공유 → 📋 주요 내용에 추가
-- 봇에게 하는 질문, 잡담, 인사 → 제외
-
-중복 금지: 이미 태그 항목에 있는 내용은 다시 넣지 말 것.
+=== [주요 내용 원문] ===
+아래 내용을 읽고 업무 관련 항목만:
+- 일정/보고/의사결정이면 해당 섹션에 추가
+- 그 외는 📋 주요 내용에:
+  • [방이름] 담당자 / 핵심 한줄
+   └ 상세 또는 후속 필요사항
+봇에게 한 질문, 잡담, 인사 제외. 중복 금지.
 ${rawContext || "없음"}`,
     "",
     MODEL_SMART
@@ -1557,12 +1556,28 @@ function csv(value) {
   return String(value || "").split(",").map((item) => item.trim()).filter(Boolean);
 }
 
+function calcDday(dateStr) {
+  if (!dateStr) return "";
+  const target = new Date(dateStr + "T00:00:00+09:00");
+  const now    = new Date(Date.now() + 9 * 3600000);
+  const diff   = Math.ceil((target - now) / 86400000);
+  if (diff === 0) return "[D-0]";
+  if (diff > 0 && diff <= 3) return `[D-${diff}]`;
+  if (diff < 0) return `[D+${Math.abs(diff)}]`;
+  const m = target.getMonth() + 1;
+  const d = target.getDate();
+  return `(${m}/${d})`;
+}
+
 function joinRows(rows) {
-  return rows.map((row) =>
-    `${row.sender_name || "담당자 미상"} - ${row.summary || row.content.slice(0, 100)}
-액션: ${row.action_items || "없음"}
-마감: ${row.milestone_date || "없음"}`
-  ).join("\n---\n").slice(0, 3000) || "특이사항 없음";
+  if (!rows.length) return "";
+  return rows.map((row) => {
+    const room   = row.room_title ? `[${row.room_title}]` : "";
+    const dday   = calcDday(row.milestone_date);
+    const sender = row.sender_name || "담당자 미상";
+    const body   = row.summary || (row.content || "").slice(0, 120);
+    return [room, dday, sender, body].filter(Boolean).join(" / ");
+  }).join("\n").slice(0, 3000);
 }
 
 function kstDate(ms) {
