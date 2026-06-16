@@ -606,10 +606,24 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
         const senderLabel = fh.sender_name ? `${fh.sender_name} 공유` : "";
         const attr = [roomLabel, senderLabel].filter(Boolean).join(" / ");
         const caption = `요청하신 자료입니다.${attr ? ` (${attr})` : ""}\n${fh.file_name || ""}`.trim();
-        const result = await sendDocument(env, chatId, fh.file_id, caption);
+        let result = await sendDocument(env, chatId, fh.file_id, caption);
+        // file_id 실패 시 원본 방에서 copyMessage 폴백
+        if (!result?.ok && fh.room_id && fh.telegram_message_id) {
+          result = await copyMessage(env, chatId, fh.room_id, fh.telegram_message_id);
+          if (result?.ok) {
+            await sendMessage(env, chatId, caption);
+          }
+        }
         if (!result?.ok) {
-          await sendMessage(env, chatId,
-            `<b>${fh.file_name || "파일"}</b> 전송 실패.\n파일이 만료됐거나 접근할 수 없습니다.${attr ? ` (${attr})` : ""}`);
+          // 파일·복사 모두 실패 시 저장된 내용(요약/원문) 텍스트로 제공
+          const body = (fh.summary || fh.content || "").slice(0, 600).trim();
+          if (body) {
+            await sendMessage(env, chatId,
+              `파일 직접 전송은 실패했지만 내용을 공유합니다.${attr ? ` (${attr})` : ""}\n<b>${fh.file_name || ""}</b>\n\n${body}`);
+          } else {
+            await sendMessage(env, chatId,
+              `<b>${fh.file_name || "파일"}</b> 전송 실패. 파일을 다시 업로드해 주세요.${attr ? ` (${attr})` : ""}`);
+          }
         }
       }
       await saveChatHistory(env, chatId, query,
@@ -1365,7 +1379,7 @@ async function searchFiles(env, query) {
   const terms = searchTerms(query).slice(0, 6);
   if (!terms.length) {
     const r = await env.DB.prepare(
-      `SELECT rowid, content, sender_name, summary, milestone_date, file_id, file_name, room_title
+      `SELECT rowid, content, sender_name, summary, milestone_date, file_id, file_name, room_title, telegram_message_id, room_id
        FROM messages
        WHERE file_id IS NOT NULL AND file_id != ''
        ORDER BY created_at DESC LIMIT 20`
@@ -1379,7 +1393,7 @@ async function searchFiles(env, query) {
     return [like, like, like];
   });
   const r = await env.DB.prepare(
-    `SELECT rowid, content, sender_name, summary, milestone_date, file_id, file_name, room_title
+    `SELECT rowid, content, sender_name, summary, milestone_date, file_id, file_name, room_title, telegram_message_id, room_id
      FROM messages
      WHERE file_id IS NOT NULL AND file_id != ''
        AND (${whereParts.join(" OR ")})
@@ -1752,6 +1766,27 @@ async function sendDocument(env, chatId, fileId, caption) {
     console.error("sendDocument FAILED:", data.error_code, data.description, "file_id:", fileId);
   }
   return data;
+}
+
+// 원본 방에서 메시지를 복사 전송 (file_id 무효 시 폴백)
+async function copyMessage(env, chatId, fromChatId, messageId) {
+  try {
+    const res = await fetch(`${telegramApi(env)}/copyMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        from_chat_id: fromChatId,
+        message_id: Number(messageId),
+      }),
+    });
+    const data = await res.json();
+    if (!data.ok) console.error("copyMessage FAILED:", data.error_code, data.description);
+    return data;
+  } catch (e) {
+    console.error("copyMessage error:", e.message);
+    return { ok: false };
+  }
 }
 
 async function getFileUrl(env, fileId) {
