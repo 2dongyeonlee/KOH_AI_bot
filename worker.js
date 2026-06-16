@@ -456,10 +456,19 @@ async function handleScheduleQuery(env, chatId, query) {
           `SELECT sender_name, summary, content, milestone_date, status_tag, MIN(rowid) AS rid
            FROM messages
            WHERE status_tag NOT IN ('#Fup')
+             AND content NOT LIKE '%알려줘%'
+             AND content NOT LIKE '%해줘%'
+             AND content NOT LIKE '%보여줘%'
+             AND content NOT LIKE '%브리핑%'
+             AND content NOT LIKE '%찾아줘%'
+             AND content NOT LIKE '%요약해줘%'
+             AND content NOT LIKE '%정리해줘%'
+             AND content NOT LIKE '%보내줘%'
+             AND content NOT LIKE '%해줄래%'
+             AND length(content) >= 15
              AND (
                ${keywordLikes}
                OR content LIKE '%회의%' OR content LIKE '%미팅%'
-               OR content LIKE '%보고%' OR content LIKE '%일정%'
              )
              AND created_at >= datetime('now', '-7 days')
            GROUP BY COALESCE(NULLIF(summary,''), content), sender_name
