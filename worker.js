@@ -1310,17 +1310,21 @@ function normalizeDateQuery(query) {
     return d.toISOString().slice(0, 10);
   }
 
-  const m1 = query.match(/(\d{1,2})\/(\d{1,2})/);
+  // 1순위: YYYY/MM/DD, YYYY-MM-DD, YYYY.MM.DD (4자리 연도 포함 — 반드시 먼저)
+  const mFull = query.match(/(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})/);
+  if (mFull) return `${mFull[1]}-${String(mFull[2]).padStart(2, "0")}-${String(mFull[3]).padStart(2, "0")}`;
+
+  // 2순위: M/D 또는 MM/DD — 4자리 숫자 경계 제외
+  const m1 = query.match(/(?<!\d)(\d{1,2})\/(\d{1,2})(?!\d)/);
   if (m1) return `${year}-${String(m1[1]).padStart(2, "0")}-${String(m1[2]).padStart(2, "0")}`;
 
+  // 3순위: M월 D일
   const m2 = query.match(/(\d{1,2})월\s*(\d{1,2})일/);
   if (m2) return `${year}-${String(m2[1]).padStart(2, "0")}-${String(m2[2]).padStart(2, "0")}`;
 
+  // 4순위: M월 D (일 생략)
   const m3 = query.match(/(\d{1,2})월\s*(\d{1,2})/);
   if (m3) return `${year}-${String(m3[1]).padStart(2, "0")}-${String(m3[2]).padStart(2, "0")}`;
-
-  const m4 = query.match(/(\d{4})[-.](\d{1,2})[-.](\d{1,2})/);
-  if (m4) return `${m4[1]}-${String(m4[2]).padStart(2, "0")}-${String(m4[3]).padStart(2, "0")}`;
 
   return null;
 }
