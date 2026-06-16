@@ -372,11 +372,26 @@ async function handleScheduleQuery(env, chatId, query) {
 
 async function handleQuery(env, chatId, query, msg = null) {
   if (!query) return sendMessage(env, chatId, "질문 내용을 입력해주세요.");
-  if (/브리핑/.test(query)) return runReportBriefing(env, chatId);
-  if (/(일정|스케줄|이번주.*(뭐|있)|오늘.*(뭐|있)|내일.*(뭐|있)|회의|행사).*(있|뭐|알려|정리|보여)?/.test(query)
-      && !/브리핑/.test(query)) {
+
+  const isFileReq = looksLikeFileRequest(query);
+
+  // 파일 요청이면 브리핑·일정 라우팅으로 절대 빠지지 않는다.
+  if (!isFileReq && /브리핑/.test(query)) {
+    return runReportBriefing(env, chatId);
+  }
+
+  const isScheduleReq =
+    !isFileReq &&
+    !/브리핑/.test(query) &&
+    (
+      /(일정|스케줄)/.test(query) ||
+      /(이번주|오늘|내일|이번달|금주).*(뭐|있|일정|스케줄)/.test(query) ||
+      /(회의|미팅|행사).*(언제|일정|뭐|있어|알려|정리|보여)/.test(query)
+    );
+  if (isScheduleReq) {
     return handleScheduleQuery(env, chatId, query);
   }
+
   const forwardRequest = parseForwardRequest(query);
   if (forwardRequest) return handleForwardRequest(env, chatId, query, forwardRequest, msg);
 
