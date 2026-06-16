@@ -59,7 +59,13 @@ const DEFAULT_SYSTEM_PROMPT =
 - 황성욱 = 성욱
 - 김선영 = SY, 선영
 - 김민아 = 민아
-사람 이름으로 검색할 때 위 별칭도 함께 찾아볼 것.`;
+사람 이름으로 검색할 때 위 별칭도 함께 찾아볼 것.
+
+분류 기준 (태그가 없어도 내용으로 판단):
+- "보고 드립니다 / 공유 드립니다 / 보고드립니다" → 보고
+- "일정 변경 / 일정 확정 / 참석 예정" → 일정
+- "의사결정 필요 / 검토 부탁 / 승인 요청" → 의사결정
+태그와 자연어 중 어느 쪽이든 해당 분류로 처리할 것.`;
 
 const REPORT_BRIEFING_FORMAT = `
 브리핑 작성 규칙:
@@ -541,10 +547,11 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
 
   const internalContext = hits.length
     ? hits.map((hit) => {
-        const room = hit.room_title ? `(출처: ${hit.room_title}) ` : "";
-        return `${room}[저장 자료]
+        const room   = hit.room_title ? `(출처: ${hit.room_title}) ` : "";
+        const label  = classifyRow(hit);
+        return `[${label}] ${room}
 - 작성자: ${hit.sender_name || ""}
-- 내용: ${hit.summary || hit.content.slice(0, 100)}
+- 내용: ${hit.summary || (hit.content || "").slice(0, 100)}
 - 마감: ${hit.milestone_date || "없음"}
 - 액션: ${hit.action_items || "없음"}`;
       }).join("\n\n").slice(0, 5000)
@@ -1293,6 +1300,15 @@ async function likeSearch(env, query) {
   ).bind(...binds).all();
 
   return rows.results || [];
+}
+
+function classifyRow(row) {
+  const text = row.summary || row.content || "";
+  if (row.status_tag === "#보고"       || PAT_REPORT.test(text))   return "보고";
+  if (row.status_tag === "#일정"       || PAT_SCHEDULE.test(text)) return "일정";
+  if (row.status_tag === "#의사결정"   || PAT_DECISION.test(text)) return "의사결정";
+  if (row.status_tag === "#공유" || row.status_tag === "#Fup")     return "공유";
+  return "공유";
 }
 
 function searchTerms(query) {
