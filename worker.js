@@ -1096,8 +1096,10 @@ function searchTerms(query) {
       const cleaned = term
         .replace(/[?.!,。，]/g, "")
         .replace(/(팀장님께서|담당님께서|TL님께서|팀장님이|담당님이|TL님이|팀장님|담당님|TL님|님께서|님이|님)$/g, "")
-        .replace(/(께서|에게서|한테서|이|가|은|는|을|를|의)$/g, "");
-      return [term, cleaned];
+        .replace(/(께서|에게서|한테서|이|가|은|는|을|를|의)$/g, "")
+        .replace(/(관련된|관련|에대한|에대해|보고한|내용)$/g, "");
+      const eng = term.match(/[A-Za-z0-9]{2,}/g) || [];
+      return [term, cleaned, ...eng];
     })
     .filter((term) => term.length >= 2 && !stopWords.test(term));
 
