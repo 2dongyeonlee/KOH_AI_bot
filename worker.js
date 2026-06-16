@@ -565,7 +565,6 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
 
   const forwardRequest = parseForwardRequest(query);
   if (forwardRequest) return handleForwardRequest(env, chatId, query, forwardRequest, msg);
-  if (isScheduleQuery(query)) return handleScheduleQuery(env, chatId, query);
 
   // ── 인라인 내용 직접 분석 (개행 포함 + 길이 > 100) ───
   if (hasInlineContent) {
