@@ -10,7 +10,7 @@ keep_vars = true
 
 [vars]
 BRIEFING_CHAT_ID = "-5156923133,-4930893560"
-BOT_USERNAME = "KOH_AI_bot"
+BOT_USERNAME = "OHKwon_bot"
 
 [triggers]
 crons = ["0 0 * * 1-5"]

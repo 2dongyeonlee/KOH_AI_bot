@@ -1,11 +1,11 @@
 const MODEL_FAST = "claude-haiku-4-5-20251001";  // 단순 대화
 const MODEL_SMART = "claude-sonnet-4-6";          // 분석·브리핑
 const STATUS_TAGS = ["#보고", "#Fup", "#공유", "#일정"];
-
 // ── 자연어 분류 패턴 ──────────────────────────────
 const PAT_REPORT   = /보고\s*드립니다|보고드립니다|보고\s*올립니다|말씀\s*드립니다|보고\s*합니다|보고\s*하겠습니다|주요\s*사항|보고\s*내용|보고\s*자료|결과\s*보고|진행\s*보고|현황\s*보고|상황\s*공유|공유\s*드립니다/;
 const PAT_SCHEDULE = /일정\s*(변경|확정|공유|안내|반영|업데이트)|참석\s*(부탁|예정|하겠|가능)|일정\s*(입니다|됩니다)|시간\s*확인|날짜\s*변경/;
 const PAT_DECISION = /의사결정|결정\s*필요|승인\s*(필요|부탁)|검토\s*(부탁|요청|필요)|어떻게\s*할까요|방향\s*(결정|확인)|피드백\s*(부탁|요청)/;
+const BOT_QUERY = /알려줘|보여줘|정리해줘|요약해줘|공유해줘|찾아줘|보내줘|알려주|해줘|해줄래|있나|있어\?|있어요|뭐야|뭐있어|뭐가 있|브리핑|요약|정리|분석|안되는데|반영이 안|해야 할 사항|있을까|있나요/;
 const DEFAULT_SYSTEM_PROMPT =
   `너는 SK하이닉스 6R전략실 권오혁 담당의 전담 AI 비서 권오혁(A)다.
 
@@ -214,7 +214,7 @@ async function handleMessage(env, msg) {
     text.length <= 20 &&
     /(안녕|ㅎㅇ|하이|반가|잘있|고마|감사|수고|어떻게|뭐야|뭐해)/.test(text);
 
-  if ((await isQueryToBot(env, msg, text)) || isShortGreeting) {
+  if ((await isQueryToBot(env, msg, text)) || isShortGreeting || BOT_QUERY.test(text)) {
     return handleQuery(env, chatId, cleanMention(text), msg, isOwner);
   }
 
@@ -565,6 +565,7 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
 
   const forwardRequest = parseForwardRequest(query);
   if (forwardRequest) return handleForwardRequest(env, chatId, query, forwardRequest, msg);
+  if (isScheduleQuery(query)) return handleScheduleQuery(env, chatId, query);
 
   // ── 인라인 내용 직접 분석 (개행 포함 + 길이 > 100) ───
   if (hasInlineContent) {
@@ -1227,8 +1228,6 @@ async function extractDocumentText(env, fileUrl, fileName) {
     .join("\n") || "[문서 분석 실패]";
 }
 
-const BOT_QUERY = /알려줘|보여줘|정리해줘|요약해줘|공유해줘|찾아줘|보내줘|알려주|해줘|해줄래|있나\?|뭐야|뭐있어|브리핑|요약|정리|분석/;
-
 function inferStatusTag(text, existingTag) {
   if (existingTag) return existingTag;
   if (BOT_QUERY.test(text)) return "";
@@ -1822,6 +1821,18 @@ function kstDate(ms) {
 
 function kstDateStr() {
   return kstDate(Date.now());
+}
+
+function addDays(dateStr, days) {
+  const date = new Date(`${dateStr}T12:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function formatKstDateLabel(dateStr) {
+  const days = ["일", "월", "화", "수", "목", "금", "토"];
+  const day = days[new Date(`${dateStr}T12:00:00Z`).getUTCDay()];
+  return `${dateStr}(${day})`;
 }
 
 function textFromClaude(data) {
