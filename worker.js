@@ -626,8 +626,8 @@ async function runMorningBriefing(env) {
   await runInfoBriefing(env);
 }
 
-async function runReportBriefing(env) {
-  if (!env.BRIEFING_CHAT_ID) return;
+async function runReportBriefing(env, replyChatId = null) {
+  if (!replyChatId && !env.BRIEFING_CHAT_ID) return;
   const today = kstDateStr();
 
   const rows = (
@@ -691,8 +691,10 @@ ${joinRows(fups)}`,
     MODEL_SMART
   );
 
-  const chatIds = (env.BRIEFING_CHAT_ID || "").split(",").filter(Boolean);
-  for (const id of chatIds) {
+  const targets = replyChatId
+    ? [replyChatId]
+    : (env.BRIEFING_CHAT_ID || "").split(",").filter(Boolean);
+  for (const id of targets) {
     await sendMessage(env, id, output);
   }
 }
