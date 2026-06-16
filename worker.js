@@ -482,49 +482,46 @@ async function handleScheduleQuery(env, chatId, query) {
     }
   }
 
-  const DAY = ["일", "월", "화", "수", "목", "금", "토"];
-  const seenLines = new Set();
-  const lines = filtered.map((row) => {
-    // 날짜·D-N 레이블
-    let dateLabel = "";
-    if (row.milestone_date) {
-      const d = new Date(row.milestone_date + "T00:00:00+09:00");
-      const diff = Math.round((d - now) / 86400000);
-      const mo  = d.getMonth() + 1;
-      const da  = d.getDate();
-      const dow = DAY[d.getDay()];
-      if (row.status_tag === "#보고") {
-        dateLabel = diff === 0 ? "[D-0]" : diff > 0 && diff <= 3 ? `[D-${diff}]` : `[${mo}/${da}(${dow})]`;
-      } else {
-        dateLabel = `[${mo}/${da}(${dow})]`;
-      }
-    }
-    // 제목 (첫 줄) + 컨텍스트 (둘째 줄)
-    const raws = String(row.summary || row.content || "")
-      .split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
-    const rawTitle = (raws[0] || "")
-      .replace(/^[-•*●·]\s*/, "")
-      .replace(/^(업무명|제목|내용|일정|회의명|행사명)\s*[:：]\s*/, "")
-      .replace(/^(담당님|팀장님|사장님)[,\s]*$/, "")
-      .trim();
-    const title = rawTitle.length >= 5
-      ? rawTitle.slice(0, 50)
-      : (raws[1] || raws[0] || "").replace(/^[-•*●·]\s*/, "").trim().slice(0, 50);
-    const ctx    = (raws[1] || "").slice(0, 60);
-    const sender = row.sender_name ? ` / ${row.sender_name}` : "";
-    const main   = `• ${dateLabel} ${title}${sender}`.replace(/\s{2,}/g, " ").trim();
-    return ctx ? `${main}\n └ ${ctx}` : main;
-  }).filter((line) => (seenLines.has(line) ? false : (seenLines.add(line), true)));
+  // LLM이 브리핑 양식으로 정리
+  const queryLabel = /(오늘|today)/.test(query) ? "오늘"
+    : /(내일|tomorrow)/.test(query) ? "내일"
+    : "이번주";
+  const dateRange = fromDate === toDate ? fromDate : `${fromDate} ~ ${toDate}`;
 
-  const section =
-    (wantEvent && !wantMeeting) ? "📌 주요 행사" :
-    (wantMeeting && !wantEvent) ? "📌 회의 일정" : "📌 주요 일정";
-  const header =
-    /(오늘|today)/.test(query)   ? `📅 오늘 일정\n\n${section}` :
-    /(내일|tomorrow)/.test(query) ? `📅 내일 일정\n\n${section}` :
-    `📅 이번주 일정\n\n${section}`;
+  const seen = new Set();
+  const rawData = filtered.map(row => {
+    const body = row.summary || row.content || "";
+    const room = row.room_title ? `[${row.room_title}] ` : "";
+    const date = row.milestone_date ? ` (${row.milestone_date})` : "";
+    const line = `${room}${row.sender_name || ""}${date}: ${body.slice(0, 300)}`;
+    return seen.has(line) ? null : (seen.add(line), line);
+  }).filter(Boolean).join("\n");
 
-  return sendMessage(env, chatId, `${header}\n\n${lines.join("\n")}`);
+  const schedulePrompt = `오늘: ${today} / 조회 날짜: ${dateRange}
+
+아래 데이터에서 "${queryLabel}"(${dateRange}) 날짜와 직접 관련된 일정·보고·의사결정만 추려서 출력.
+제외 기준: 다른 날짜 항목, 질문, 잡담, 공지, 보도자료, "~하지 않을까요" 같은 논의성 메시지.
+HTML 태그 사용(<b>, <u>). 해당 항목 없는 섹션은 전체 생략.
+
+📅 ${queryLabel} 일정
+
+📌 주요 일정
+• [M/DD] <b>내용</b> / <u>담당자</u>
+ └ 핵심 사항
+
+🔔 보고
+• [M/DD] <b>보고명</b> / <u>담당자</u>
+ └ 핵심 내용
+
+💡 의사결정 필요
+• <b>사항</b> / <u>담당자</u>
+ └ 배경
+
+=== 데이터 ===
+${rawData || "관련 데이터 없음"}`;
+
+  const output = await callClaude(env, schedulePrompt, "", MODEL_SMART);
+  return sendMessage(env, chatId, output || `${queryLabel} 등록된 일정이 없습니다.`);
 }
 
 async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
