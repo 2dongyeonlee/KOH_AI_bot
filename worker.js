@@ -404,13 +404,11 @@ async function handleQuery(env, chatId, query, msg = null) {
   const forwardRequest = parseForwardRequest(query);
   if (forwardRequest) return handleForwardRequest(env, chatId, query, forwardRequest, msg);
 
-  const hits = await searchMemory(env, query);
-
-  // 파일 요청: 상위 3개 전송 후 종료 (LLM 답변 추가 없음)
-  if (looksLikeFileRequest(query)) {
+  // 파일 요청: 파일 전용 검색(file_id 보장) → 상위 3개 전송 또는 명확한 안내
+  if (isFileReq) {
+    const fileCandidates = await searchFiles(env, query);
     const seen = new Set();
-    const fileHits = hits
-      .filter((h) => h.file_id)
+    const fileHits = fileCandidates
       .map((h) => ({ hit: h, score: scoreFileHit(query, h) }))
       .filter((i) => i.score > 0)
       .sort((a, b) => b.score - a.score)
@@ -430,7 +428,12 @@ async function handleQuery(env, chatId, query, msg = null) {
       }
       return;
     }
+    return sendMessage(env, chatId,
+      "요청하신 자료를 저장소에서 찾지 못했습니다.\n" +
+      "파일명이나 키워드를 더 구체적으로 알려주시면 다시 찾겠습니다.");
   }
+
+  const hits = await searchMemory(env, query);
 
   const internalContext = hits.length
     ? hits.map((hit) =>
@@ -969,6 +972,33 @@ async function insertMessage(env, options) {
   }
 
   return lastRowId;
+}
+
+async function searchFiles(env, query) {
+  const terms = searchTerms(query).slice(0, 6);
+  if (!terms.length) {
+    const r = await env.DB.prepare(
+      `SELECT rowid, content, sender_name, summary, milestone_date, file_id, file_name
+       FROM messages
+       WHERE file_id IS NOT NULL AND file_id != ''
+       ORDER BY created_at DESC LIMIT 20`
+    ).all();
+    return r.results || [];
+  }
+  const whereParts = terms.map(() =>
+    "(file_name LIKE ? OR content LIKE ? OR summary LIKE ?)");
+  const binds = terms.flatMap((t) => {
+    const like = `%${t}%`;
+    return [like, like, like];
+  });
+  const r = await env.DB.prepare(
+    `SELECT rowid, content, sender_name, summary, milestone_date, file_id, file_name
+     FROM messages
+     WHERE file_id IS NOT NULL AND file_id != ''
+       AND (${whereParts.join(" OR ")})
+     ORDER BY created_at DESC LIMIT 20`
+  ).bind(...binds).all();
+  return r.results || [];
 }
 
 async function searchMemory(env, query) {
