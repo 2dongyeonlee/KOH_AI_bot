@@ -431,8 +431,55 @@ async function handleScheduleQuery(env, chatId, query) {
   const typeLabel = (wantEvent && !wantMeeting) ? "행사" : (wantMeeting && !wantEvent) ? "회의 일정" : "일정";
 
   if (!filtered.length) {
-    return sendMessage(env, chatId,
-      `등록된 ${typeLabel}이 없습니다.\n텔레그램방에 #일정 태그로 공유 부탁드립니다.`);
+    // 폴백: milestone_date 없이 content에 날짜/일정 키워드가 있는 메시지 검색
+    const fallbackRows = await (async () => {
+      try {
+        const d  = new Date(fromDate + "T00:00:00+09:00");
+        const mo = String(d.getMonth() + 1);
+        const da = String(d.getDate());
+        const patterns = [
+          `${mo}/${da}`, `${mo}월 ${da}일`, `${mo}월${da}일`,
+          `${String(mo).padStart(2,"0")}/${String(da).padStart(2,"0")}`,
+        ];
+        const isToday    = fromDate === today;
+        const isTomorrow = (() => {
+          const td = new Date(now); td.setDate(td.getDate() + 1);
+          return fromDate === td.toISOString().slice(0, 10);
+        })();
+        const keywordLikes = [
+          ...patterns.map(p => `content LIKE '%${p}%'`),
+          ...(isToday    ? ["content LIKE '%오늘%'"]  : []),
+          ...(isTomorrow ? ["content LIKE '%내일%'"]  : []),
+        ].join(" OR ");
+
+        const r = await env.DB.prepare(
+          `SELECT sender_name, summary, content, milestone_date, status_tag, MIN(rowid) AS rid
+           FROM messages
+           WHERE status_tag NOT IN ('#Fup')
+             AND (
+               ${keywordLikes}
+               OR content LIKE '%회의%' OR content LIKE '%미팅%'
+               OR content LIKE '%보고%' OR content LIKE '%일정%'
+             )
+             AND created_at >= datetime('now', '-7 days')
+           GROUP BY COALESCE(NULLIF(summary,''), content), sender_name
+           ORDER BY created_at DESC
+           LIMIT 10`
+        ).all();
+        return r.results || [];
+      } catch (e) {
+        console.error("fallback schedule error:", e.message);
+        return [];
+      }
+    })();
+
+    if (fallbackRows.length) {
+      filtered = fallbackRows;
+    } else {
+      return sendMessage(env, chatId,
+        `${fromDate} 등록된 ${typeLabel}이 없습니다.\n` +
+        `날짜(6/17, 내일 등)와 함께 일정을 공유해주시면 자동으로 인식합니다.`);
+    }
   }
 
   const DAY = ["일", "월", "화", "수", "목", "금", "토"];
@@ -1172,9 +1219,41 @@ function inferStatusTag(text, existingTag) {
   return "";
 }
 
+function extractDateFromText(text) {
+  if (!text) return "";
+  const now  = new Date(Date.now() + 9 * 3600000);
+  const year = now.getFullYear();
+
+  if (/(내일|tomorrow)/.test(text)) {
+    const d = new Date(now); d.setDate(d.getDate() + 1);
+    return d.toISOString().slice(0, 10);
+  }
+  if (/모레/.test(text)) {
+    const d = new Date(now); d.setDate(d.getDate() + 2);
+    return d.toISOString().slice(0, 10);
+  }
+  // 4자리 연도 포함 (2026/06/17, 2026-06-17) — 먼저 확인
+  const mFull = text.match(/(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  if (mFull) {
+    return `${mFull[1]}-${String(mFull[2]).padStart(2,"0")}-${String(mFull[3]).padStart(2,"0")}`;
+  }
+  // M/D 또는 MM/DD
+  const m1 = text.match(/(?<!\d)(\d{1,2})[\/\-](\d{1,2})(?!\d)/);
+  if (m1 && Number(m1[1]) >= 1 && Number(m1[1]) <= 12 && Number(m1[2]) >= 1 && Number(m1[2]) <= 31) {
+    return `${year}-${String(m1[1]).padStart(2,"0")}-${String(m1[2]).padStart(2,"0")}`;
+  }
+  // M월 D일
+  const m2 = text.match(/(\d{1,2})월\s*(\d{1,2})일/);
+  if (m2) {
+    return `${year}-${String(m2[1]).padStart(2,"0")}-${String(m2[2]).padStart(2,"0")}`;
+  }
+  return "";
+}
+
 async function saveMessage(env, msg, content) {
-  const inferredTag = inferStatusTag(content, "");
-  await insertMessage(env, { msg, content, statusTag: inferredTag });
+  const inferredTag    = inferStatusTag(content, "");
+  const extractedDate  = extractDateFromText(content);
+  await insertMessage(env, { msg, content, statusTag: inferredTag, milestoneDate: extractedDate });
 }
 
 async function insertMessage(env, options) {
