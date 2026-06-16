@@ -348,14 +348,28 @@ async function handleScheduleQuery(env, chatId, query) {
      LIMIT 20`
   ).bind(fromDate, toDate).all()).results || [];
 
-  if (!rows.length) {
+  // 행사/회의 유형 판별 → 후처리 필터
+  const wantEvent   = /(행사|기공식|세미나|워크숍|컨퍼런스)/.test(query);
+  const wantMeeting = /(회의|미팅)/.test(query);
+  let filtered = rows;
+  if (wantEvent && !wantMeeting) {
+    filtered = rows.filter((r) =>
+      /행사|기공식|세미나|워크숍|컨퍼런스|발표회|보고회/.test(r.content || r.summary || ""));
+  } else if (wantMeeting && !wantEvent) {
+    filtered = rows.filter((r) =>
+      /회의|미팅/.test(r.content || r.summary || ""));
+  }
+
+  const typeLabel = (wantEvent && !wantMeeting) ? "행사" : (wantMeeting && !wantEvent) ? "회의 일정" : "일정";
+
+  if (!filtered.length) {
     return sendMessage(env, chatId,
-      "등록된 일정이 없습니다.\n텔레그램방에 #일정 태그로 공유 부탁드립니다.");
+      `등록된 ${typeLabel}이 없습니다.\n텔레그램방에 #일정 태그로 공유 부탁드립니다.`);
   }
 
   const DAY = ["일", "월", "화", "수", "목", "금", "토"];
   const seenLines = new Set();
-  const lines = rows.map((row) => {
+  const lines = filtered.map((row) => {
     let prefix = "";
     if (row.milestone_date) {
       const d = new Date(row.milestone_date + "T00:00:00+09:00");
@@ -367,14 +381,21 @@ async function handleScheduleQuery(env, chatId, query) {
     const rawLines = String(row.summary || row.content || "")
       .split("\n").map((l) => l.trim()).filter(Boolean);
     const bodyLine = rawLines.find((l) => !l.startsWith("#")) || rawLines[0] || "";
-    const title = bodyLine.slice(0, 60);
+    const title = bodyLine
+      .replace(/^[-•*●·]\s*/, "")
+      .replace(/^(업무명|제목|내용|일정|회의명|행사명)\s*[:：]\s*/, "")
+      .trim()
+      .slice(0, 60);
     const sender = row.sender_name ? ` / ${row.sender_name}` : "";
     return `• ${prefix}${title}${sender}`;
   }).filter((line) => (seenLines.has(line) ? false : (seenLines.add(line), true)));
 
-  const header = /(오늘|today)/.test(query) ? "오늘 일정"
-    : /(내일|tomorrow)/.test(query) ? "내일 일정"
-    : "이번주 주요 일정";
+  const header =
+    /(오늘|today)/.test(query)   ? "오늘 일정" :
+    /(내일|tomorrow)/.test(query) ? "내일 일정" :
+    (wantEvent && !wantMeeting)   ? "이번주 주요 행사" :
+    (wantMeeting && !wantEvent)   ? "이번주 회의 일정" :
+    "이번주 주요 일정";
 
   return sendMessage(env, chatId, `${header}\n\n${lines.join("\n")}`);
 }
