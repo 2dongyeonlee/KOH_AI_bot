@@ -537,8 +537,10 @@ async function handleScheduleQuery(env, chatId, query) {
 
   let sectionSpec;
   let headerLabel;
+  let kindLabel;
   if (wantDecision) {
-    headerLabel = `💡 ${queryLabel} 의사결정 필요 사항`;
+    kindLabel   = `${queryLabel} 의사결정 필요 사항`;
+    headerLabel = `💡 ${kindLabel}`;
     sectionSpec = `사용자는 "의사결정이 필요한 사항"만 물었다. 의사결정·판단·승인·방향 결정이 필요한 미결 항목만 추려라.
 이미 확정된 일정이나 단순 보고·완료 항목은 절대 포함하지 말 것.
 
@@ -546,7 +548,8 @@ async function handleScheduleQuery(env, chatId, query) {
 • <b>사항</b> / <u>담당자</u>
  └ 배경 및 결정해야 할 선택지`;
   } else if (wantReport) {
-    headerLabel = `🔔 ${queryLabel} 보고 사항`;
+    kindLabel   = `${queryLabel} 보고 사항`;
+    headerLabel = `🔔 ${kindLabel}`;
     sectionSpec = `사용자는 "보고 사항"만 물었다. 진행 현황·결과·완료 보고 항목만 추려라.
 단순 일정이나 의사결정 미결 항목은 포함하지 말 것.
 
@@ -554,7 +557,8 @@ async function handleScheduleQuery(env, chatId, query) {
 • [M/DD] <b>보고명</b> / <u>담당자</u>
  └ 핵심 내용`;
   } else {
-    headerLabel = `📅 ${queryLabel} 일정`;
+    kindLabel   = `${queryLabel} 일정`;
+    headerLabel = `📅 ${kindLabel}`;
     sectionSpec = `📌 주요 일정
 • [M/DD] <b>내용</b> / <u>담당자</u>
  └ 핵심 사항
@@ -574,7 +578,7 @@ async function handleScheduleQuery(env, chatId, query) {
 포함 기준: 날짜가 없는 항목도 포함.
 제외 기준: 봇에게 한 질문, 잡담, 인사, "~하지 않을까요" 같은 논의성 메시지만 제외.
 HTML 태그 사용(<b>, <u>). 해당 항목 없는 섹션은 전체 생략.
-해당 항목이 하나도 없으면 "${headerLabel.replace(/^[📅📌🔔💡]\s*/, "")}: 없음" 만 출력.
+해당 항목이 하나도 없으면 "${kindLabel}: 없음" 만 출력.
 
 ${headerLabel}
 
