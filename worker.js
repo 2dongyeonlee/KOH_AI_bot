@@ -695,7 +695,9 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
     return;
   }
 
-  const hits = await searchMemory(env, query);
+  // 발신자 명시 쿼리면 sender 필터 우선
+  const senderHits = await searchBySender(env, query);
+  const hits = senderHits || await searchMemory(env, query);
 
   // ── 지시어/요약 단독: 같은 방 최근 메시지 조회 ────────
   let recentRawContext = "";
@@ -1565,6 +1567,42 @@ async function searchFiles(env, query) {
      ORDER BY created_at DESC LIMIT 20`
   ).bind(...binds).all();
   return r.results || [];
+}
+
+// 쿼리에서 발신자 명시 감지 후 sender_name 필터 검색
+async function searchBySender(env, query) {
+  const senderPattern = /^(.+?)\s*(TL|팀장|담당|씨|님|이|가|은|는)?\s*(보고한|공유한|공유해준|말한|언급한|올린|전달한|작성한|보낸|이야기한)/;
+  const match = query.match(senderPattern);
+  if (!match) return null;
+
+  const nameRaw = match[1].replace(/(어제|오늘|이번주|최근|아까)\s*/g, "").trim();
+  if (nameRaw.length < 2) return null;
+
+  // NAME_ALIASES에서 해당 이름의 모든 별칭 찾기
+  const aliases = Object.entries(NAME_ALIASES).find(([full, list]) =>
+    full.includes(nameRaw) || list.some(a => a.includes(nameRaw) || nameRaw.includes(a))
+  );
+  if (!aliases) return null;
+
+  const [, aliasList] = aliases;
+  const senderLikes = aliasList.map(() => "sender_name LIKE ?").join(" OR ");
+  const binds = aliasList.map(a => `%${a}%`);
+
+  try {
+    const rows = (await env.DB.prepare(
+      `SELECT rowid, content, sender_name, summary, action_items,
+              milestone_date, file_id, file_name, room_title, telegram_message_id, room_id
+       FROM messages
+       WHERE (${senderLikes})
+         AND length(content) >= 5
+       ORDER BY created_at DESC
+       LIMIT 10`
+    ).bind(...binds).all()).results || [];
+    return rows.length > 0 ? rows : null;
+  } catch (e) {
+    console.error("searchBySender error:", e.message);
+    return null;
+  }
 }
 
 async function searchMemory(env, query) {
