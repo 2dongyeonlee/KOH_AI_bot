@@ -723,9 +723,26 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
       return qWords.reduce((s, w) => s + (hay.includes(w.toLowerCase()) ? 1 : 0), 0);
     };
     // 키워드가 1개라도 맞는 파일만 (느슨한 매칭 차단). 키워드 없으면 상위 1개 허용
+    // 같은 파일이 여러 방에 있으면 단체방(음수 room_id) 우선 — copyMessage 가능
+    const isGroup = (f) => String(f.room_id || "").startsWith("-");
+    const rankFiles = (arr) => arr.sort((a, b) => {
+      const sc = scoreFile(b) - scoreFile(a);
+      if (sc !== 0) return sc;
+      // 점수 같으면 단체방 우선
+      return (isGroup(b) ? 1 : 0) - (isGroup(a) ? 1 : 0);
+    });
+    // 파일명 기준 중복 제거 시 단체방 버전을 남김
+    const dedupGroupFirst = (arr) => {
+      const sorted = [...arr].sort((a, b) => (isGroup(b) ? 1 : 0) - (isGroup(a) ? 1 : 0));
+      const seen = new Set();
+      return sorted.filter(f => {
+        const key = f.file_name || String(f.rowid);
+        return seen.has(key) ? false : (seen.add(key), true);
+      });
+    };
     const relevantFiles = qWords.length
-      ? fileHits.filter(f => scoreFile(f) >= 1).sort((a,b) => scoreFile(b) - scoreFile(a))
-      : fileHits.slice(0, 1);
+      ? rankFiles(dedupGroupFirst(fileHits.filter(f => scoreFile(f) >= 1)))
+      : dedupGroupFirst(fileHits).slice(0, 1);
     let sent = false;
     // 1. 관련 파일·사진 전송 (최대 3개)
     for (const fh of relevantFiles.slice(0, 3)) {
@@ -738,7 +755,17 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
         result = await copyMessage(env, chatId, fh.room_id, fh.telegram_message_id);
         if (result?.ok) await sendMessage(env, chatId, caption);
       }
-      if (result?.ok) sent = true;
+      if (result?.ok) {
+        sent = true;
+      } else {
+        // 파일 전송 불가(DM 등) → 그 파일의 전체 내용을 텍스트로 제공
+        const body = (fh.summary || fh.content || "").trim();
+        if (body && body !== "[문서 분석 실패]") {
+          await sendMessage(env, chatId,
+            `파일 직접 전송은 어렵지만 내용을 공유합니다.${attr ? ` (${attr})` : ""}\n<b>${fh.file_name || ""}</b>\n\n${body.slice(0, 2500)}`);
+          sent = true;
+        }
+      }
     }
     // 2. 텍스트 보고/메시지 → 누가·무슨 내용 요약 (관련 파일 없거나 텍스트가 더 풍부할 때)
     if (!sent && textHits.length > 0) {
