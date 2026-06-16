@@ -88,6 +88,12 @@ export default {
       return new Response("ok");
     }
 
+    if (update.my_chat_member) {
+      try { await handleChatMemberUpdate(env, update.my_chat_member); }
+      catch (e) { console.error("chat_member error", e?.stack || e); }
+      return new Response("ok");
+    }
+
     const msg = update.message;
     if (!msg) return new Response("ok");
 
@@ -670,7 +676,8 @@ async function runMorningBriefing(env) {
 }
 
 async function runReportBriefing(env, replyChatId = null) {
-  if (!replyChatId && !env.BRIEFING_CHAT_ID) return;
+  const targets = replyChatId ? [replyChatId] : await briefingTargets(env);
+  if (!targets.length) return;
   const today = kstDateStr();
 
   const rows = (
@@ -734,16 +741,14 @@ ${joinRows(fups)}`,
     MODEL_SMART
   );
 
-  const targets = replyChatId
-    ? [replyChatId]
-    : (env.BRIEFING_CHAT_ID || "").split(",").filter(Boolean);
   for (const id of targets) {
     await sendMessage(env, id, output);
   }
 }
 
 async function runInfoBriefing(env) {
-  if (!env.BRIEFING_CHAT_ID) return;
+  const targets = await briefingTargets(env);
+  if (!targets.length) return;
 
   const rows = (
     await env.DB.prepare(
@@ -766,9 +771,54 @@ ${rows.map((row) => row.summary || row.content).join("\n").slice(0, 10000)}`,
     MODEL_SMART
   );
 
-  const chatIds = (env.BRIEFING_CHAT_ID || "").split(",").filter(Boolean);
-  for (const id of chatIds) {
+  for (const id of targets) {
     await sendMessage(env, id, output);
+  }
+}
+
+async function briefingTargets(env) {
+  const fromEnv = (env.BRIEFING_CHAT_ID || "")
+    .split(",").map((s) => s.trim()).filter(Boolean);
+  let fromDb = [];
+  try {
+    const r = await env.DB.prepare(`SELECT room_id FROM rooms`).all();
+    fromDb = (r.results || []).map((row) => String(row.room_id));
+  } catch (e) {
+    console.error("briefingTargets DB error:", e.message);
+  }
+  return [...new Set([...fromEnv, ...fromDb])];
+}
+
+async function handleChatMemberUpdate(env, upd) {
+  const chat = upd.chat || {};
+  const newMember = upd.new_chat_member || {};
+  const roomId = String(chat.id || "");
+  const roomTitle = chat.title || chat.username || "";
+  const botName = newMember.user?.username || "";
+  const status = newMember.status || "";
+
+  if (!roomId) return;
+
+  if (status === "member" || status === "administrator") {
+    await env.DB.prepare(
+      `INSERT INTO rooms (room_id, room_title, bot_name)
+       VALUES (?, ?, ?)
+       ON CONFLICT(room_id) DO UPDATE SET
+         room_title = excluded.room_title,
+         bot_name = excluded.bot_name`
+    ).bind(roomId, roomTitle, botName).run();
+    console.log("rooms upsert:", roomId, roomTitle);
+    await sendMessage(env, roomId,
+      `안녕하세요! KOH봇입니다. 이 채팅방이 브리핑 대상으로 등록되었습니다.\n` +
+      `• 업무 보고: 첫 줄에 #보고 태그\n` +
+      `• 일정 등록: 첫 줄에 #일정 태그\n` +
+      `• 공유 사항: 첫 줄에 #공유 태그\n` +
+      `• 브리핑 요청: @${env.BOT_USERNAME || "KOH_AI_bot"} 브리핑`);
+  } else if (status === "left" || status === "kicked") {
+    await env.DB.prepare(
+      `DELETE FROM rooms WHERE room_id = ?`
+    ).bind(roomId).run();
+    console.log("rooms delete:", roomId);
   }
 }
 
