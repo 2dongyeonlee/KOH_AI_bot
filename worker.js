@@ -51,6 +51,9 @@ const DEFAULT_SYSTEM_PROMPT =
 - 답변 시 참고한 자료의 출처 방이 있으면 "(출처: 방이름)" 명시.
 - 봇 주인(권오혁 담당님)에게는 정중하게 답변.
 - 그 외 사람에게는 간결하고 직접적으로 답변.
+- 사람들이 서로 대화하는 내용(봇에게 직접 말하지 않는 대화)에는 절대 끼어들지 말 것.
+- "알겠습니다", "수정 완료", "확인했습니다" 등 확인·완료 응답은 봇에게 명확히 요청한 경우에만 사용.
+- 파일·이미지 저장 완료 사실을 언급하지 말 것.
 
 팀원 텔레그램 표시 이름 매핑 (표시 이름이 다를 수 있음):
 - 홍석윤 = 석윤
@@ -355,8 +358,8 @@ ${extracted.slice(0, 3000)}`,
     needs_escalation: parsed.needs_escalation || 0,
   });
 
-  return sendMessage(env, chatId,
-    `<b>${fileName || "파일"}</b> 저장 완료.`);
+  // 파일 저장 완료 알림 없음 (묵음 저장)
+  return;
 }
 
 async function handleScheduleQuery(env, chatId, query) {
@@ -499,10 +502,14 @@ async function handleScheduleQuery(env, chatId, query) {
     // 제목 (첫 줄) + 컨텍스트 (둘째 줄)
     const raws = String(row.summary || row.content || "")
       .split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
-    const title = (raws[0] || "")
+    const rawTitle = (raws[0] || "")
       .replace(/^[-•*●·]\s*/, "")
       .replace(/^(업무명|제목|내용|일정|회의명|행사명)\s*[:：]\s*/, "")
-      .trim().slice(0, 50);
+      .replace(/^(담당님|팀장님|사장님)[,\s]*$/, "")
+      .trim();
+    const title = rawTitle.length >= 5
+      ? rawTitle.slice(0, 50)
+      : (raws[1] || raws[0] || "").replace(/^[-•*●·]\s*/, "").trim().slice(0, 50);
     const ctx    = (raws[1] || "").slice(0, 60);
     const sender = row.sender_name ? ` / ${row.sender_name}` : "";
     const main   = `• ${dateLabel} ${title}${sender}`.replace(/\s{2,}/g, " ").trim();
