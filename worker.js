@@ -685,55 +685,70 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
 
   // 파일 요청: 파일 전용 검색(file_id 보장) → 상위 3개 전송 또는 명확한 안내
   if (isFileReq) {
-    // 파일·사진·텍스트 통합 검색 (searchMemory = 하이브리드)
-    const allHits  = await searchMemory(env, query);
+    // 발신자 명시("예슬TL이 보고한 자료") 시 sender 필터 우선
+    const senderHits = await searchBySender(env, query);
+    const allHits  = senderHits || await searchMemory(env, query);
     const fileHits = allHits.filter(h => h.file_id && h.file_id !== "");
     const textHits = allHits.filter(h => !h.file_id || h.file_id === "");
-    let sentCount = 0;
-    // 1. 파일·사진 전송
-    for (const fh of fileHits.slice(0, 3)) {
+    // 쿼리 핵심 키워드 추출 (조사·요청어 제거)
+    const qWords = query
+      .replace(/(자료|파일|문서|사진|이미지|내용|공유|보내|전달|찾아|요약|알려|줘|주세요|해줘|관련|어디|있어|있나)/g, " ")
+      .split(/\s+/).map(w => w.trim()).filter(w => w.length >= 2);
+    // 파일이 쿼리와 실제로 관련 있는지 점수 (파일명/내용에 키워드 포함 수)
+    const scoreFile = (f) => {
+      const hay = `${f.file_name || ""} ${f.summary || ""} ${(f.content || "").slice(0,200)}`.toLowerCase();
+      return qWords.reduce((s, w) => s + (hay.includes(w.toLowerCase()) ? 1 : 0), 0);
+    };
+    // 키워드가 1개라도 맞는 파일만 (느슨한 매칭 차단). 키워드 없으면 상위 1개 허용
+    const relevantFiles = qWords.length
+      ? fileHits.filter(f => scoreFile(f) >= 1).sort((a,b) => scoreFile(b) - scoreFile(a))
+      : fileHits.slice(0, 1);
+    let sent = false;
+    // 1. 관련 파일·사진 전송 (최대 3개)
+    for (const fh of relevantFiles.slice(0, 3)) {
       const roomLabel   = fh.room_title  ? `[${fh.room_title}]`  : "";
       const senderLabel = fh.sender_name ? `${fh.sender_name} 공유` : "";
       const attr    = [roomLabel, senderLabel].filter(Boolean).join(" / ");
       const caption = `요청하신 자료입니다.${attr ? ` (${attr})` : ""}\n${fh.file_name || ""}`.trim();
       let result = await sendDocument(env, chatId, fh.file_id, caption);
-      // file_id 실패 → copyMessage 폴백 (원본 형식 유지 - 사진도 사진으로)
       if (!result?.ok && fh.room_id && fh.telegram_message_id) {
         result = await copyMessage(env, chatId, fh.room_id, fh.telegram_message_id);
         if (result?.ok) await sendMessage(env, chatId, caption);
       }
-      // 파일 전송도 실패 → 텍스트 내용 폴백
-      if (!result?.ok) {
-        const body = (fh.summary || fh.content || "").slice(0, 600).trim();
-        if (body) {
-          await sendMessage(env, chatId,
-            `파일 전송 실패, 내용 공유합니다.${attr ? ` (${attr})` : ""}\n<b>${fh.file_name || ""}</b>\n\n${body}`);
-        }
-      } else {
-        sentCount++;
+      if (result?.ok) sent = true;
+    }
+    // 2. 텍스트 보고/메시지 → 누가·무슨 내용 요약 (관련 파일 없거나 텍스트가 더 풍부할 때)
+    if (!sent && textHits.length > 0) {
+      const textContext = textHits.slice(0, 6).map(h => {
+        const room   = h.room_title  ? `[${h.room_title}]` : "";
+        const sender = h.sender_name || "작성자미상";
+        const when   = h.milestone_date ? ` (${h.milestone_date})` : "";
+        const body   = (h.summary || h.content || "").slice(0, 500);
+        return `${room} ${sender}${when}: ${body}`;
+      }).join("\n\n─────\n\n");
+      const textPrompt = `사용자 요청: "${query}"
+아래는 검색된 메시지·보고 내용이다. 요청과 관련된 것만 골라
+"누가 무슨 내용을 공유/보고했는지" 형식으로 요약해줘.
+- 작성자(이름)와 핵심 내용을 함께 표기
+- 관련 없는 항목은 제외
+- 없는 내용은 지어내지 말 것
+- 파일이 아니라 메시지로 공유된 내용임을 자연스럽게 안내
+[검색된 내용]
+${textContext}`;
+      const answer = await callClaude(env, textPrompt, "", MODEL_SMART);
+      if (answer) {
+        await sendMessage(env, chatId, answer);
+        sent = true;
       }
     }
-    // 2. 파일 없는 텍스트 내용 → LLM이 요약해서 답변
-    if (textHits.length > 0) {
-      const textContext = textHits.slice(0, 5).map(h => {
-        const room   = h.room_title  ? `[${h.room_title}] ` : "";
-        const sender = h.sender_name ? `${h.sender_name}: ` : "";
-        const body   = (h.summary || h.content || "").slice(0, 400);
-        return `${room}${sender}${body}`;
-      }).join("\n\n─────\n\n");
-      const textPrompt = `사용자 질문: "${query}"\n\n아래 관련 내용 중 질문과 관련된 것을 찾아 정리해줘.\n없는 내용은 만들지 말 것.\n\n${textContext}`;
-      const answer = await callClaude(env, textPrompt, "", MODEL_SMART);
-      if (answer) await sendMessage(env, chatId, answer);
-      sentCount++;
-    }
-    // 3. 아무것도 없으면
-    if (sentCount === 0 && fileHits.length === 0) {
+    // 3. 관련 파일은 없지만 텍스트도 비었고, 무관한 파일만 있을 때
+    if (!sent) {
       await sendMessage(env, chatId,
-        "관련 자료나 내용을 찾지 못했습니다.\n키워드를 더 구체적으로 알려주시면 다시 찾겠습니다.");
+        "요청하신 자료를 찾지 못했습니다.\n파일명이나 키워드를 더 구체적으로 알려주시면 다시 찾겠습니다.");
     }
     await saveChatHistory(env, chatId, query,
-      fileHits.map(f => f.file_name || "(파일)").join(", ") || "텍스트 내용",
-      { files: fileHits.map(f => ({ name: f.file_name || "", room: f.room_title || "" })) }
+      relevantFiles.map(f => f.file_name || "(파일)").join(", ") || "텍스트 내용",
+      { files: relevantFiles.map(f => ({ name: f.file_name || "", room: f.room_title || "" })) }
     );
     await updateBotSession(env, chatId);
     return;
