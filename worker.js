@@ -45,7 +45,16 @@ const DEFAULT_SYSTEM_PROMPT =
 - 브리핑 포맷의 📅 📌 🔔 💡 📢 🔁 기호는 예외.
 - 답변 시 참고한 자료의 출처 방이 있으면 "(출처: 방이름)" 명시.
 - 봇 주인(권오혁 담당님)에게는 정중하게 답변.
-- 그 외 사람에게는 간결하고 직접적으로 답변.`;
+- 그 외 사람에게는 간결하고 직접적으로 답변.
+
+팀원 텔레그램 표시 이름 매핑 (표시 이름이 다를 수 있음):
+- 홍석윤 = 석윤
+- 이기두 = Kidu, 기두
+- 위예슬 = 예슬
+- 황성욱 = 성욱
+- 김선영 = SY, 선영
+- 김민아 = 민아
+사람 이름으로 검색할 때 위 별칭도 함께 찾아볼 것.`;
 
 const REPORT_BRIEFING_FORMAT = `
 브리핑 작성 규칙:
@@ -1217,9 +1226,28 @@ async function searchMemory(env, query) {
   return likeSearch(env, query);
 }
 
+const NAME_ALIASES = {
+  "홍석윤": ["석윤", "홍석윤"],
+  "이기두": ["기두", "kidu", "이기두"],
+  "위예슬": ["예슬", "위예슬"],
+  "황성욱": ["성욱", "황성욱"],
+  "김선영": ["선영", "sy", "김선영"],
+  "김민아": ["민아", "김민아"],
+};
+
+function expandWithAliases(terms) {
+  const expanded = [...terms];
+  for (const [, aliases] of Object.entries(NAME_ALIASES)) {
+    if (terms.some(t => aliases.some(a => t.toLowerCase().includes(a.toLowerCase())))) {
+      aliases.forEach(a => { if (!expanded.includes(a)) expanded.push(a); });
+    }
+  }
+  return expanded;
+}
+
 async function likeSearch(env, query) {
   const dateStr = normalizeDateQuery(query);
-  const terms = searchTerms(query).slice(0, 6);
+  const terms = expandWithAliases(searchTerms(query).slice(0, 6));
   if (!terms.length && !dateStr) return [];
 
   const whereParts = terms.map(() => "(content LIKE ? OR summary LIKE ? OR file_name LIKE ? OR sender_name LIKE ?)");
