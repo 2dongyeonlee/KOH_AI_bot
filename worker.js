@@ -396,11 +396,11 @@ async function handleScheduleQuery(env, chatId, query) {
     toDate = d.toISOString().slice(0, 10);
   }
 
-  // 특정 날짜(오늘/내일) → milestone_date 필수. 범위(이번주) → 최근 30일 이내 NULL 허용
+  // 특정 날짜(오늘/내일) → milestone_date 필수. 범위(이번주) → 최근 2주 이내 NULL 허용
   const isSpecificDate = fromDate === toDate;
   const dateCondition = isSpecificDate
     ? "milestone_date >= ? AND milestone_date <= ?"
-    : "(milestone_date >= ? AND milestone_date <= ?) OR (milestone_date IS NULL AND created_at >= datetime('now', '-30 days'))";
+    : "(milestone_date >= ? AND milestone_date <= ?) OR (milestone_date IS NULL AND created_at >= datetime('now', '-14 days'))";
 
   const rows = (await env.DB.prepare(
     `SELECT sender_name, summary, content, milestone_date, status_tag, MIN(rowid) AS rid
