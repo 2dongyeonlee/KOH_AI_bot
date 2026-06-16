@@ -92,12 +92,9 @@ const REPORT_BRIEFING_FORMAT = `
  └ 핵심 안건 또는 준비사항
 
 🔔 보고
-• [D-0] <b>보고명</b> / <u>보고자</u>
+• [MM/DD] <b>보고명</b> / <u>보고자</u>
  └ 보고 핵심 내용 또는 필요 액션
-• [D-N] <b>보고명</b> / <u>보고자</u>
- └ 핵심 내용
-• (MM/DD) <b>보고명</b> / <u>담당자</u>
- └ 핵심 내용
+(날짜는 항상 [M/DD] 형식. 날짜 없는 항목은 날짜 표기 생략)
 
 💡 의사결정 필요
 • <b>의사결정 사항</b> / <u>담당자</u>
@@ -107,13 +104,6 @@ const REPORT_BRIEFING_FORMAT = `
 • [방이름] <u>담당자</u>
   - <b>핵심 내용 한줄</b>
    └ 상세 내용 또는 후속 필요사항
-
-D-N 계산 규칙:
-- milestone_date가 오늘 = [D-0]
-- milestone_date가 내일 = [D-1]
-- milestone_date가 2~3일 후 = [D-2], [D-3]
-- milestone_date가 4일 이상 = (MM/DD) 형식
-- milestone_date 없으면 날짜 표기 없이 항목명만
 `;
 
 const INFO_BRIEFING_FORMAT = `정보방 내용을 한국어로 요약하세요.
@@ -1798,14 +1788,9 @@ function csv(value) {
 function calcDday(dateStr) {
   if (!dateStr) return "";
   const target = new Date(dateStr + "T00:00:00+09:00");
-  const now    = new Date(Date.now() + 9 * 3600000);
-  const diff   = Math.ceil((target - now) / 86400000);
-  if (diff === 0) return "[D-0]";
-  if (diff > 0 && diff <= 3) return `[D-${diff}]`;
-  if (diff < 0) return `[D+${Math.abs(diff)}]`;
   const m = target.getMonth() + 1;
   const d = target.getDate();
-  return `(${m}/${d})`;
+  return `[${m}/${d}]`;
 }
 
 function joinRows(rows) {
