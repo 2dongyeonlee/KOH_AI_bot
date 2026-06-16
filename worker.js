@@ -1118,7 +1118,7 @@ async function insertMessage(env, options) {
       String(msg.chat?.title  || msg.chat?.username || "DM"),
       String(msg.from?.id     || "0"),
       String(msg.from?.first_name || msg.from?.username || "unknown"),
-      String(content          || ""),
+      String(content          || "").slice(0, 5000),
       String(statusTag),
       String(fieldTag),
       String(milestoneDate),
