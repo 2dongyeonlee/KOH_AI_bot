@@ -360,21 +360,25 @@ async function handleScheduleQuery(env, chatId, query) {
     toDate = d.toISOString().slice(0, 10);
   }
 
+  // 특정 날짜(오늘/내일/날짜지정) → NULL 제외. 이번주 범위 → NULL 포함
+  const isSpecificDate = fromDate === toDate;
+  const dateCondition = isSpecificDate
+    ? "milestone_date >= ? AND milestone_date <= ?"
+    : "milestone_date IS NULL OR (milestone_date >= ? AND milestone_date <= ?)";
+
   const rows = (await env.DB.prepare(
-    `SELECT sender_name, summary, content, milestone_date, MIN(rowid) AS rid
+    `SELECT sender_name, summary, content, milestone_date, status_tag, MIN(rowid) AS rid
      FROM messages
-     WHERE status_tag NOT IN ('#보고', '#Fup', '#공유')
+     WHERE status_tag NOT IN ('#Fup', '#공유')
        AND (
          status_tag = '#일정'
          OR content LIKE '%회의%' OR content LIKE '%미팅%'
          OR content LIKE '%행사%' OR content LIKE '%기공식%'
          OR content LIKE '%보고회%' OR content LIKE '%발표회%'
          OR content LIKE '%워크숍%' OR content LIKE '%세미나%'
+         OR (status_tag = '#보고' AND milestone_date IS NOT NULL)
        )
-       AND (
-         milestone_date IS NULL
-         OR (milestone_date >= ? AND milestone_date <= ?)
-       )
+       AND (${dateCondition})
      GROUP BY COALESCE(NULLIF(summary,''), content), sender_name, milestone_date
      ORDER BY milestone_date ASC, rid DESC
      LIMIT 20`
@@ -419,7 +423,8 @@ async function handleScheduleQuery(env, chatId, query) {
       .trim()
       .slice(0, 60);
     const sender = row.sender_name ? ` / ${row.sender_name}` : "";
-    return `• ${prefix}${title}${sender}`;
+    const tag = row.status_tag === "#보고" ? "[보고] " : "";
+    return `• ${prefix}${tag}${title}${sender}`;
   }).filter((line) => (seenLines.has(line) ? false : (seenLines.add(line), true)));
 
   const header =
