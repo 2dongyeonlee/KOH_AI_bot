@@ -772,16 +772,17 @@ async function runReportBriefing(env, replyChatId = null) {
   ).results || [];
 
   const schedules = rows.filter((row) =>
-    row.status_tag !== "#보고" &&
     row.status_tag !== "#Fup" &&
-    row.status_tag !== "#공유" &&
     (
       row.status_tag === "#일정" ||
+      PAT_SCHEDULE.test(row.content || "") ||
       /회의|미팅|행사|기공식|보고회|발표회|워크숍|세미나/.test(row.content || "")
-    )
+    ) &&
+    row.status_tag !== "#보고"
   );
-  const reports = rows.filter(
-    (row) => row.status_tag === "#보고" && (row.is_due_soon || row.is_recent)
+  const reports = rows.filter((row) =>
+    (row.status_tag === "#보고" || PAT_REPORT.test(row.content || row.summary || "")) &&
+    (row.is_due_soon || row.is_recent || !row.milestone_date)
   );
   const highlights = rows.filter((row) =>
     ["#공유", "#Fup"].includes(row.status_tag) && row.is_recent
