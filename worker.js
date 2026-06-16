@@ -393,6 +393,7 @@ async function handleScheduleQuery(env, chatId, query) {
      WHERE status_tag NOT IN ('#Fup')
        AND (
          status_tag = '#일정'
+         OR status_tag = '#의사결정'
          OR (status_tag = '#보고' AND milestone_date IS NOT NULL)
          OR content LIKE '%회의%' OR content LIKE '%미팅%'
          OR content LIKE '%행사%' OR content LIKE '%기공식%'
@@ -402,6 +403,8 @@ async function handleScheduleQuery(env, chatId, query) {
          OR content LIKE '%일정 공유%' OR content LIKE '%일정 반영%'
          OR content LIKE '%일정 안내%' OR content LIKE '%참석 부탁%'
          OR content LIKE '%참석 예정%'
+         OR content LIKE '%의사결정%' OR content LIKE '%결정 필요%'
+         OR content LIKE '%검토 부탁%' OR content LIKE '%승인 필요%'
        )
        AND (${dateCondition})
      GROUP BY COALESCE(NULLIF(summary,''), content), sender_name, milestone_date
@@ -499,8 +502,9 @@ async function handleScheduleQuery(env, chatId, query) {
 
   const schedulePrompt = `오늘: ${today} / 조회 날짜: ${dateRange}
 
-아래 데이터에서 "${queryLabel}"(${dateRange}) 날짜와 직접 관련된 일정·보고·의사결정만 추려서 출력.
-제외 기준: 다른 날짜 항목, 질문, 잡담, 공지, 보도자료, "~하지 않을까요" 같은 논의성 메시지.
+아래 데이터에서 업무 관련 항목 전체를 섹션별로 정리.
+포함 기준: 일정·보고·의사결정 모두 포함. 날짜가 없는 항목도 포함.
+제외 기준: 봇에게 한 질문, 잡담, 인사, "~하지 않을까요" 같은 논의성 메시지만 제외.
 HTML 태그 사용(<b>, <u>). 해당 항목 없는 섹션은 전체 생략.
 
 📅 ${queryLabel} 일정
@@ -601,8 +605,12 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
         const roomLabel   = fh.room_title  ? `[${fh.room_title}]`  : "";
         const senderLabel = fh.sender_name ? `${fh.sender_name} 공유` : "";
         const attr = [roomLabel, senderLabel].filter(Boolean).join(" / ");
-        await sendDocument(env, chatId, fh.file_id,
-          `요청하신 자료입니다.${attr ? ` (${attr})` : ""}\n${fh.file_name || ""}`.trim());
+        const caption = `요청하신 자료입니다.${attr ? ` (${attr})` : ""}\n${fh.file_name || ""}`.trim();
+        const result = await sendDocument(env, chatId, fh.file_id, caption);
+        if (!result?.ok) {
+          await sendMessage(env, chatId,
+            `<b>${fh.file_name || "파일"}</b> 전송 실패.\n파일이 만료됐거나 접근할 수 없습니다.${attr ? ` (${attr})` : ""}`);
+        }
       }
       await saveChatHistory(env, chatId, query,
         fileHits.map(f => f.file_name || "(파일)").join(", "),
