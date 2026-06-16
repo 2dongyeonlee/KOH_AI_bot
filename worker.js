@@ -383,14 +383,18 @@ async function handleScheduleQuery(env, chatId, query) {
   const rows = (await env.DB.prepare(
     `SELECT sender_name, summary, content, milestone_date, status_tag, MIN(rowid) AS rid
      FROM messages
-     WHERE status_tag NOT IN ('#Fup', '#공유')
+     WHERE status_tag NOT IN ('#Fup')
        AND (
          status_tag = '#일정'
+         OR (status_tag = '#보고' AND milestone_date IS NOT NULL)
          OR content LIKE '%회의%' OR content LIKE '%미팅%'
          OR content LIKE '%행사%' OR content LIKE '%기공식%'
          OR content LIKE '%보고회%' OR content LIKE '%발표회%'
          OR content LIKE '%워크숍%' OR content LIKE '%세미나%'
-         OR (status_tag = '#보고' AND milestone_date IS NOT NULL)
+         OR content LIKE '%일정 변경%' OR content LIKE '%일정 확정%'
+         OR content LIKE '%일정 공유%' OR content LIKE '%일정 반영%'
+         OR content LIKE '%일정 안내%' OR content LIKE '%참석 부탁%'
+         OR content LIKE '%참석 예정%'
        )
        AND (${dateCondition})
      GROUP BY COALESCE(NULLIF(summary,''), content), sender_name, milestone_date
