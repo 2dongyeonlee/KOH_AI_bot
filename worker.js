@@ -458,19 +458,17 @@ async function handleScheduleQuery(env, chatId, query) {
            WHERE status_tag NOT IN ('#Fup')
              AND content NOT LIKE '%알려줘%'
              AND content NOT LIKE '%해줘%'
+             AND content NOT LIKE '%있나%'
+             AND content NOT LIKE '%있어%'
+             AND content NOT LIKE '%뭐야%'
+             AND content NOT LIKE '%뭐가 있%'
+             AND content NOT LIKE '%부탁해요%'
              AND content NOT LIKE '%보여줘%'
-             AND content NOT LIKE '%브리핑%'
-             AND content NOT LIKE '%찾아줘%'
-             AND content NOT LIKE '%요약해줘%'
              AND content NOT LIKE '%정리해줘%'
-             AND content NOT LIKE '%보내줘%'
-             AND content NOT LIKE '%해줄래%'
-             AND length(content) >= 15
-             AND (
-               ${keywordLikes}
-               OR content LIKE '%회의%' OR content LIKE '%미팅%'
-             )
-             AND created_at >= datetime('now', '-7 days')
+             AND content NOT LIKE '%찾아줘%'
+             AND length(content) >= 20
+             AND (${keywordLikes})
+             AND created_at >= datetime('now', '-3 days')
            GROUP BY COALESCE(NULLIF(summary,''), content), sender_name
            ORDER BY created_at DESC
            LIMIT 10`
@@ -494,33 +492,40 @@ async function handleScheduleQuery(env, chatId, query) {
   const DAY = ["일", "월", "화", "수", "목", "금", "토"];
   const seenLines = new Set();
   const lines = filtered.map((row) => {
-    let prefix = "";
+    // 날짜·D-N 레이블
+    let dateLabel = "";
     if (row.milestone_date) {
       const d = new Date(row.milestone_date + "T00:00:00+09:00");
-      const mm = String(d.getMonth() + 1).padStart(2, "0");
-      const dd = String(d.getDate()).padStart(2, "0");
+      const diff = Math.round((d - now) / 86400000);
+      const mo  = d.getMonth() + 1;
+      const da  = d.getDate();
       const dow = DAY[d.getDay()];
-      prefix = `${mm}/${dd}(${dow}) / `;
+      if (row.status_tag === "#보고") {
+        dateLabel = diff === 0 ? "[D-0]" : diff > 0 && diff <= 3 ? `[D-${diff}]` : `[${mo}/${da}(${dow})]`;
+      } else {
+        dateLabel = `[${mo}/${da}(${dow})]`;
+      }
     }
-    const rawLines = String(row.summary || row.content || "")
-      .split("\n").map((l) => l.trim()).filter(Boolean);
-    const bodyLine = rawLines.find((l) => !l.startsWith("#")) || rawLines[0] || "";
-    const title = bodyLine
+    // 제목 (첫 줄) + 컨텍스트 (둘째 줄)
+    const raws = String(row.summary || row.content || "")
+      .split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+    const title = (raws[0] || "")
       .replace(/^[-•*●·]\s*/, "")
       .replace(/^(업무명|제목|내용|일정|회의명|행사명)\s*[:：]\s*/, "")
-      .trim()
-      .slice(0, 60);
+      .trim().slice(0, 50);
+    const ctx    = (raws[1] || "").slice(0, 60);
     const sender = row.sender_name ? ` / ${row.sender_name}` : "";
-    const tag = row.status_tag === "#보고" ? "[보고] " : "";
-    return `• ${prefix}${tag}${title}${sender}`;
+    const main   = `• ${dateLabel} ${title}${sender}`.replace(/\s{2,}/g, " ").trim();
+    return ctx ? `${main}\n └ ${ctx}` : main;
   }).filter((line) => (seenLines.has(line) ? false : (seenLines.add(line), true)));
 
+  const section =
+    (wantEvent && !wantMeeting) ? "📌 주요 행사" :
+    (wantMeeting && !wantEvent) ? "📌 회의 일정" : "📌 주요 일정";
   const header =
-    /(오늘|today)/.test(query)   ? "오늘 일정" :
-    /(내일|tomorrow)/.test(query) ? "내일 일정" :
-    (wantEvent && !wantMeeting)   ? "이번주 주요 행사" :
-    (wantMeeting && !wantEvent)   ? "이번주 회의 일정" :
-    "이번주 주요 일정";
+    /(오늘|today)/.test(query)   ? `📅 오늘 일정\n\n${section}` :
+    /(내일|tomorrow)/.test(query) ? `📅 내일 일정\n\n${section}` :
+    `📅 이번주 일정\n\n${section}`;
 
   return sendMessage(env, chatId, `${header}\n\n${lines.join("\n")}`);
 }
