@@ -973,8 +973,8 @@ async function insertMessage(env, options) {
   // Vectorize 색인 (실패해도 저장은 유지)
   if (lastRowId && env.AI && env.VECTORIZE) {
     try {
-      const textToEmbed = [fileName, summary, content]
-        .filter(Boolean).join(" ").slice(0, 2000);
+      const textToEmbed = [fileName, fileName, summary, content]
+        .filter(Boolean).join(" ").slice(0, 6000);
       const vector = await embedText(env, textToEmbed);
       if (vector) {
         await env.VECTORIZE.upsert([{
@@ -1219,7 +1219,8 @@ async function handleReindex(env, chatId) {
   }
 
   const texts = rows.map((row) =>
-    [row.file_name, row.summary, row.content].filter(Boolean).join(" "));
+    [row.file_name, row.file_name, row.summary, row.content]
+      .filter(Boolean).join(" ").slice(0, 6000));
 
   // 청크 안에서 10건씩 나눠 임베딩 (모델 배치 한도 회피)
   const SUB = 10;
