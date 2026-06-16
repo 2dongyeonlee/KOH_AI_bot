@@ -2165,21 +2165,9 @@ async function isQueryToBot(env, msg, text) {
   const botName = (env.BOT_USERNAME || "").toLowerCase();
   const mentionedByName = botName && text.toLowerCase().includes(`@${botName}`);
   const isReply = !!msg.reply_to_message?.from?.is_bot;
-  if (hasMention || mentionedByName || isReply) return true;
-
-  // 맥락 연속성: 최근 10분 내 봇이 이 방에서 응답했으면 멘션 없이도 응답
-  try {
-    const row = await env.DB.prepare(
-      `SELECT last_reply_at FROM bot_sessions WHERE room_id = ?`
-    ).bind(String(msg.chat.id)).first();
-    if (row?.last_reply_at) {
-      const lastReply = new Date(row.last_reply_at + "Z");
-      const diffMin = (Date.now() - lastReply.getTime()) / 60000;
-      if (diffMin <= 10) return true;
-    }
-  } catch (e) { console.error("session check error", e.message); }
-
-  return false;
+  // 단체방: 멘션 또는 봇 메시지에 Reply한 경우만 응답
+  // (맥락 연속성 제거 — 끼어들기 방지)
+  return hasMention || mentionedByName || isReply;
 }
 
 async function updateBotSession(env, chatId) {
