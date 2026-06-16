@@ -1384,7 +1384,11 @@ async function searchFiles(env, query) {
 }
 
 async function searchMemory(env, query) {
-  // 1순위: Vectorize 시맨틱 검색
+  // 키워드 검색과 의미 검색을 항상 병행 → 병합
+  let vectorRows = [];
+  let likeRows = [];
+
+  // 의미 검색 (Vectorize)
   if (env.AI && env.VECTORIZE) {
     try {
       const qVec = await embedText(env, query);
@@ -1395,25 +1399,36 @@ async function searchMemory(env, query) {
           .filter(n => Number.isFinite(n) && n > 0);
         if (ids.length > 0) {
           const ph = ids.map(() => "?").join(",");
-          const rows = await env.DB.prepare(
+          const r = await env.DB.prepare(
             `SELECT rowid, content, sender_name, summary, action_items,
                     milestone_date, file_id, file_name, room_title
              FROM messages WHERE rowid IN (${ph})
              ORDER BY rowid DESC`
           ).bind(...ids).all();
-          if (rows.results?.length > 0) {
-            console.log("Vectorize hit:", rows.results.length);
-            return rows.results;
-          }
+          vectorRows = r.results || [];
         }
       }
     } catch (e) {
-      console.error("Vectorize search error, falling back:", e.message);
+      console.error("Vectorize search error:", e.message);
     }
   }
 
-  // 2순위: D1 키워드 LIKE 검색
-  return likeSearch(env, query);
+  // 키워드 검색 (LIKE) — 항상 실행
+  try {
+    likeRows = await likeSearch(env, query);
+  } catch (e) {
+    console.error("likeSearch error:", e.message);
+  }
+
+  // 병합: 키워드 결과를 앞에 (정확도 우선), 중복 제거
+  const seen = new Set();
+  const merged = [...likeRows, ...vectorRows].filter(r => {
+    const key = String(r.rowid || (r.content || "").slice(0, 40));
+    return seen.has(key) ? false : (seen.add(key), true);
+  });
+
+  console.log(`searchMemory: like=${likeRows.length} vec=${vectorRows.length} merged=${merged.length}`);
+  return merged.slice(0, 12);
 }
 
 const NAME_ALIASES = {
