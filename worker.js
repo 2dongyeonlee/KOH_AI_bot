@@ -641,57 +641,56 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
 
   // 파일 요청: 파일 전용 검색(file_id 보장) → 상위 3개 전송 또는 명확한 안내
   if (isFileReq) {
-    const fileCandidates = await searchFiles(env, query);
-    const seen = new Set();
-    const fileHits = fileCandidates
-      .map((h) => ({ hit: h, score: scoreFileHit(query, h) }))
-      .filter((i) => i.score > 0)
-      .sort((a, b) => b.score - a.score)
-      .filter((i) => {
-        const key = i.hit.file_name || i.hit.file_id;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      })
-      .slice(0, 3)
-      .map((i) => i.hit);
-
-    if (fileHits.length) {
-      for (const fh of fileHits) {
-        const roomLabel   = fh.room_title  ? `[${fh.room_title}]`  : "";
-        const senderLabel = fh.sender_name ? `${fh.sender_name} 공유` : "";
-        const attr = [roomLabel, senderLabel].filter(Boolean).join(" / ");
-        const caption = `요청하신 자료입니다.${attr ? ` (${attr})` : ""}\n${fh.file_name || ""}`.trim();
-        let result = await sendDocument(env, chatId, fh.file_id, caption);
-        // file_id 실패 시 원본 방에서 copyMessage 폴백
-        if (!result?.ok && fh.room_id && fh.telegram_message_id) {
-          result = await copyMessage(env, chatId, fh.room_id, fh.telegram_message_id);
-          if (result?.ok) {
-            await sendMessage(env, chatId, caption);
-          }
-        }
-        if (!result?.ok) {
-          // 파일·복사 모두 실패 시 저장된 내용(요약/원문) 텍스트로 제공
-          const body = (fh.summary || fh.content || "").slice(0, 600).trim();
-          if (body) {
-            await sendMessage(env, chatId,
-              `파일 직접 전송은 실패했지만 내용을 공유합니다.${attr ? ` (${attr})` : ""}\n<b>${fh.file_name || ""}</b>\n\n${body}`);
-          } else {
-            await sendMessage(env, chatId,
-              `<b>${fh.file_name || "파일"}</b> 전송 실패. 파일을 다시 업로드해 주세요.${attr ? ` (${attr})` : ""}`);
-          }
-        }
+    // 파일·사진·텍스트 통합 검색 (searchMemory = 하이브리드)
+    const allHits  = await searchMemory(env, query);
+    const fileHits = allHits.filter(h => h.file_id && h.file_id !== "");
+    const textHits = allHits.filter(h => !h.file_id || h.file_id === "");
+    let sentCount = 0;
+    // 1. 파일·사진 전송
+    for (const fh of fileHits.slice(0, 3)) {
+      const roomLabel   = fh.room_title  ? `[${fh.room_title}]`  : "";
+      const senderLabel = fh.sender_name ? `${fh.sender_name} 공유` : "";
+      const attr    = [roomLabel, senderLabel].filter(Boolean).join(" / ");
+      const caption = `요청하신 자료입니다.${attr ? ` (${attr})` : ""}\n${fh.file_name || ""}`.trim();
+      let result = await sendDocument(env, chatId, fh.file_id, caption);
+      // file_id 실패 → copyMessage 폴백 (원본 형식 유지 - 사진도 사진으로)
+      if (!result?.ok && fh.room_id && fh.telegram_message_id) {
+        result = await copyMessage(env, chatId, fh.room_id, fh.telegram_message_id);
+        if (result?.ok) await sendMessage(env, chatId, caption);
       }
-      await saveChatHistory(env, chatId, query,
-        fileHits.map(f => f.file_name || "(파일)").join(", "),
-        { files: fileHits.map(f => ({ name: f.file_name || "", room: f.room_title || "" })) }
-      );
-      await updateBotSession(env, chatId);
-      return;
+      // 파일 전송도 실패 → 텍스트 내용 폴백
+      if (!result?.ok) {
+        const body = (fh.summary || fh.content || "").slice(0, 600).trim();
+        if (body) {
+          await sendMessage(env, chatId,
+            `파일 전송 실패, 내용 공유합니다.${attr ? ` (${attr})` : ""}\n<b>${fh.file_name || ""}</b>\n\n${body}`);
+        }
+      } else {
+        sentCount++;
+      }
     }
-    await sendMessage(env, chatId,
-      "요청하신 자료를 저장소에서 찾지 못했습니다.\n" +
-      "파일명이나 키워드를 더 구체적으로 알려주시면 다시 찾겠습니다.");
+    // 2. 파일 없는 텍스트 내용 → LLM이 요약해서 답변
+    if (textHits.length > 0) {
+      const textContext = textHits.slice(0, 5).map(h => {
+        const room   = h.room_title  ? `[${h.room_title}] ` : "";
+        const sender = h.sender_name ? `${h.sender_name}: ` : "";
+        const body   = (h.summary || h.content || "").slice(0, 400);
+        return `${room}${sender}${body}`;
+      }).join("\n\n─────\n\n");
+      const textPrompt = `사용자 질문: "${query}"\n\n아래 관련 내용 중 질문과 관련된 것을 찾아 정리해줘.\n없는 내용은 만들지 말 것.\n\n${textContext}`;
+      const answer = await callClaude(env, textPrompt, "", MODEL_SMART);
+      if (answer) await sendMessage(env, chatId, answer);
+      sentCount++;
+    }
+    // 3. 아무것도 없으면
+    if (sentCount === 0 && fileHits.length === 0) {
+      await sendMessage(env, chatId,
+        "관련 자료나 내용을 찾지 못했습니다.\n키워드를 더 구체적으로 알려주시면 다시 찾겠습니다.");
+    }
+    await saveChatHistory(env, chatId, query,
+      fileHits.map(f => f.file_name || "(파일)").join(", ") || "텍스트 내용",
+      { files: fileHits.map(f => ({ name: f.file_name || "", room: f.room_title || "" })) }
+    );
     await updateBotSession(env, chatId);
     return;
   }
@@ -1586,7 +1585,7 @@ async function searchMemory(env, query) {
           const ph = ids.map(() => "?").join(",");
           const r = await env.DB.prepare(
             `SELECT rowid, content, sender_name, summary, action_items,
-                    milestone_date, file_id, file_name, room_title
+                    milestone_date, file_id, file_name, room_title, room_id, telegram_message_id
              FROM messages WHERE rowid IN (${ph})
              ORDER BY rowid DESC`
           ).bind(...ids).all();
@@ -1695,7 +1694,7 @@ async function likeSearch(env, query) {
 
   const rows = await env.DB.prepare(
     `SELECT rowid, content, sender_name, summary, action_items,
-            milestone_date, file_id, file_name, room_title
+            milestone_date, file_id, file_name, room_title, room_id, telegram_message_id
      FROM messages
      WHERE (${where})
      ORDER BY datetime(created_at) DESC
