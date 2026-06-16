@@ -1,6 +1,11 @@
 const MODEL_FAST = "claude-haiku-4-5-20251001";  // 단순 대화
 const MODEL_SMART = "claude-sonnet-4-6";          // 분석·브리핑
 const STATUS_TAGS = ["#보고", "#Fup", "#공유", "#일정"];
+
+// ── 자연어 분류 패턴 ──────────────────────────────
+const PAT_REPORT   = /보고\s*드립니다|보고드립니다|보고\s*올립니다|말씀\s*드립니다|보고\s*합니다|보고\s*하겠습니다|주요\s*사항|보고\s*내용|보고\s*자료|결과\s*보고|진행\s*보고|현황\s*보고|상황\s*공유|공유\s*드립니다/;
+const PAT_SCHEDULE = /일정\s*(변경|확정|공유|안내|반영|업데이트)|참석\s*(부탁|예정|하겠|가능)|일정\s*(입니다|됩니다)|시간\s*확인|날짜\s*변경/;
+const PAT_DECISION = /의사결정|결정\s*필요|승인\s*(필요|부탁)|검토\s*(부탁|요청|필요)|어떻게\s*할까요|방향\s*(결정|확인)|피드백\s*(부탁|요청)/;
 const DEFAULT_SYSTEM_PROMPT =
   `너는 SK하이닉스 6R전략실 권오혁 담당의 전담 AI 비서 권오혁(A)다.
 
@@ -1083,8 +1088,17 @@ async function extractDocumentText(env, fileUrl, fileName) {
     .join("\n") || "[문서 분석 실패]";
 }
 
+function inferStatusTag(text, existingTag) {
+  if (existingTag) return existingTag;
+  if (PAT_REPORT.test(text))   return "#보고";
+  if (PAT_SCHEDULE.test(text)) return "#일정";
+  if (PAT_DECISION.test(text)) return "#의사결정";
+  return "";
+}
+
 async function saveMessage(env, msg, content) {
-  await insertMessage(env, { msg, content });
+  const inferredTag = inferStatusTag(content, "");
+  await insertMessage(env, { msg, content, statusTag: inferredTag });
 }
 
 async function insertMessage(env, options) {
