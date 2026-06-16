@@ -554,6 +554,7 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
   const isScheduleReq =
     !isFileReq &&
     !/브리핑/.test(query) &&
+    !/자료|파일|문서|어디/.test(query) &&
     (
       /(일정|스케줄)/.test(query) ||
       /(이번주|오늘|내일|이번달|금주).*(뭐|있|일정|스케줄)/.test(query) ||
