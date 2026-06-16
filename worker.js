@@ -1486,11 +1486,16 @@ async function sendMessage(env, chatId, text) {
 }
 
 async function sendDocument(env, chatId, fileId, caption) {
-  await fetch(`${telegramApi(env)}/sendDocument`, {
+  const res = await fetch(`${telegramApi(env)}/sendDocument`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, document: fileId, caption }),
   });
+  const data = await res.json();
+  if (!data.ok) {
+    console.error("sendDocument FAILED:", data.error_code, data.description, "file_id:", fileId);
+  }
+  return data;
 }
 
 async function getFileUrl(env, fileId) {
