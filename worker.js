@@ -673,12 +673,18 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
     ? hits.map((hit) => {
         const room   = hit.room_title ? `(출처: ${hit.room_title}) ` : "";
         const label  = classifyRow(hit);
+        // summary와 content 둘 다 제공 (요약이 부실해도 원문으로 보완)
+        const summaryText = (hit.summary || "").trim();
+        const contentText = (hit.content || "").slice(0, 800).trim();
+        const bodyParts = [];
+        if (summaryText) bodyParts.push(`요약: ${summaryText}`);
+        if (contentText && contentText !== summaryText) bodyParts.push(`원문: ${contentText}`);
+        const body = bodyParts.join("\n  ") || "(내용 없음)";
         return `[${label}] ${room}
 - 작성자: ${hit.sender_name || ""}
-- 내용: ${hit.summary || (hit.content || "").slice(0, 100)}
-- 마감: ${hit.milestone_date || "없음"}
-- 액션: ${hit.action_items || "없음"}`;
-      }).join("\n\n").slice(0, 5000)
+- ${body}
+- 마감: ${hit.milestone_date || "없음"}`;
+      }).join("\n\n").slice(0, 9000)
     : "";
 
   const fullContext = [replyContext, recentRawContext, internalContext].filter(Boolean).join("\n\n");
