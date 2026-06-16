@@ -329,19 +329,24 @@ async function handleScheduleQuery(env, chatId, query) {
   }
 
   const rows = (await env.DB.prepare(
-    `SELECT sender_name, summary, content, milestone_date
+    `SELECT sender_name, summary, content, milestone_date, MIN(rowid) AS rid
      FROM messages
-     WHERE (
-       status_tag = '#일정'
-       OR (milestone_date >= ? AND milestone_date <= ?)
-       OR content LIKE '%회의%' OR content LIKE '%미팅%'
-       OR content LIKE '%행사%' OR content LIKE '%발표%'
-       OR content LIKE '%기공식%' OR content LIKE '%보고회%'
-     )
-     AND (milestone_date IS NULL OR milestone_date >= ?)
-     ORDER BY milestone_date ASC, created_at DESC
+     WHERE status_tag NOT IN ('#보고', '#Fup', '#공유')
+       AND (
+         status_tag = '#일정'
+         OR content LIKE '%회의%' OR content LIKE '%미팅%'
+         OR content LIKE '%행사%' OR content LIKE '%기공식%'
+         OR content LIKE '%보고회%' OR content LIKE '%발표회%'
+         OR content LIKE '%워크숍%' OR content LIKE '%세미나%'
+       )
+       AND (
+         milestone_date IS NULL
+         OR (milestone_date >= ? AND milestone_date <= ?)
+       )
+     GROUP BY COALESCE(NULLIF(summary,''), content), sender_name, milestone_date
+     ORDER BY milestone_date ASC, rid DESC
      LIMIT 20`
-  ).bind(fromDate, toDate, fromDate).all()).results || [];
+  ).bind(fromDate, toDate).all()).results || [];
 
   if (!rows.length) {
     return sendMessage(env, chatId,
@@ -349,6 +354,7 @@ async function handleScheduleQuery(env, chatId, query) {
   }
 
   const DAY = ["일", "월", "화", "수", "목", "금", "토"];
+  const seenLines = new Set();
   const lines = rows.map((row) => {
     let prefix = "";
     if (row.milestone_date) {
@@ -358,10 +364,13 @@ async function handleScheduleQuery(env, chatId, query) {
       const dow = DAY[d.getDay()];
       prefix = `${mm}/${dd}(${dow}) / `;
     }
-    const title = (row.summary || row.content || "").split("\n")[0].slice(0, 60);
+    const rawLines = String(row.summary || row.content || "")
+      .split("\n").map((l) => l.trim()).filter(Boolean);
+    const bodyLine = rawLines.find((l) => !l.startsWith("#")) || rawLines[0] || "";
+    const title = bodyLine.slice(0, 60);
     const sender = row.sender_name ? ` / ${row.sender_name}` : "";
     return `• ${prefix}${title}${sender}`;
-  });
+  }).filter((line) => (seenLines.has(line) ? false : (seenLines.add(line), true)));
 
   const header = /(오늘|today)/.test(query) ? "오늘 일정"
     : /(내일|tomorrow)/.test(query) ? "내일 일정"
