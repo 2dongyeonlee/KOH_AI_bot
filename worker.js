@@ -1211,8 +1211,12 @@ async function extractDocumentText(env, fileUrl, fileName) {
     .join("\n") || "[문서 분석 실패]";
 }
 
+const BOT_QUERY = /알려줘|보여줘|정리해줘|요약해줘|공유해줘|찾아줘|보내줘|알려주|해줘|해줄래|있나\?|뭐야|뭐있어|브리핑|요약|정리|분석/;
+
 function inferStatusTag(text, existingTag) {
   if (existingTag) return existingTag;
+  if (BOT_QUERY.test(text)) return "";
+  if (text.trim().length < 15) return "";
   if (PAT_REPORT.test(text))   return "#보고";
   if (PAT_SCHEDULE.test(text)) return "#일정";
   if (PAT_DECISION.test(text)) return "#의사결정";
@@ -1221,6 +1225,8 @@ function inferStatusTag(text, existingTag) {
 
 function extractDateFromText(text) {
   if (!text) return "";
+  if (BOT_QUERY.test(text)) return "";
+  if (text.trim().length < 15) return "";
   const now  = new Date(Date.now() + 9 * 3600000);
   const year = now.getFullYear();
 
