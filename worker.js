@@ -549,6 +549,46 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
   // ── 답장 컨텍스트 추출 ──────────────────────────────
   const replyMsg     = msg?.reply_to_message;
   const replyContent = (replyMsg?.text || replyMsg?.caption || "").trim();
+  // Reply 메시지에 파일(사진/PDF/PPTX/DOCX 등)이 있으면 직접 분석
+  let replyFileAnalysis = "";
+  if (replyMsg && !replyContent) {
+    try {
+      const replyPhoto = replyMsg.photo?.[replyMsg.photo.length - 1];
+      const replyDoc   = replyMsg.document;
+      if (replyPhoto) {
+        // 사진
+        const url = await getFileUrl(env, replyPhoto.file_id);
+        const result = await describeImage(env, url, query);
+        if (result) replyFileAnalysis = `[답장 이미지 분석]\n${result}`;
+      } else if (replyDoc) {
+        const mime = replyDoc.mime_type || "";
+        const name = replyDoc.file_name || "";
+        const url  = await getFileUrl(env, replyDoc.file_id);
+        if (mime.startsWith("image/")) {
+          // 이미지 문서
+          const result = await describeImage(env, url, query);
+          if (result) replyFileAnalysis = `[답장 이미지 분석]\n${result}`;
+        } else if (
+          mime === "application/pdf" ||
+          mime.includes("presentation") ||   // PPTX
+          mime.includes("wordprocessing") ||  // DOCX
+          mime.includes("spreadsheet") ||     // XLSX
+          mime.includes("ms-powerpoint") ||
+          mime.includes("ms-word") ||
+          mime.includes("ms-excel") ||
+          /\.(pdf|pptx|ppt|docx|doc|xlsx|xls)$/i.test(name)
+        ) {
+          // 문서류 (PDF/PPTX/DOCX/XLSX)
+          const result = await extractDocumentText(env, url, name);
+          if (result && result !== "[문서 분석 실패]") {
+            replyFileAnalysis = `[답장 문서 분석: ${name}]\n${result.slice(0, 3000)}`;
+          }
+        }
+      }
+    } catch (e) {
+      console.error("replyFile analyze error:", e.message);
+    }
+  }
   const replyContext = replyContent
     ? `[답장 대상 메시지]\n${replyMsg?.from?.first_name || ""}: ${replyContent}\n`
     : "";
@@ -717,7 +757,7 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
       }).join("\n\n").slice(0, 9000)
     : "";
 
-  const fullContext = [replyContext, recentRawContext, internalContext].filter(Boolean).join("\n\n");
+  const fullContext = [replyContext, replyFileAnalysis, recentRawContext, internalContext].filter(Boolean).join("\n\n");
 
   let webResults = [];
   let webContext = "";
