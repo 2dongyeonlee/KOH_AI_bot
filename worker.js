@@ -456,6 +456,24 @@ async function handleQuery(env, chatId, query, msg = null) {
 
   const hits = await searchMemory(env, query);
 
+  // 내용 질의여도 관련 파일 본문을 컨텍스트에 추가
+  let fileContext = "";
+  {
+    const files = await searchFiles(env, query);
+    const topFiles = files
+      .map((h) => ({ hit: h, score: scoreFileHit(query, h) }))
+      .filter((i) => i.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 2)
+      .map((i) => i.hit);
+    if (topFiles.length) {
+      fileContext = "\n\n[관련 파일 내용]\n" +
+        topFiles.map((f) =>
+          `· ${f.file_name || "(파일)"}\n${(f.summary || f.content || "").slice(0, 1500)}`
+        ).join("\n\n");
+    }
+  }
+
   const internalContext = hits.length
     ? hits.map((hit) =>
         `[저장 자료]
@@ -488,6 +506,7 @@ async function handleQuery(env, chatId, query, msg = null) {
   const prompt = `
 ${historyContext ? `직전 대화:\n${historyContext}\n\n` : ""}
 ${internalContext ? `내부 자료:\n${internalContext}\n\n` : ""}
+${fileContext}
 ${webContext}
 
 지시:
