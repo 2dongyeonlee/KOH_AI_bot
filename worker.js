@@ -1576,14 +1576,53 @@ async function searchMemory(env, query) {
   return merged.slice(0, 12);
 }
 
-const NAME_ALIASES = {
-  "홍석윤": ["석윤", "홍석윤"],
-  "이기두": ["기두", "kidu", "이기두"],
-  "위예슬": ["예슬", "위예슬"],
-  "황성욱": ["성욱", "황성욱"],
-  "김선영": ["선영", "sy", "김선영"],
-  "김민아": ["민아", "김민아"],
-};
+// 사람 목록. 새 팀원 추가 시 이 배열에만 한 줄 추가하면 됨.
+// full: 성+이름 / telegram: 텔레그램 표시 형식 / english: 영문명 / extra: 기타 별칭
+const PEOPLE = [
+  { full: "염성진",  extra: ["사장님"] },
+  { full: "권오혁",  telegram: ["오혁 권"],  extra: ["권오혁(A)"] },
+  { full: "이동연",  telegram: ["동연 이"] },
+  { full: "구정모" },
+  { full: "홍석윤" },
+  { full: "이기두",  english: "Kidu Lee",    extra: ["Kidu", "kidu"] },
+  { full: "위예슬",  telegram: ["예슬 위"] },
+  { full: "황성욱",  telegram: ["성욱 황"] },
+  { full: "김선영",  telegram: ["선영 김"],  extra: ["SY", "sy", "SY Kim"] },
+  { full: "김민아",  telegram: ["민아 김"] },
+  { full: "성봉구",  english: "Bonggu Sung" },
+  { full: "손경배" },
+  { full: "한혜승" },
+  { full: "황무연",  english: "Moo Yeon" },
+  { full: "함동균" },
+  { full: "박호현" },
+  { full: "양서진" },
+  { full: "심슬아",  extra: ["Shim"] },
+];
+
+// 자동 변형 생성: "황성욱" → ["황성욱", "성욱", "성욱 황"] + extra/english
+function buildNameAliases(people) {
+  const result = {};
+  for (const p of people) {
+    const full      = p.full;
+    const lastName  = full.slice(0, 1);
+    const firstName = full.slice(1);
+    const variants  = new Set([
+      full,
+      firstName,
+      `${firstName} ${lastName}`,
+    ]);
+    (p.telegram || []).forEach(t => variants.add(t));
+    if (p.english) {
+      variants.add(p.english);
+      variants.add(p.english.split(" ")[0]);
+    }
+    (p.extra || []).forEach(e => variants.add(e));
+    result[full] = [...variants];
+  }
+  return result;
+}
+
+const NAME_ALIASES = buildNameAliases(PEOPLE);
 
 function expandWithAliases(terms) {
   const expanded = [...terms];
