@@ -422,14 +422,13 @@ async function handleScheduleQuery(env, chatId, query) {
       ? "(milestone_date >= ? AND milestone_date <= ?) OR (milestone_date IS NULL AND created_at >= datetime('now', '-3 days'))"
       : "milestone_date >= ? AND milestone_date <= ?";
 
-  const rows = (await env.DB.prepare(
-    `SELECT sender_name, summary, content, milestone_date, status_tag, MIN(rowid) AS rid
-     FROM messages
-     WHERE status_tag NOT IN ('#Fup')
-       AND (
+  // 콘텐츠 선택 조건. 키워드·태그 매칭이 기본이되,
+  // '오늘' 쿼리는 태그 없어도 주요 내용(길이 25자+ 최근 3일)이면 포함.
+  const keywordSelector = `
          status_tag = '#일정'
          OR status_tag = '#의사결정'
-         OR (status_tag = '#보고' AND milestone_date IS NOT NULL)
+         OR status_tag = '#보고'
+         OR status_tag = '#공유'
          OR content LIKE '%회의%' OR content LIKE '%미팅%'
          OR content LIKE '%행사%' OR content LIKE '%기공식%'
          OR content LIKE '%보고회%' OR content LIKE '%발표회%'
@@ -437,14 +436,26 @@ async function handleScheduleQuery(env, chatId, query) {
          OR content LIKE '%일정 변경%' OR content LIKE '%일정 확정%'
          OR content LIKE '%일정 공유%' OR content LIKE '%일정 반영%'
          OR content LIKE '%일정 안내%' OR content LIKE '%참석 부탁%'
-         OR content LIKE '%참석 예정%'
+         OR content LIKE '%참석 예정%' OR content LIKE '%보고%' OR content LIKE '%공유%'
          OR content LIKE '%의사결정%' OR content LIKE '%결정 필요%'
-         OR content LIKE '%검토 부탁%' OR content LIKE '%승인 필요%'
-       )
+         OR content LIKE '%검토 부탁%' OR content LIKE '%승인 필요%'`;
+  const looseSelector = isTodayQuery
+    ? ` OR (length(content) >= 25
+            AND content NOT LIKE '%알려줘%' AND content NOT LIKE '%보여줘%'
+            AND content NOT LIKE '%정리해줘%' AND content NOT LIKE '%요약해줘%'
+            AND content NOT LIKE '%찾아줘%' AND content NOT LIKE '%뭐야%')`
+    : "";
+  const contentSelector = `(${keywordSelector}${looseSelector})`;
+
+  const rows = (await env.DB.prepare(
+    `SELECT sender_name, summary, content, milestone_date, status_tag, MIN(rowid) AS rid
+     FROM messages
+     WHERE status_tag NOT IN ('#Fup')
+       AND ${contentSelector}
        AND (${dateCondition})
      GROUP BY COALESCE(NULLIF(summary,''), content), sender_name, milestone_date
      ORDER BY milestone_date ASC, rid DESC
-     LIMIT 20`
+     LIMIT 25`
   ).bind(fromDate, toDate).all()).results || [];
 
   // 행사/회의 유형 판별 → 후처리 필터
