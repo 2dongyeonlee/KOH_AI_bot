@@ -1840,11 +1840,13 @@ function cleanMention(text) {
 }
 
 function looksLikeFileRequest(query) {
-  // 일정/브리핑 의도가 명확하면 파일 요청 아님
   if (/(일정|스케줄|브리핑|보고 일정|회의|미팅).*(공유|알려|보여|정리|뭐)/.test(query)) return false;
   if (/(오늘|내일|이번주|이번달|금주).*(일정|스케줄|공유해|알려|보여)/.test(query)) return false;
-  // 자료·파일·문서 명시가 있어야 파일 요청
-  return /((자료|파일|문서|발표자료|보고서|패키지|package|pdf|ppt|장표).*(보내|전달|올려|공유|다운|다운로드|줘|주세요)|보내줘|전달해|올려줘|찾아서 줘|다운로드)/.test(query);
+  // 요약/정리/분석 의도면 파일 요청 아님
+  if (/(요약|정리|분석|설명|번역)(해줘|해|해봐|줘)?$/.test(query.trim())) return false;
+  // 지시어로 시작하면 파일 요청 아님 (이 자료, 그거, 방금 등)
+  if (/^(이|그|저|이거|그거|저거|이것|그것|저것|이 자료|그 자료|방금|위에|앞에)/.test(query.trim())) return false;
+  return /((자료|파일|문서|발표자료|보고서|패키지|package|pdf|ppt|장표).*(보내|전달|올려|공유|다운|다운로드|줘|주세요)|보내줘|전달해|올려줘|찾아서 줄래|다운로드)/.test(query);
 }
 
 function senderName(from) {
