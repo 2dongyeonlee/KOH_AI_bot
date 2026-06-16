@@ -472,7 +472,20 @@ async function handleScheduleQuery(env, chatId, query) {
 async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
   if (!query) return sendMessage(env, chatId, "질문 내용을 입력해주세요.");
 
+  // ── 답장 컨텍스트 추출 ──────────────────────────────
+  const replyMsg     = msg?.reply_to_message;
+  const replyContent = (replyMsg?.text || replyMsg?.caption || "").trim();
+  const replyContext = replyContent
+    ? `[답장 대상 메시지]\n${replyMsg?.from?.first_name || ""}: ${replyContent}\n`
+    : "";
+
+  // ── 지시어 / 요약단독 감지 ───────────────────────────
+  const PRONOUN_PATTERN      = /^(그거|이거|이것|그것|저것|위에|방금|아까|앞에|이\s*내용|그\s*내용|저\s*내용|위\s*내용|이\s*자료|그\s*자료)/;
+  const SUMMARY_ONLY_PATTERN = /^(요약|정리|분석|설명|번역|해석)(해줘|해|해봐|해\s*줘|해줄래|해줘요)?$/;
+  let isPronounQuery = PRONOUN_PATTERN.test(query.trim()) || SUMMARY_ONLY_PATTERN.test(query.trim());
+
   const isFileReq = looksLikeFileRequest(query);
+  const hasInlineContent = !isFileReq && query.includes("\n") && query.length > 100;
 
   // 파일 요청이면 브리핑·일정 라우팅으로 절대 빠지지 않는다.
   if (!isFileReq && /브리핑/.test(query)) {
@@ -493,6 +506,23 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
 
   const forwardRequest = parseForwardRequest(query);
   if (forwardRequest) return handleForwardRequest(env, chatId, query, forwardRequest, msg);
+
+  // ── 인라인 내용 직접 분석 (개행 포함 + 길이 > 100) ───
+  if (hasInlineContent) {
+    const lines      = query.split("\n");
+    const instruction = lines[0].trim();
+    const body        = lines.slice(1).join("\n").trim();
+    const sysP        = await getSystemPrompt(env);
+    const toneCtx     = isOwner
+      ? "\n\n[현재 대화 상대: 봇 주인 권오혁 담당님. 정중하게 답변.]"
+      : "\n\n[현재 대화 상대: 기타 사용자. 간결하고 직접적으로 답변.]";
+    const directPrompt = `[직접 제공된 내용]\n${body}\n\n지시: ${instruction}`;
+    const answer = await callClaude(env, directPrompt, sysP + toneCtx, MODEL_SMART);
+    await saveChatHistory(env, chatId, query, answer);
+    await sendMessage(env, chatId, answer);
+    await updateBotSession(env, chatId);
+    return;
+  }
 
   // 파일 요청: 파일 전용 검색(file_id 보장) → 상위 3개 전송 또는 명확한 안내
   if (isFileReq) {
@@ -535,6 +565,29 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
 
   const hits = await searchMemory(env, query);
 
+  // ── 지시어/요약 단독: 같은 방 최근 메시지 조회 ────────
+  let recentRawContext = "";
+  if (isPronounQuery && !replyContent) {
+    try {
+      const recent = (await env.DB.prepare(`
+        SELECT sender_name, content, created_at
+        FROM messages
+        WHERE room_id = ?
+          AND (is_bot_query = 0 OR is_bot_query IS NULL)
+          AND length(content) >= 10
+        ORDER BY created_at DESC
+        LIMIT 5
+      `).bind(String(chatId)).all()).results || [];
+      const ordered = [...recent].reverse();
+      if (ordered.length) {
+        recentRawContext = "[최근 대화 내용 (참고용)]\n" +
+          ordered.map(r => `${r.sender_name || "누군가"}: ${(r.content || "").slice(0, 300)}`).join("\n");
+      }
+    } catch (e) {
+      console.error("recentRawContext error:", e.message);
+    }
+  }
+
   // 내용 질의여도 관련 파일 본문을 컨텍스트에 추가
   let fileContext = "";
   {
@@ -564,6 +617,8 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
 - 액션: ${hit.action_items || "없음"}`;
       }).join("\n\n").slice(0, 5000)
     : "";
+
+  const fullContext = [replyContext, recentRawContext, internalContext].filter(Boolean).join("\n\n");
 
   let webResults = [];
   let webContext = "";
@@ -596,11 +651,12 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
     : "";
   const prompt = `
 ${historyContext ? `직전 대화:\n${historyContext}\n\n` : ""}
-${internalContext ? `내부 자료:\n${internalContext}\n\n` : ""}
+${fullContext ? `${fullContext}\n\n` : ""}
 ${fileContext}
 ${webContext}
 
 지시:
+- [답장 대상 메시지] 또는 [최근 대화 내용]이 있으면 그것을 분석 대상으로 사용
 - 내부 자료는 답변 품질을 높이기 위한 참고자료로만 조용히 활용
 - 사용자가 명시적으로 파일/자료를 요청한 경우에만 자료 존재를 언급
 - 의사결정이 필요한 내용이면 판단 포인트 제시
