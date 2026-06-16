@@ -86,6 +86,21 @@ const REPORT_BRIEFING_FORMAT = `
 - 없는 섹션은 전체 생략. "특이사항 없음" 쓰지 말 것.
 - 날짜: 오늘 [6/16], 내일 [6/17] 식으로 슬래시 숫자.
 
+섹션 분류 기준 (반드시 준수):
+- 📌 주요 일정: 담당급 이상(권오혁 담당, 황무연 담당, 손경배 담당, 함동균 담당 등)이
+  공유한 일정 또는 권오혁 담당님이 참석·인지해야 할 외부 일정
+- 🔔 보고: 팀장·TL급(구정모 팀장, 김민아 TL, 이기두 TL, 황성욱 TL, 위예슬 TL,
+  홍석윤 TL 등)이 올리는 보고 사항
+- 동일 항목은 두 섹션에 중복 표시 금지. 하나의 섹션에만 넣을 것.
+- 권오혁 담당님 본인이 처리하는 보고(사전보고 참석 등)는 📌 일정으로.
+
+날짜 필터 규칙 (반드시 준수):
+- 오늘 날짜보다 이전인 일정·보고는 📌 일정, 🔔 보고 섹션에 표시하지 말 것.
+- 예: 오늘이 6/16이면 [6/15], [6/14] 항목은 두 섹션에서 제외.
+- 단, 아직 완료되지 않은 진행 중 사항(날짜가 지났어도 후속 조치 필요)은
+  📋 주요 내용에만 표시.
+- 날짜 없는 항목은 최근 3일 이내 생성된 것만 포함.
+
 출력 양식:
 
 📅 YYYY-MM-DD Daily Briefing
@@ -381,11 +396,11 @@ async function handleScheduleQuery(env, chatId, query) {
     toDate = d.toISOString().slice(0, 10);
   }
 
-  // 특정 날짜(오늘/내일/날짜지정) → NULL 제외. 이번주 범위 → NULL 포함
+  // 특정 날짜(오늘/내일) → milestone_date 필수. 범위(이번주) → 최근 30일 이내 NULL 허용
   const isSpecificDate = fromDate === toDate;
   const dateCondition = isSpecificDate
     ? "milestone_date >= ? AND milestone_date <= ?"
-    : "milestone_date IS NULL OR (milestone_date >= ? AND milestone_date <= ?)";
+    : "(milestone_date >= ? AND milestone_date <= ?) OR (milestone_date IS NULL AND created_at >= datetime('now', '-30 days'))";
 
   const rows = (await env.DB.prepare(
     `SELECT sender_name, summary, content, milestone_date, status_tag, MIN(rowid) AS rid
@@ -1187,18 +1202,128 @@ function detectImageMediaType(contentType, imageUrl, buf) {
   return "image/jpeg";
 }
 
+async function extractOfficeText(buffer) {
+  const view = new DataView(buffer);
+  const u8   = new Uint8Array(buffer);
+  const dec  = new TextDecoder("utf-8", { fatal: false });
+  const texts = [];
+  let offset = 0;
+
+  while (offset + 30 <= buffer.byteLength) {
+    if (view.getUint32(offset, true) !== 0x04034b50) break;
+
+    const compression = view.getUint16(offset + 8,  true);
+    const compSize    = view.getUint32(offset + 18, true);
+    const nameLen     = view.getUint16(offset + 26, true);
+    const extraLen    = view.getUint16(offset + 28, true);
+    const dataOffset  = offset + 30 + nameLen + extraLen;
+    const name        = dec.decode(u8.slice(offset + 30, offset + 30 + nameLen));
+
+    const want =
+      name === "word/document.xml" ||
+      /^ppt\/slides\/slide\d+\.xml$/.test(name) ||
+      name === "xl/sharedStrings.xml";
+
+    if (want && compSize > 0) {
+      try {
+        const compData = u8.slice(dataOffset, dataOffset + compSize);
+        let xml = "";
+
+        if (compression === 0) {
+          xml = dec.decode(compData);
+        } else if (compression === 8) {
+          const ds = new DecompressionStream("deflate-raw");
+          const w  = ds.writable.getWriter();
+          const r  = ds.readable.getReader();
+          w.write(compData);
+          w.close();
+          const chunks = [];
+          while (true) {
+            const { done, value } = await r.read();
+            if (done) break;
+            if (value) chunks.push(value);
+          }
+          const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+          let p = 0;
+          for (const c of chunks) { out.set(c, p); p += c.length; }
+          xml = dec.decode(out);
+        }
+
+        if (xml) {
+          const text = xml
+            .replace(/<[^>]+>/g, " ")
+            .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+            .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#\d+;/g, " ")
+            .replace(/\s+/g, " ").trim();
+          if (text.length > 10) texts.push(text);
+        }
+      } catch (e) {
+        console.error("office xml error:", name, e.message);
+      }
+    }
+
+    offset = dataOffset + Math.max(compSize, 0);
+    if (offset <= dataOffset) { offset = dataOffset + 1; }
+  }
+
+  return texts.join("\n\n").slice(0, 8000);
+}
+
 async function extractDocumentText(env, fileUrl, fileName) {
-  if (!/\.pdf$/i.test(fileName)) {
-    return `[지원하지 않는 형식: ${fileName} — PDF와 이미지만 처리합니다]`;
+  const isPdf  = /\.pdf$/i.test(fileName);
+  const isDocx = /\.docx$/i.test(fileName);
+  const isPptx = /\.pptx$/i.test(fileName);
+  const isXlsx = /\.xlsx$/i.test(fileName);
+
+  if (!isPdf && !isDocx && !isPptx && !isXlsx) {
+    return `[지원하지 않는 형식: ${fileName} — PDF, DOCX, PPTX, XLSX, 이미지만 처리합니다]`;
   }
 
   const res = await fetch(fileUrl);
   const buf = await res.arrayBuffer();
 
   if (buf.byteLength > 32 * 1024 * 1024) {
-    return "[PDF 파일이 너무 큽니다 — 32MB 이하만 처리 가능합니다]";
+    return `[파일이 너무 큽니다 — 32MB 이하만 처리 가능합니다]`;
   }
 
+  // ── Office 형식 (ZIP+XML) ────────────────────────────────────
+  if (isDocx || isPptx || isXlsx) {
+    const rawText = await extractOfficeText(buf);
+    if (!rawText || rawText.length < 20) {
+      return `[${fileName} — 내용을 읽을 수 없습니다]`;
+    }
+    const typeLabel = isPptx ? "프레젠테이션" : isDocx ? "문서" : "스프레드시트";
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: MODEL_SMART,
+        max_tokens: 2000,
+        messages: [{
+          role: "user",
+          content: `이 ${typeLabel}을 SK하이닉스 6R전략실 권오혁 담당님 관점에서 분석해줘.
+아래 양식으로만 답해. 없는 항목은 없음.
+마크다운(#,*,**) 금지. 플레인 텍스트.
+
+일정: (문서에 나온 날짜·마감 중 캘린더에 넣을 것)
+의사결정사항: (담당님이 판단해야 할 사항. 사장님 보고 필요 여부도 포함)
+핵심 요약: (문서 전체 맥락 2~3줄)
+
+문서 내용:
+${rawText.slice(0, 6000)}`,
+        }],
+      }),
+    });
+    const data = await resp.json();
+    return (data.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n")
+      || "[문서 분석 실패]";
+  }
+
+  // ── PDF ────────────────────────────────────────────────────
   let binary = "";
   const bytes = new Uint8Array(buf);
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
