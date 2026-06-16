@@ -1060,8 +1060,14 @@ async function runReportBriefing(env, replyChatId = null) {
     ).all()
   ).results || [];
 
+  // 오늘 날짜 (KST)
+  const todayKST = new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10);
+  // 과거 milestone_date면 제외 (날짜 없으면 통과)
+  const notPast = (row) => !row.milestone_date || row.milestone_date >= todayKST;
+
   const schedules = rows.filter((row) =>
     row.status_tag !== "#Fup" &&
+    notPast(row) &&
     (
       row.status_tag === "#일정" ||
       PAT_SCHEDULE.test(row.content || "") ||
@@ -1071,6 +1077,7 @@ async function runReportBriefing(env, replyChatId = null) {
   );
   const reports = rows.filter((row) =>
     (row.status_tag === "#보고" || PAT_REPORT.test(row.content || row.summary || "")) &&
+    notPast(row) &&
     (row.is_due_soon || row.is_recent || !row.milestone_date)
   );
   const highlights = rows.filter((row) =>
