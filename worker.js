@@ -1013,7 +1013,8 @@ ${textContext}`;
       }).join("\n\n").slice(0, 9000)
     : "";
 
-  const fullContext = [replyContext, replyFileAnalysis, recentRawContext, internalContext].filter(Boolean).join("\n\n");
+  // 원본 검색자료(internalContext)를 우선 배치. 직전대화(recentRawContext)는 보조 참고.
+  const fullContext = [replyContext, replyFileAnalysis, internalContext, recentRawContext].filter(Boolean).join("\n\n");
 
   let webResults = [];
   let webContext = "";
@@ -1051,11 +1052,19 @@ ${fileContext}
 ${webContext}
 
 지시:
-- [답장 대상 메시지] 또는 [최근 대화 내용]이 있으면 그것을 분석 대상으로 사용
-- 내부 자료는 답변 품질을 높이기 위한 참고자료로만 조용히 활용
-- 사용자가 명시적으로 파일/자료를 요청한 경우에만 자료 존재를 언급
-- 의사결정이 필요한 내용이면 판단 포인트 제시
-- 없는 내용은 만들지 않는다
+- 먼저 [내부 자료]에서 질문 주제와 관련된 내용을 찾아 분석 대상으로 삼는다
+- ★ [최근 대화 내용]에 사용자가 과거에 한 질문(예: "○○ 요약해줘")이 들어있어도,
+  그 질문을 "답할 자료가 없는 요청"으로 취급하지 마라. 그것은 분석 대상이 아니라 단순 맥락이다.
+  반드시 [내부 자료]에서 주제어(예: 키옥시아, 그룹 AI 인재 등)로 답을 찾아라.
+  "님께서 요청하신 …내용이 없습니다" 같은 답변은 금지한다 — 내부 자료에 있으면 그것으로 답한다.
+- [최근 대화 내용]은 맥락 파악용 보조 참고일 뿐, 그 자체를 답으로 내지 않는다
+- [답장 대상 메시지]가 있으면 그것을 우선 분석 대상으로 사용
+- 내부 자료(여러 방·DM)를 종합해 답하되, 각 내용마다 누가(작성자)·어느 방(출처)에서 나온 것인지 반드시 표기
+  · 단체방은 [방이름], 개인 메시지는 [DM]으로, 작성자 이름과 함께
+- 여러 방에 흩어진 같은 사안은 합쳐서 정리
+- 의사결정이 필요한 내용(특히 '의사결정/CEO/사장님/보고' 관련)은 "의사결정 필요 사항"으로 따로 묶어 제시
+- 날짜·마감이 있으면 일정으로 함께 정리
+- 없는 내용은 만들지 않는다. 내부 자료에 관련 내용이 전혀 없을 때만 "관련 자료를 찾지 못했습니다"
 
 질문: ${query}`;
   let answer = await callClaude(
@@ -2299,16 +2308,44 @@ async function updateSystemPrompt(env, instruction) {
   await env.PROMPT.put("system", `${previous}\n[지시] ${instruction}`.trim());
 }
 
-async function sendMessage(env, chatId, text) {
+async function sendMessageRaw(env, chatId, text) {
   await fetch(`${telegramApi(env)}/sendMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       chat_id: chatId,
-      text: String(text || "").slice(0, 3900),
+      text: String(text || ""),
       parse_mode: "HTML",
     }),
   });
+}
+
+// 긴 메시지는 줄 단위로 끊어 여러 건으로 순차 전송 (텔레그램 한도 대응)
+async function sendMessage(env, chatId, text) {
+  const LIMIT = 3900;
+  const full = String(text || "");
+  if (full.length <= LIMIT) {
+    await sendMessageRaw(env, chatId, full);
+    return;
+  }
+  const lines = full.split("\n");
+  const chunks = [];
+  let buf = "";
+  for (const line of lines) {
+    if (line.length > LIMIT) {
+      if (buf) { chunks.push(buf); buf = ""; }
+      for (let i = 0; i < line.length; i += LIMIT) chunks.push(line.slice(i, i + LIMIT));
+      continue;
+    }
+    if ((buf + (buf ? "\n" : "") + line).length > LIMIT) {
+      chunks.push(buf);
+      buf = line;
+    } else {
+      buf = buf ? buf + "\n" + line : line;
+    }
+  }
+  if (buf) chunks.push(buf);
+  for (const chunk of chunks) await sendMessageRaw(env, chatId, chunk);
 }
 
 async function sendDocument(env, chatId, fileId, caption) {
