@@ -719,8 +719,20 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
       .split(/\s+/).map(w => w.trim()).filter(w => w.length >= 2);
     // 파일이 쿼리와 실제로 관련 있는지 점수 (파일명/내용에 키워드 포함 수)
     const scoreFile = (f) => {
-      const hay = `${f.file_name || ""} ${f.summary || ""} ${(f.content || "").slice(0,200)}`.toLowerCase();
-      return qWords.reduce((s, w) => s + (hay.includes(w.toLowerCase()) ? 1 : 0), 0);
+      const name = (f.file_name || "").toLowerCase();
+      const summ = (f.summary || "").toLowerCase();
+      const cont = (f.content || "").slice(0, 300).toLowerCase();
+      let score = 0;
+      let nameHit = 0;
+      for (const w of qWords) {
+        const lw = w.toLowerCase();
+        if (name.includes(lw)) { score += 3; nameHit++; }
+        else if (summ.includes(lw)) { score += 2; }
+        else if (cont.includes(lw)) { score += 1; }
+      }
+      // 파일명에 키워드가 하나도 없으면 큰 감점 (엉뚱한 파일 차단)
+      if (nameHit === 0) score = Math.max(0, score - 2);
+      return score;
     };
     // 키워드가 1개라도 맞는 파일만 (느슨한 매칭 차단). 키워드 없으면 상위 1개 허용
     // 같은 파일이 여러 방에 있으면 단체방(음수 room_id) 우선 — copyMessage 가능
@@ -740,9 +752,16 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
         return seen.has(key) ? false : (seen.add(key), true);
       });
     };
-    const relevantFiles = qWords.length
-      ? rankFiles(dedupGroupFirst(fileHits.filter(f => scoreFile(f) >= 1)))
+    // 파일명 매칭(3점) 이상만 통과 — 내용만 우연히 맞은 것 차단
+    let scored = qWords.length
+      ? rankFiles(dedupGroupFirst(fileHits.filter(f => scoreFile(f) >= 3)))
       : dedupGroupFirst(fileHits).slice(0, 1);
+    // 최고점과 차이 큰 하위 파일 제거 (섞임 방지)
+    if (scored.length > 1) {
+      const top = scoreFile(scored[0]);
+      scored = scored.filter(f => scoreFile(f) >= top - 1);
+    }
+    const relevantFiles = scored.slice(0, 2);
     let sent = false;
     // 1. 관련 파일·사진 전송 (최대 3개)
     for (const fh of relevantFiles.slice(0, 3)) {
