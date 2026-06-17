@@ -2437,8 +2437,11 @@ function looksLikeFileRequest(query) {
   if (hasDocNoun && hasFindVerb) return true;
   // 자료 명사만 있어도 (예: "경쟁사 홍보동향 자료") → 자료 요청
   if (hasDocNoun) return true;
-  // "OO 관련 내용 있어?", "OO 언급한 거 찾아줘" 등 내용 탐색도 자료 요청으로
-  if (/(관련|언급|얘기|이야기|논의).*(내용|있|찾|공유|보)/.test(q)) return true;
+  // 종합/요약 의도면 파일요청이 아니라 일반 경로(검색+종합 답변)로 보낸다
+  const isSynthIntent = /(요약|정리|분석|설명|어떤\s*내용|무슨\s*내용|뭐야|뭔지|어떻게\s*돼|현황|진행\s*상황)/.test(q);
+  if (isSynthIntent) return false;
+  // "OO 관련 자료 찾아줘"처럼 자료성 명사가 함께 있을 때만 파일 요청으로 인정
+  if (/(관련|언급|얘기|이야기|논의).*(자료|파일|문서|보고서|장표|발표자료|패키지)/.test(q)) return true;
   return false;
 }
 
