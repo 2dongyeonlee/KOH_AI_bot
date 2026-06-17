@@ -730,8 +730,7 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
         else if (summ.includes(lw)) { score += 2; }
         else if (cont.includes(lw)) { score += 1; }
       }
-      // 파일명에 키워드가 하나도 없으면 큰 감점 (엉뚱한 파일 차단)
-      if (nameHit === 0) score = Math.max(0, score - 2);
+      // 파일명 매칭 없어도 summary/content 매칭이면 인정 (파일명 오타 대응)
       return score;
     };
     // 키워드가 1개라도 맞는 파일만 (느슨한 매칭 차단). 키워드 없으면 상위 1개 허용
