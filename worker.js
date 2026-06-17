@@ -867,7 +867,7 @@ ${synthContext}`;
       let nameHit = 0;
       for (const w of qWords) {
         const lw = w.toLowerCase();
-        if (name.includes(lw)) { score += 3; nameHit++; }
+        if (name.includes(lw)) { score += 5; nameHit++; }
         else if (summ.includes(lw)) { score += 2; }
         else if (cont.includes(lw)) { score += 1; }
       }
@@ -892,16 +892,32 @@ ${synthContext}`;
         return seen.has(key) ? false : (seen.add(key), true);
       });
     };
-    // 점수 2점 이상 통과 (파일명3·요약2·내용1 → 요약 매칭도 인정)
+    // 점수 3점 이상 통과 (파일명5·요약2·내용1). qWords 없으면 전송 안 함(오배송 차단).
     let scored = qWords.length
-      ? rankFiles(dedupGroupFirst(fileHits.filter(f => scoreFile(f) >= 2)))
-      : dedupGroupFirst(fileHits).slice(0, 1);
+      ? rankFiles(dedupGroupFirst(fileHits.filter(f => scoreFile(f) >= 3)))
+      : [];
     // 최고점 근처만 (너무 동떨어진 하위 제거)
     if (scored.length > 1) {
       const top = scoreFile(scored[0]);
-      scored = scored.filter(f => scoreFile(f) >= Math.max(2, top - 2));
+      scored = scored.filter(f => scoreFile(f) >= Math.max(3, top - 2));
     }
     const relevantFiles = scored.slice(0, 3);
+    // 확신 미달(컷오프 통과 0건)이지만 후보가 있으면 목록 제시 후 종료
+    if (relevantFiles.length === 0) {
+      const cands = dedupGroupFirst(fileHits).slice(0, 5);
+      if (cands.length > 0) {
+        const list = cands.map((f, i) =>
+          `${i + 1}. ${f.file_name || "(이름없음)"}${f.room_title ? ` [${f.room_title}]` : ""}`
+        ).join("\n");
+        await sendMessage(env, chatId,
+          `정확히 일치하는 자료를 못 찾았습니다. 혹시 이 중에 있나요?\n\n${list}\n\n파일명을 더 정확히 알려주시면 바로 보내드리겠습니다.`);
+      } else {
+        await sendMessage(env, chatId,
+          "요청하신 자료를 찾지 못했습니다.\n파일명이나 키워드를 더 구체적으로 알려주시면 다시 찾겠습니다.");
+      }
+      await updateBotSession(env, chatId);
+      return;
+    }
     let sent = false;
     // 1. 관련 파일·사진 전송 (최대 3개)
     for (const fh of relevantFiles.slice(0, 3)) {
