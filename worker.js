@@ -709,6 +709,9 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
 
   const isFileReq = looksLikeFileRequest(query);
   const hasInlineContent = !isFileReq && query.includes("\n") && query.length > 100;
+  // 종합 분석 요청: 여러 자료/DM을 모아 필요정보·의사결정·일정으로 정리
+  const isSynthReq = !isFileReq &&
+    /(종합|모아서|모아|취합|총정리|한꺼번에|흩어진|여러|정리해서).*(분석|요약|정리|뽑아|알려|보여|판단|의사결정|일정)/.test(query);
 
   // 파일 요청이면 브리핑·일정 라우팅으로 절대 빠지지 않는다.
   if (!isFileReq && /브리핑/.test(query)) {
@@ -744,6 +747,46 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
     const answer = await callClaude(env, directPrompt, sysP + toneCtx, MODEL_SMART);
     await saveChatHistory(env, chatId, query, answer);
     await sendMessage(env, chatId, answer);
+    await updateBotSession(env, chatId);
+    return;
+  }
+
+  // 종합 분석 요청: 파편화된 자료·DM을 모아 필요정보·의사결정·일정으로 정리
+  if (isSynthReq) {
+    const synthHits = await searchMemory(env, query);
+    if (!synthHits.length) {
+      await sendMessage(env, chatId,
+        "종합할 만한 관련 자료나 메시지를 찾지 못했습니다.\n주제나 기간을 좀 더 구체적으로 알려주시면 다시 모아보겠습니다.");
+      await updateBotSession(env, chatId);
+      return;
+    }
+    const synthContext = synthHits.slice(0, 12).map(h => {
+      const room   = h.room_title  ? `[${h.room_title}]` : "[DM]";
+      const sender = h.sender_name || "작성자미상";
+      const when   = h.milestone_date ? ` (${h.milestone_date})` : "";
+      const file   = h.file_name ? ` <${h.file_name}>` : "";
+      const body   = (h.summary || h.content || "").slice(0, 600);
+      return `${room} ${sender}${when}${file}: ${body}`;
+    }).join("\n\n─────\n\n");
+    const synthPrompt = `사용자 요청: "${query}"
+
+아래는 여러 방·DM에 흩어져 적재된 자료와 메시지다. 요청 주제와 직접 관련된 것만 골라 종합 분석해라.
+마크다운(#,*,**) 금지. 플레인 텍스트. 아래 3개 항목으로만 정리하고, 해당 없으면 "없음".
+
+📌 필요정보: (주제 관련 핵심 사실·자료를 출처와 함께 2~5줄. 출처는 [방이름] 또는 [DM], 작성자 표기)
+🔔 의사결정사항: (담당님 판단이 필요한 사항. '의사결정/CEO/사장님/보고' 관련은 반드시 포함)
+📅 일정: (날짜·마감이 있는 항목. 날짜 미정이면 "날짜 미정"으로 묶어 표기)
+
+규칙:
+- 없는 내용은 지어내지 말 것
+- 같은 사안이 여러 곳에 있으면 합쳐서 한 줄로
+- 출처(방·작성자)를 반드시 함께 표기
+
+[수집된 자료·메시지]
+${synthContext}`;
+    const synthAnswer = await callClaude(env, synthPrompt, "", MODEL_SMART);
+    await sendMessage(env, chatId, synthAnswer || "종합 분석에 실패했습니다.");
+    await saveChatHistory(env, chatId, query, synthAnswer || "", {});
     await updateBotSession(env, chatId);
     return;
   }
@@ -1739,7 +1782,7 @@ async function insertMessage(env, options) {
   // Vectorize 색인 (실패해도 저장은 유지)
   if (lastRowId && env.AI && env.VECTORIZE) {
     try {
-      const textToEmbed = [fileName, fileName, summary, content]
+      const textToEmbed = [fileName, summary, content]
         .filter(Boolean).join(" ").slice(0, 6000);
       const vector = await embedText(env, textToEmbed);
       if (vector) {
@@ -1881,8 +1924,11 @@ async function searchMemory(env, query) {
     try {
       const qVec = await embedText(env, query);
       if (qVec) {
-        const vr = await env.VECTORIZE.query(qVec, { topK: 8, returnMetadata: "all" });
+        const vr = await env.VECTORIZE.query(qVec, { topK: 12, returnMetadata: "all" });
+        // 관련도 임계값 미만은 버림(무관한 자료 오긁기 차단). bge-m3 코사인 기준 0.5.
+        const VEC_MIN_SCORE = 0.5;
         const ids = (vr.matches || [])
+          .filter(m => (m.score ?? 0) >= VEC_MIN_SCORE)
           .map(m => Number(m.id))
           .filter(n => Number.isFinite(n) && n > 0);
         if (ids.length > 0) {
@@ -2113,8 +2159,9 @@ async function embedText(env, text) {
 async function embedBatch(env, texts) {
   if (!env.AI || !texts.length) return [];
   try {
+    // bge-m3는 8192 토큰까지 입력 가능. 한글 기준 약 6000자까지 안전하게 확대.
     const result = await env.AI.run("@cf/baai/bge-m3", {
-      text: texts.map((t) => String(t || "").slice(0, 2000)),
+      text: texts.map((t) => String(t || "").slice(0, 6000)),
     });
     return result?.data || [];
   } catch (e) {
