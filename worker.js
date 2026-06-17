@@ -750,6 +750,44 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
 
   // 파일 요청: 파일 전용 검색(file_id 보장) → 상위 3개 전송 또는 명확한 안내
   if (isFileReq) {
+    // ── AI Search 우선: 의미 기반으로 파일 특정 ──
+    const aiNames = await searchFilesViaAISearch(env, query);
+    const aiFiles = await getFilesByNames(env, aiNames);
+    if (aiFiles.length > 0) {
+      let aiSent = false;
+      for (const fh of aiFiles.slice(0, 3)) {
+        const roomLabel   = fh.room_title  ? `[${fh.room_title}]`  : "";
+        const senderLabel = fh.sender_name ? `${fh.sender_name} 공유` : "";
+        const attr    = [roomLabel, senderLabel].filter(Boolean).join(" / ");
+        const caption = `요청하신 자료입니다.${attr ? ` (${attr})` : ""}\n${fh.file_name || ""}`.trim();
+        let result = await sendDocument(env, chatId, fh.file_id, caption);
+        if (!result?.ok && fh.room_id && fh.telegram_message_id) {
+          result = await copyMessage(env, chatId, fh.room_id, fh.telegram_message_id);
+          if (result?.ok) await sendMessage(env, chatId, caption);
+        }
+        if (result?.ok) {
+          aiSent = true;
+        } else {
+          const body = (fh.summary || fh.content || "").trim();
+          if (body && body !== "[문서 분석 실패]") {
+            await sendMessage(env, chatId,
+              `파일 직접 전송은 어렵지만 내용을 공유합니다.${attr ? ` (${attr})` : ""}\n<b>${fh.file_name || ""}</b>\n\n${body.slice(0, 2500)}`);
+            aiSent = true;
+          }
+        }
+      }
+      if (!aiSent) {
+        await sendMessage(env, chatId,
+          "요청하신 자료를 찾지 못했습니다.\n파일명이나 키워드를 더 구체적으로 알려주시면 다시 찾겠습니다.");
+      }
+      await saveChatHistory(env, chatId, query,
+        aiFiles.map(f => f.file_name || "(파일)").join(", "),
+        { files: aiFiles.map(f => ({ name: f.file_name || "", room: f.room_title || "" })) }
+      );
+      await updateBotSession(env, chatId);
+      return;
+    }
+    // ── AI Search 결과 없으면 기존 키워드 방식으로 폴백 ──
     // 발신자 명시("예슬TL이 보고한 자료") 시 sender 필터 우선
     const senderHits = await searchBySender(env, query);
     const allHits  = senderHits || await searchMemory(env, query);
@@ -1784,6 +1822,53 @@ async function searchBySender(env, query) {
     console.error("searchBySender error:", e.message);
     return null;
   }
+}
+
+async function searchFilesViaAISearch(env, query) {
+  if (!env.CF_ACCOUNT_ID || !env.CF_API_TOKEN || !env.AISEARCH_INSTANCE) {
+    console.log("AI Search 미설정 - 빈 결과");
+    return [];
+  }
+  try {
+    const resp = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/ai-search/instances/${env.AISEARCH_INSTANCE}/search`,
+      {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${env.CF_API_TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ query: query, max_num_results: 5, rewrite_query: true }),
+      }
+    );
+    if (!resp.ok) { console.error("AI Search 검색 실패:", resp.status); return []; }
+    const json = await resp.json();
+    const results = json?.result?.data || [];
+    const names = [];
+    for (const r of results) {
+      const text = (r.content || []).map(c => c.text || "").join(" ");
+      const m = text.match(/\[파일명\]\s*(.+)/);
+      if (m && m[1]) names.push({ name: m[1].trim(), score: r.score || 0 });
+    }
+    console.log("AI Search 매칭 파일:", JSON.stringify(names));
+    return names;
+  } catch (e) { console.error("searchFilesViaAISearch error:", e.message); return []; }
+}
+
+async function getFilesByNames(env, fileNames) {
+  if (!fileNames.length) return [];
+  const out = [];
+  for (const fn of fileNames) {
+    try {
+      const row = await env.DB.prepare(
+        `SELECT rowid, file_id, file_name, summary, content, sender_name,
+                room_id, room_title, telegram_message_id, milestone_date
+         FROM messages
+         WHERE file_name = ? AND file_id != ''
+         ORDER BY (CASE WHEN room_id < 0 THEN 0 ELSE 1 END), rowid DESC
+         LIMIT 1`
+      ).bind(fn.name).first();
+      if (row) out.push(row);
+    } catch (e) { console.error("getFilesByNames error:", e.message); }
+  }
+  return out;
 }
 
 async function searchMemory(env, query) {
