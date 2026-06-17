@@ -752,16 +752,16 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
         return seen.has(key) ? false : (seen.add(key), true);
       });
     };
-    // 파일명 매칭(3점) 이상만 통과 — 내용만 우연히 맞은 것 차단
+    // 점수 2점 이상 통과 (파일명3·요약2·내용1 → 요약 매칭도 인정)
     let scored = qWords.length
-      ? rankFiles(dedupGroupFirst(fileHits.filter(f => scoreFile(f) >= 3)))
+      ? rankFiles(dedupGroupFirst(fileHits.filter(f => scoreFile(f) >= 2)))
       : dedupGroupFirst(fileHits).slice(0, 1);
-    // 최고점과 차이 큰 하위 파일 제거 (섞임 방지)
+    // 최고점 근처만 (너무 동떨어진 하위 제거)
     if (scored.length > 1) {
       const top = scoreFile(scored[0]);
-      scored = scored.filter(f => scoreFile(f) >= top - 1);
+      scored = scored.filter(f => scoreFile(f) >= Math.max(2, top - 2));
     }
-    const relevantFiles = scored.slice(0, 2);
+    const relevantFiles = scored.slice(0, 3);
     let sent = false;
     // 1. 관련 파일·사진 전송 (최대 3개)
     for (const fh of relevantFiles.slice(0, 3)) {
@@ -1904,7 +1904,8 @@ function searchTerms(query) {
         .replace(/(께서|에게서|한테서|이|가|은|는|을|를|의)$/g, "")
         .replace(/(관련된|관련|에대한|에대해|보고한|내용)$/g, "");
       const eng = term.match(/[A-Za-z0-9]{2,}/g) || [];
-      return [term, cleaned, ...eng];
+      const kor = term.match(/[가-힣]{2,}/g) || [];
+      return [term, cleaned, ...eng, ...kor];
     })
     .filter((term) => term.length >= 2 && !stopWords.test(term));
 
