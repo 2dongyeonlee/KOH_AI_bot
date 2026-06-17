@@ -322,6 +322,43 @@ ${parsed.summary}
 
 }
 
+// AI Search에 추출된 텍스트를 .txt로 업로드 (형식 무관, 검색 정확도용)
+async function uploadToAISearch(env, text, originalName, roomId) {
+  // 빈 텍스트나 에러 메시지는 올리지 않음
+  if (!text || text.length < 20) return;
+  if (text.startsWith("[지원하지 않는") || text.startsWith("[파일이 너무")) return;
+  if (!env.CF_ACCOUNT_ID || !env.CF_API_TOKEN || !env.AISEARCH_INSTANCE) {
+    console.log("AI Search 환경변수 미설정 - 업로드 건너뜀");
+    return;
+  }
+  try {
+    // 파일명은 영문+숫자로만 (한글/특수문자 Error 방지)
+    const safeName = `doc_${roomId}_${Date.now()}.txt`;
+    // 원본 파일명을 텍스트 맨 앞에 넣어 검색 가능하게
+    const body = `[파일명] ${originalName}\n[방] ${roomId}\n\n${text}`;
+    const blob = new Blob([body], { type: "text/plain" });
+    const form = new FormData();
+    form.append("file", blob, safeName);
+
+    const resp = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/ai-search/instances/${env.AISEARCH_INSTANCE}/items`,
+      {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${env.CF_API_TOKEN}` },
+        body: form,
+      }
+    );
+    if (!resp.ok) {
+      const errText = await resp.text();
+      console.error("AI Search 업로드 실패:", resp.status, errText.slice(0, 200));
+    } else {
+      console.log("AI Search 업로드 성공:", safeName, "원본:", originalName);
+    }
+  } catch (e) {
+    console.error("uploadToAISearch error:", e.message);
+  }
+}
+
 async function ingestAndSummarize(env, msg, chatId, caption) {
   let extracted = "";
   let fileId = "";
@@ -393,6 +430,10 @@ ${extracted.slice(0, 3000)}`,
     action_items: parsed.action_items || "",
     needs_escalation: parsed.needs_escalation || 0,
   });
+
+  // AI Search에도 추출 텍스트 업로드 (검색 정확도용, 실패해도 무시)
+  const roomIdForSearch = msg.chat?.id || "unknown";
+  await uploadToAISearch(env, extracted, fileName, roomIdForSearch);
 
   // 파일 저장 완료 알림 없음 (묵음 저장)
   return;
