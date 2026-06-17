@@ -995,11 +995,24 @@ ${textContext}`;
     }
   }
 
-  const internalContext = hits.length
-    ? hits.map((hit) => {
+  // 질문 키워드가 파일명/요약/원문에 얼마나 겹치는지로 관련도 점수화 → 높은 순 정렬
+  const qTerms = searchTerms(query);
+  const relScore = (hit) => {
+    const hay = `${hit.file_name || ""} ${hit.summary || ""} ${(hit.content || "").slice(0, 500)}`.toLowerCase();
+    let s = 0;
+    for (const t of qTerms) {
+      const lt = t.toLowerCase();
+      if (!lt) continue;
+      if ((hit.summary || "").toLowerCase().includes(lt)) s += 2;
+      else if (hay.includes(lt)) s += 1;
+    }
+    return s;
+  };
+  const rankedHits = [...hits].sort((a, b) => relScore(b) - relScore(a));
+  const internalContext = rankedHits.length
+    ? rankedHits.slice(0, 12).map((hit) => {
         const room   = hit.room_title ? `(출처: ${hit.room_title}) ` : "";
         const label  = classifyRow(hit);
-        // summary와 content 둘 다 제공 (요약이 부실해도 원문으로 보완)
         const summaryText = (hit.summary || "").trim();
         const contentText = (hit.content || "").slice(0, 800).trim();
         const bodyParts = [];
@@ -1053,6 +1066,10 @@ ${webContext}
 
 지시:
 - 먼저 [내부 자료]에서 질문 주제와 관련된 내용을 찾아 분석 대상으로 삼는다
+- ★ 질문의 단어가 자료에 토씨까지 똑같이 없어도, 의미상 같은 사안이면 그것으로 답하라.
+  예: "그룹 AI 인재 파견" 질문 → 자료의 "마이써니 AI 인재 육성 프로그램 인력 파견 요청"은 같은 사안이다.
+  예: "투자제한법" → "조세특례제한법/투자 세액공제" 등 관련 제도면 그 내용을 안내한다.
+  정확히 같은 표현이 없다는 이유로 "없다"고 답하지 마라. 의미가 통하는 자료가 있으면 반드시 활용한다.
 - ★ [최근 대화 내용]에 사용자가 과거에 한 질문(예: "○○ 요약해줘")이 들어있어도,
   그 질문을 "답할 자료가 없는 요청"으로 취급하지 마라. 그것은 분석 대상이 아니라 단순 맥락이다.
   반드시 [내부 자료]에서 주제어(예: 키옥시아, 그룹 AI 인재 등)로 답을 찾아라.
