@@ -1566,67 +1566,86 @@ async function extractOfficeText(buffer) {
   const view = new DataView(buffer);
   const u8   = new Uint8Array(buffer);
   const dec  = new TextDecoder("utf-8", { fatal: false });
-  const texts = [];
-  let offset = 0;
 
+  // 1) ZIP의 모든 Local File Header를 스캔해 항목 목록을 만든다.
+  //    compSize가 0/불명확한 경우에도 다음 시그니처(0x04034b50)를 찾아 안전하게 점프.
+  const entries = [];
+  let offset = 0;
   while (offset + 30 <= buffer.byteLength) {
     if (view.getUint32(offset, true) !== 0x04034b50) break;
-
     const compression = view.getUint16(offset + 8,  true);
-    const compSize    = view.getUint32(offset + 18, true);
+    let   compSize    = view.getUint32(offset + 18, true);
     const nameLen     = view.getUint16(offset + 26, true);
     const extraLen    = view.getUint16(offset + 28, true);
     const dataOffset  = offset + 30 + nameLen + extraLen;
     const name        = dec.decode(u8.slice(offset + 30, offset + 30 + nameLen));
 
-    const want =
-      name === "word/document.xml" ||
-      /^ppt\/slides\/slide\d+\.xml$/.test(name) ||
-      name === "xl/sharedStrings.xml";
-
-    if (want && compSize > 0) {
-      try {
-        const compData = u8.slice(dataOffset, dataOffset + compSize);
-        let xml = "";
-
-        if (compression === 0) {
-          xml = dec.decode(compData);
-        } else if (compression === 8) {
-          const ds = new DecompressionStream("deflate-raw");
-          const w  = ds.writable.getWriter();
-          const r  = ds.readable.getReader();
-          w.write(compData);
-          w.close();
-          const chunks = [];
-          while (true) {
-            const { done, value } = await r.read();
-            if (done) break;
-            if (value) chunks.push(value);
-          }
-          const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
-          let p = 0;
-          for (const c of chunks) { out.set(c, p); p += c.length; }
-          xml = dec.decode(out);
-        }
-
-        if (xml) {
-          const text = xml
-            .replace(/<[^>]+>/g, " ")
-            .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-            .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#\d+;/g, " ")
-            .replace(/\s+/g, " ").trim();
-          if (text.length > 10) texts.push(text);
-        }
-      } catch (e) {
-        console.error("office xml error:", name, e.message);
-      }
+    // compSize가 0이면 다음 PK 시그니처까지를 데이터로 간주(견고화)
+    if (compSize === 0) {
+      let next = dataOffset;
+      while (next + 4 <= buffer.byteLength && view.getUint32(next, true) !== 0x04034b50) next++;
+      compSize = Math.max(0, next - dataOffset);
     }
-
-    offset = dataOffset + Math.max(compSize, 0);
-    if (offset <= dataOffset) { offset = dataOffset + 1; }
+    entries.push({ name, compression, dataOffset, compSize });
+    const advance = dataOffset + compSize;
+    offset = advance > offset ? advance : offset + 1;
   }
 
-  return texts.join("\n\n").slice(0, 8000);
+  // 2) 대상 파일 선별: 슬라이드/노트/문서/공유문자열 + 슬라이드 번호순 정렬
+  const slideNo = (n) => {
+    const m = n.match(/slide(\d+)\.xml$/);
+    return m ? Number(m[1]) : 9999;
+  };
+  const wanted = entries
+    .filter(e =>
+      e.name === "word/document.xml" ||
+      e.name === "xl/sharedStrings.xml" ||
+      /^ppt\/slides\/slide\d+\.xml$/.test(e.name) ||
+      /^ppt\/notesSlides\/notesSlide\d+\.xml$/.test(e.name)
+    )
+    .sort((a, b) => slideNo(a.name) - slideNo(b.name));
+
+  // 3) 각 항목 압축 해제 후 텍스트 추출
+  const texts = [];
+  for (const e of wanted) {
+    if (e.compSize <= 0) continue;
+    try {
+      const compData = u8.slice(e.dataOffset, e.dataOffset + e.compSize);
+      let xml = "";
+      if (e.compression === 0) {
+        xml = dec.decode(compData);
+      } else if (e.compression === 8) {
+        const ds = new DecompressionStream("deflate-raw");
+        const w  = ds.writable.getWriter();
+        const r  = ds.readable.getReader();
+        w.write(compData); w.close();
+        const chunks = [];
+        while (true) {
+          const { done, value } = await r.read();
+          if (done) break;
+          if (value) chunks.push(value);
+        }
+        const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+        let p = 0;
+        for (const c of chunks) { out.set(c, p); p += c.length; }
+        xml = dec.decode(out);
+      }
+      if (xml) {
+        // <a:t>, <w:t> 등 텍스트 노드 사이에 공백을 넣어 단어 붙음 방지
+        const text = xml
+          .replace(/<\/(a:t|w:t|t)>/g, "$& ")
+          .replace(/<[^>]+>/g, " ")
+          .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+          .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#\d+;/g, " ")
+          .replace(/\s+/g, " ").trim();
+        if (text.length > 5) texts.push(text);
+      }
+    } catch (err) {
+      console.error("office xml error:", e.name, err.message);
+    }
+  }
+
+  return texts.join("\n\n").slice(0, 12000);
 }
 
 async function extractDocumentText(env, fileUrl, fileName) {
