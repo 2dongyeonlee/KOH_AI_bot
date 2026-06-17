@@ -3,7 +3,7 @@ name: Deploy koh-ai-bot
 on:
   push:
     branches:
-      - claude/ecstatic-carson-CVsrs
+      - main
   workflow_dispatch:
 
 jobs:
