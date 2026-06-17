@@ -906,9 +906,15 @@ ${synthContext}`;
     if (relevantFiles.length === 0) {
       const cands = dedupGroupFirst(fileHits).slice(0, 5);
       if (cands.length > 0) {
-        const list = cands.map((f, i) =>
-          `${i + 1}. ${f.file_name || "(이름없음)"}${f.room_title ? ` [${f.room_title}]` : ""}`
-        ).join("\n");
+        const list = cands.map((f, i) => {
+          const nm   = f.file_name || "(이름없음)";
+          const room = f.room_title ? ` [${f.room_title}]` : "";
+          // 내용 힌트: summary 우선, 없으면 content 앞부분. 약 20자.
+          let hint = (f.summary || f.content || "").replace(/\s+/g, " ").trim();
+          if (hint.length > 20) hint = hint.slice(0, 20) + "…";
+          const hintPart = hint ? ` — ${hint}` : "";
+          return `${i + 1}. ${nm}${room}${hintPart}`;
+        }).join("\n");
         await sendMessage(env, chatId,
           `정확히 일치하는 자료를 못 찾았습니다. 혹시 이 중에 있나요?\n\n${list}\n\n파일명을 더 정확히 알려주시면 바로 보내드리겠습니다.`);
       } else {
