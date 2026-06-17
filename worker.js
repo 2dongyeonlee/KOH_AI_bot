@@ -796,12 +796,17 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
         return `${room} ${sender}${when}: ${body}`;
       }).join("\n\n─────\n\n");
       const textPrompt = `사용자 요청: "${query}"
-아래는 검색된 메시지·보고 내용이다. 요청과 관련된 것만 골라
-"누가 무슨 내용을 공유/보고했는지" 형식으로 요약해줘.
-- 작성자(이름)와 핵심 내용을 함께 표기
-- 관련 없는 항목은 제외
-- 없는 내용은 지어내지 말 것
-- 파일이 아니라 메시지로 공유된 내용임을 자연스럽게 안내
+
+아래는 검색된 메시지·보고 내용이다. 요청과 직접 관련된 것만 골라 정리해줘.
+
+규칙:
+- 작성자(이름·직책)와 핵심 내용을 함께 표기
+- 출처가 DM이면 "(DM 공유 내용)", 단체방이면 "[방이름]"을 앞에 명시
+- 관련 없는 항목은 제외하고, 없는 내용은 지어내지 말 것
+- 파일이 아니라 메시지로 공유된 내용임을 끝에 한 줄로 안내
+  (예: "위 내용은 파일이 아닌 메시지로 공유된 것입니다.")
+- 관련 내용이 전혀 없으면 "관련 자료나 공유 내용을 찾지 못했습니다"라고만
+
 [검색된 내용]
 ${textContext}`;
       const answer = await callClaude(env, textPrompt, "", MODEL_SMART);
@@ -2205,16 +2210,24 @@ function cleanMention(text) {
 }
 
 function looksLikeFileRequest(query) {
-  if (/(일정|스케줄|브리핑|보고 일정|회의|미팅).*(공유|알려|보여|정리|뭐)/.test(query)) return false;
-  if (/(오늘|내일|이번주|이번달|금주).*(일정|스케줄|공유해|알려|보여)/.test(query)) return false;
-  // 요약/정리/분석 의도면 파일 요청 아님
-  if (/(요약|정리|분석|설명|번역)(해줘|해|해봐|줘)?$/.test(query.trim())) return false;
-  // 지시어로 시작하면 파일 요청 아님 (이 자료, 그거, 방금 등)
-  if (/^(이|그|저|이거|그거|저거|이것|그것|저것|이 자료|그 자료|방금|위에|앞에)/.test(query.trim())) return false;
-  // "~자료 공유해줘" 형태
-  if (/((자료|파일|문서|발표자료|보고서|패키지|package|pdf|ppt|장표).*(보내|전달|올려|공유|다운|다운로드|줘|주세요)|보내줘|전달해|올려줘|찾아서 줄래|다운로드)/.test(query)) return true;
-  // "~자료", "~파일", "~문서"로 끝나거나 포함 (동사 없어도 자료 요청으로)
-  if (/(자료|파일|문서|발표자료|보고서|장표|pdf|ppt|어디 ?있)/.test(query)) return true;
+  const q = query.trim();
+  // 일정/브리핑 의도는 제외 (일정 라우팅으로)
+  if (/(일정|스케줄|브리핑|보고 일정).*(공유|알려|보여|정리|뭐)/.test(q)) return false;
+  if (/(오늘|내일|이번주|이번달|금주).*(일정|스케줄)/.test(q)) return false;
+  // 지시어로 시작 (이 자료, 그거 등)은 Reply/맥락 경로로
+  if (/^(이거|그거|저거|이것|그것|저것|이 자료|그 자료|방금|위에|앞에)/.test(q)) return false;
+
+  // 자료성 명사 (자료/파일/문서/보고서/발표자료/PDF/PPT/장표/패키지 등)
+  const hasDocNoun = /(자료|파일|문서|발표자료|보고서|장표|패키지|package|pdf|ppt|docx|xlsx|보고)/.test(q);
+  // 찾기/전송 동사·표현 (공유/보내/전달/올려/다운/찾아/줘/있을까/어디있/어딨/있어\?/있나)
+  const hasFindVerb = /(공유|보내|전달|올려|다운|다운로드|찾아|줘|주세요|있을까|있나|있어\?|어디\s?있|어딨|어디야|위치)/.test(q);
+
+  // 자료 명사 + 찾기 동사 → 자료 요청
+  if (hasDocNoun && hasFindVerb) return true;
+  // 자료 명사만 있어도 (예: "경쟁사 홍보동향 자료") → 자료 요청
+  if (hasDocNoun) return true;
+  // "OO 관련 내용 있어?", "OO 언급한 거 찾아줘" 등 내용 탐색도 자료 요청으로
+  if (/(관련|언급|얘기|이야기|논의).*(내용|있|찾|공유|보)/.test(q)) return true;
   return false;
 }
 
