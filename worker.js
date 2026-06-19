@@ -1306,7 +1306,7 @@ async function runReportBriefing(env, replyChatId = null) {
           ELSE 0
         END AS is_due_soon,
         CASE
-          WHEN created_at > datetime('now', '-3 days') THEN 1
+          WHEN created_at > datetime('now', '-1 days') THEN 1
           ELSE 0
         END AS is_recent
        FROM messages
@@ -1350,7 +1350,7 @@ async function runReportBriefing(env, replyChatId = null) {
     `SELECT room_title, sender_name, content, summary, created_at
      FROM messages
      WHERE status_tag = ''
-       AND created_at >= datetime('now', '-3 days')
+       AND created_at >= datetime('now', '-1 days')
        AND length(content) >= 15
        AND room_title NOT IN ('', 'codex-test', '테스트방임', '--')
        AND content NOT LIKE '%보내줘%'
