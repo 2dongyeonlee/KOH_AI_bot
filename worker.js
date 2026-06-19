@@ -231,6 +231,53 @@ async function handleMessage(env, msg) {
 
   const isOwner = String(msg.from?.id) === String(env.BOT_OWNER_ID || "");
 
+  // ── 슬래시 명령어 라우터 ──
+  if (text.startsWith("/")) {
+    const spaceIdx = text.indexOf(" ");
+    const cmd  = (spaceIdx === -1 ? text : text.slice(0, spaceIdx)).toLowerCase();
+    const rest = (spaceIdx === -1 ? "" : text.slice(spaceIdx + 1)).trim();
+
+    if (cmd === "/help" || cmd === "/start") {
+      return sendMessage(env, chatId,
+        `<b>권오혁 AI 비서 사용법</b>\n\n` +
+        `/q [질문] — 자료를 찾아 답변\n` +
+        `   예) /q 키옥시아 투자 관련 내용 요약해줘\n` +
+        `/info [주제] — 정보·동향 조회\n` +
+        `   예) /info 공정위 입법\n` +
+        `/summary — 답글 단 메시지·자료 또는 직전 내용 요약\n` +
+        `   (요약할 메시지에 답글로 /summary 입력)\n` +
+        `/brief — 데일리 브리핑(일정·보고·의사결정·주요내용)\n` +
+        `/decision — 지금 의사결정이 필요한 안건 모음\n\n` +
+        `명령어 없이 그냥 질문해도 됩니다.`);
+    }
+
+    if (cmd === "/brief") {
+      return runReportBriefing(env, chatId);
+    }
+
+    if (cmd === "/decision") {
+      return handleQuery(env, chatId,
+        "지금 의사결정이 필요한 안건들을 출처와 함께 정리해줘", msg, isOwner);
+    }
+
+    if (cmd === "/q") {
+      if (!rest) return sendMessage(env, chatId, `/q 뒤에 질문을 입력해주세요.\n예) /q 키옥시아 투자 요약해줘`);
+      return handleQuery(env, chatId, rest, msg, isOwner);
+    }
+
+    if (cmd === "/info") {
+      if (!rest) return sendMessage(env, chatId, `/info 뒤에 주제를 입력해주세요.\n예) /info 공정위 입법`);
+      return handleQuery(env, chatId, `${rest} 관련 정보 알려줘`, msg, isOwner);
+    }
+
+    if (cmd === "/summary") {
+      const q = rest ? `${rest} 요약해줘` : "방금 내용 요약해줘";
+      return handleQuery(env, chatId, q, msg, isOwner);
+    }
+
+    return sendMessage(env, chatId, `알 수 없는 명령어입니다. /help 로 사용법을 확인하세요.`);
+  }
+
   // 파일/이미지 → 멘션 여부 무관하게 항상 저장·분석
   if (msg.document || (msg.photo && msg.photo.length)) {
     await ingestAndSummarize(env, msg, chatId, text);
