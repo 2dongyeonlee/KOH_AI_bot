@@ -732,7 +732,7 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
     /(종합|모아서|모아|취합|총정리|한꺼번에|흩어진|여러|정리해서).*(분석|요약|정리|뽑아|알려|보여|판단|의사결정|일정)/.test(query);
 
   // 파일 요청이면 브리핑·일정 라우팅으로 절대 빠지지 않는다.
-  if (!isFileReq && /브리핑/.test(query)) {
+  if (!isFileReq && /브리핑|briefing|daily brief/i.test(query)) {
     return runReportBriefing(env, chatId);
   }
 
@@ -1380,28 +1380,76 @@ async function runReportBriefing(env, replyChatId = null) {
     `[주요내용(태그)]\n${joinRows(highlights)}`,
   ].filter(s => !s.endsWith("\n")).join("\n\n");
 
-  const output = await callClaude(
-    env,
-    `오늘 날짜: ${today}
-${REPORT_BRIEFING_FORMAT}
+  // 섹션별로 LLM 호출 분리 → 각각 전송 (길이 초과 방지)
+  const sectionPromptBase = `오늘 날짜: ${today}
 
 === [태그 항목] ===
 ${taggedContext}
 
 === [주요 내용 원문] ===
-아래 내용을 읽고 업무 관련 항목만:
-- 일정/보고/의사결정이면 해당 섹션에 추가
-- 그 외는 📋 주요 내용에:
-  • [방이름] 담당자 / 핵심 한줄
-   └ 상세 또는 후속 필요사항
-봇에게 한 질문, 잡담, 인사 제외. 중복 금지.
-${rawContext || "없음"}`,
-    "",
-    MODEL_SMART
-  );
+아래 내용을 읽고 업무 관련 항목만 사용. 봇 질문·잡담·인사 제외. 중복 금지.
+${rawContext || "없음"}`;
 
+  const [outSchedule, outReport, outDecision, outMain] = await Promise.all([
+    callClaude(env,
+      `${sectionPromptBase}
+
+위 내용에서 📅 일정 섹션만 작성해라.
+형식:
+📅 일정
+• [날짜] 항목명 / 담당자
+ └ 세부사항 (장소·참석자·의사결정 필요 여부)
+일정 항목이 없으면 "• 해당 없음" 한 줄만.
+다른 섹션(보고/의사결정/주요내용)은 절대 포함하지 마라.`,
+      "", MODEL_SMART),
+
+    callClaude(env,
+      `${sectionPromptBase}
+
+위 내용에서 🔔 보고 섹션만 작성해라.
+형식:
+🔔 보고
+• 보고명 / 담당자
+ └ 핵심 내용 한 줄
+보고 항목이 없으면 "• 해당 없음" 한 줄만.
+다른 섹션(일정/의사결정/주요내용)은 절대 포함하지 마라.`,
+      "", MODEL_SMART),
+
+    callClaude(env,
+      `${sectionPromptBase}
+
+위 내용에서 💡 의사결정 필요 섹션만 작성해라.
+형식:
+💡 의사결정 필요
+• 안건명 / 관련 담당자
+ └ 결정 필요 사유·선택지
+의사결정 항목이 없으면 "• 해당 없음" 한 줄만.
+'의사결정/승인/결정/사장님 보고/CEO' 관련 내용은 반드시 포함.
+다른 섹션(일정/보고/주요내용)은 절대 포함하지 마라.`,
+      "", MODEL_SMART),
+
+    callClaude(env,
+      `${sectionPromptBase}
+
+위 내용에서 📋 주요 내용 섹션만 작성해라.
+형식:
+📋 주요 내용
+• [방이름] 담당자 / 핵심 한 줄
+ └ 상세 또는 후속 필요사항
+일정·보고·의사결정으로 분류된 것은 제외하고, 그 외 공유·정보·동향만.
+항목이 없으면 "• 해당 없음" 한 줄만.
+다른 섹션(일정/보고/의사결정)은 절대 포함하지 마라.`,
+      "", MODEL_SMART),
+  ]);
+
+  // 섹션별로 순차 전송
+  const dateHeader = `📅 ${today} Daily Briefing`;
   for (const id of targets) {
-    await sendMessage(env, id, output);
+    await sendMessage(env, id, dateHeader);
+    if (outSchedule)  await sendMessage(env, id, outSchedule);
+    if (outReport)    await sendMessage(env, id, outReport);
+    if (outDecision)  await sendMessage(env, id, outDecision);
+    if (outMain)      await sendMessage(env, id, outMain);
   }
 }
 
