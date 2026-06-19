@@ -720,6 +720,28 @@ ${rawData || "관련 데이터 없음"}`;
 async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
   if (!query) return sendMessage(env, chatId, "질문 내용을 입력해주세요.");
 
+  // ── 후보 번호 선택 처리 ──
+  // 직전에 파일 후보 목록을 보냈고, 이번 입력이 "N", "N번", "N번째"면 그 파일 전송
+  const numMatch = query.trim().match(/^([1-9])\s*번?(?:째)?$/);
+  if (numMatch) {
+    try {
+      const raw = await env.PROMPT.get(`filecand:${chatId}`);
+      if (raw) {
+        const cands = JSON.parse(raw);
+        const idx = Number(numMatch[1]) - 1;
+        if (cands[idx] && cands[idx].file_id) {
+          const f = cands[idx];
+          const cap = `${f.file_name || ""}${f.room_title ? ` [${f.room_title}]` : ""}`;
+          await sendDocument(env, chatId, f.file_id, cap);
+          await env.PROMPT.delete(`filecand:${chatId}`);
+          return;
+        }
+      }
+    } catch (e) { console.error("filecand select error", e.message); }
+    // 후보가 없거나 만료된 경우 — 일반 질문으로 진행
+  }
+
+
   // ── 답장 컨텍스트 추출 ──────────────────────────────
   const replyMsg     = msg?.reply_to_message;
   const replyContent = (replyMsg?.text || replyMsg?.caption || "").trim();
@@ -958,17 +980,24 @@ ${synthContext}`;
         const list = cands.map((f, i) => {
           const nm   = f.file_name || "(이름없음)";
           const room = f.room_title ? ` [${f.room_title}]` : "";
-          // 내용 힌트: summary 우선, 없으면 content 앞부분. 약 20자.
           let hint = (f.summary || f.content || "").replace(/\s+/g, " ").trim();
           if (hint.length > 20) hint = hint.slice(0, 20) + "…";
           const hintPart = hint ? ` — ${hint}` : "";
-          return `${i + 1}. ${nm}${room}${hintPart}`;
+          return `<b>${i + 1}.</b> ${nm}${room}${hintPart}`;
         }).join("\n");
+        // 후보 목록을 KV에 저장 (다음에 "N번"으로 선택 가능, 5분 유효)
+        try {
+          const slim = cands.map(f => ({
+            file_id: f.file_id, file_name: f.file_name,
+            room_title: f.room_title, sender_name: f.sender_name
+          }));
+          await env.PROMPT.put(`filecand:${chatId}`, JSON.stringify(slim), { expirationTtl: 300 });
+        } catch (e) { console.error("filecand save error", e.message); }
         await sendMessage(env, chatId,
-          `정확히 일치하는 자료를 못 찾았습니다. 혹시 이 중에 있나요?\n\n${list}\n\n파일명을 더 정확히 알려주시면 바로 보내드리겠습니다.`);
+          `<b>찾으시는 자료가 이 중에 있나요?</b>\n\n${list}\n\n번호(예: <b>2번</b>) 또는 파일명을 알려주세요.`);
       } else {
         await sendMessage(env, chatId,
-          "요청하신 자료를 찾지 못했습니다.\n파일명이나 키워드를 더 구체적으로 알려주시면 다시 찾겠습니다.");
+          "요청하신 자료를 찾지 못했습니다.\n키워드를 더 구체적으로 알려주세요.");
       }
       await updateBotSession(env, chatId);
       return;
@@ -1494,7 +1523,7 @@ ${rawContext || "없음"}`;
   // 메시지 1: 헤더 + 일정 + 보고 (함께)
   // 메시지 2: 의사결정 (별도)
   // 메시지 3: 주요 내용 (별도)
-  const msg1 = [`📅 ${today} Daily Briefing`, outSchedule, outReport]
+  const msg1 = [`📅 ${today} 데일리 브리핑`, outSchedule, outReport]
     .filter(Boolean).join("\n\n");
   for (const id of targets) {
     await sendMessage(env, id, msg1);
