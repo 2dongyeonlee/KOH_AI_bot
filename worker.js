@@ -725,7 +725,9 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
   const SUMMARY_ONLY_PATTERN = /^(요약|정리|분석|설명|번역|해석)(해줘|해|해봐|해\s*줘|해줄래|해줘요)?$/;
   let isPronounQuery = PRONOUN_PATTERN.test(query.trim()) || SUMMARY_ONLY_PATTERN.test(query.trim());
 
-  const isFileReq = looksLikeFileRequest(query);
+  // 포워드 메시지는 파일 요청으로 오인하지 않음 → 요약/분석 경로로
+  const isForwarded = !!(msg.forward_date || msg.forward_origin || msg.forward_from);
+  const isFileReq = !isForwarded && looksLikeFileRequest(query);
   const hasInlineContent = !isFileReq && query.includes("\n") && query.length > 100;
   // 종합 분석 요청: 여러 자료/DM을 모아 필요정보·의사결정·일정으로 정리
   const isSynthReq = !isFileReq &&
