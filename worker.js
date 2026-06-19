@@ -1442,14 +1442,15 @@ ${rawContext || "없음"}`;
       "", MODEL_SMART),
   ]);
 
-  // 섹션별로 순차 전송
-  const dateHeader = `📅 ${today} Daily Briefing`;
+  // 메시지 1: 헤더 + 일정 + 보고 (함께)
+  // 메시지 2: 의사결정 (별도)
+  // 메시지 3: 주요 내용 (별도)
+  const msg1 = [`📅 ${today} Daily Briefing`, outSchedule, outReport]
+    .filter(Boolean).join("\n\n");
   for (const id of targets) {
-    await sendMessage(env, id, dateHeader);
-    if (outSchedule)  await sendMessage(env, id, outSchedule);
-    if (outReport)    await sendMessage(env, id, outReport);
-    if (outDecision)  await sendMessage(env, id, outDecision);
-    if (outMain)      await sendMessage(env, id, outMain);
+    await sendMessage(env, id, msg1);
+    if (outDecision) await sendMessage(env, id, outDecision);
+    if (outMain)     await sendMessage(env, id, outMain);
   }
 }
 
