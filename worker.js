@@ -2610,7 +2610,14 @@ function telegramApi(env) {
 }
 
 async function isQueryToBot(env, msg, text) {
-  if (msg.chat.type === "private") return !!text;
+  const t = (text || "").trim();
+  // 1:1(DM) 처리: 포워드(전달) 메시지면 응답 안 함(조용히 저장), 그 외 일반 질문은 응답
+  if (msg.chat?.type === "private") {
+    const isForwarded = !!(msg.forward_date || msg.forward_origin || msg.forward_from);
+    if (isForwarded) return false;
+    if (t) return true;     // 텍스트가 있는 일반 질문이면 응답
+    return false;           // 텍스트 없음(파일만 등)은 위 파일 블록에서 별도 처리
+  }
   const entities = msg.entities || [];
   const hasMention = entities.some((e) => e.type === "mention");
   const botName = (env.BOT_USERNAME || "").toLowerCase();
