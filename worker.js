@@ -791,7 +791,7 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
 
   // ── 지시어 / 요약단독 감지 ───────────────────────────
   const PRONOUN_PATTERN      = /^(그거|이거|이것|그것|저것|위에|방금|아까|앞에|이\s*내용|그\s*내용|저\s*내용|위\s*내용|이\s*자료|그\s*자료)/;
-  const SUMMARY_ONLY_PATTERN = /^(요약|정리|분석|설명|번역|해석)(해줘|해|해봐|해\s*줘|해줄래|해줘요)?$/;
+  const SUMMARY_ONLY_PATTERN = /(요약|정리|분석|설명|번역|해석)\s*(해줘|해|해봐|해\s*줘|해줄래|해줘요|정리)/;
   let isPronounQuery = PRONOUN_PATTERN.test(query.trim()) || SUMMARY_ONLY_PATTERN.test(query.trim());
 
   // 포워드 메시지는 파일 요청으로 오인하지 않음 → 요약/분석 경로로
