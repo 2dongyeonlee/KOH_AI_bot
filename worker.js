@@ -735,7 +735,7 @@ async function handleQuery(env, chatId, query, msg = null, isOwner = false) {
         if (cands[idx] && cands[idx].file_id) {
           const f = cands[idx];
           const cap = `${f.file_name || ""}${f.room_title ? ` [${f.room_title}]` : ""}`;
-          await sendDocument(env, chatId, f.file_id, cap);
+          await (isImageFile(f.file_name) ? sendPhoto : sendDocument)(env, chatId, f.file_id, cap);
           await env.PROMPT.delete(`filecand:${chatId}`);
           return;
         }
@@ -895,7 +895,7 @@ ${synthContext}`;
         const senderLabel = fh.sender_name ? `${fh.sender_name} 공유` : "";
         const attr    = [roomLabel, senderLabel].filter(Boolean).join(" / ");
         const caption = `요청하신 자료입니다.${attr ? ` (${attr})` : ""}\n${fh.file_name || ""}`.trim();
-        let result = await sendDocument(env, chatId, fh.file_id, caption);
+        let result = await (isImageFile(fh.file_name) ? sendPhoto : sendDocument)(env, chatId, fh.file_id, caption);
         if (!result?.ok && fh.room_id && fh.telegram_message_id) {
           result = await copyMessage(env, chatId, fh.room_id, fh.telegram_message_id);
           if (result?.ok) await sendMessage(env, chatId, caption);
@@ -1012,7 +1012,7 @@ ${synthContext}`;
       const senderLabel = fh.sender_name ? `${fh.sender_name} 공유` : "";
       const attr    = [roomLabel, senderLabel].filter(Boolean).join(" / ");
       const caption = `요청하신 자료입니다.${attr ? ` (${attr})` : ""}\n${fh.file_name || ""}`.trim();
-      let result = await sendDocument(env, chatId, fh.file_id, caption);
+      let result = await (isImageFile(fh.file_name) ? sendPhoto : sendDocument)(env, chatId, fh.file_id, caption);
       if (!result?.ok && fh.room_id && fh.telegram_message_id) {
         result = await copyMessage(env, chatId, fh.room_id, fh.telegram_message_id);
         if (result?.ok) await sendMessage(env, chatId, caption);
@@ -2567,6 +2567,23 @@ async function sendMessage(env, chatId, text) {
   for (const chunk of chunks) await sendMessageRaw(env, chatId, chunk);
 }
 
+function isImageFile(fileName) {
+  return /\.(jpe?g|png|webp|gif)$/i.test(fileName || "");
+}
+
+async function sendPhoto(env, chatId, fileId, caption) {
+  const res = await fetch(`${telegramApi(env)}/sendPhoto`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, photo: fileId, caption }),
+  });
+  const data = await res.json();
+  if (!data.ok) {
+    console.error("sendPhoto FAILED:", data.error_code, data.description, "file_id:", fileId);
+  }
+  return data;
+}
+
 async function sendDocument(env, chatId, fileId, caption) {
   const res = await fetch(`${telegramApi(env)}/sendDocument`, {
     method: "POST",
@@ -2660,14 +2677,14 @@ function looksLikeFileRequest(query) {
   const hasDocNoun = /(자료|파일|문서|발표자료|보고서|장표|패키지|package|pdf|ppt|docx|xlsx|보고)/.test(q);
   // 찾기/전송 동사·표현 ("공유" 단독 제외 — "공유한/공유된"은 위에서 처리)
   const hasFindVerb = /(공유해줘|공유해주세요|보내|전달|올려|다운|다운로드|찾아|줘|주세요|있을까|있나|있어\?|어디\s?있|어딨|어디야|위치)/.test(q);
+  // 요약/분석/설명 의도면 파일 전송이 아니라 내용 분석 경로로 → hasDocNoun보다 먼저 체크
+  const isSynthIntent = /(요약|정리|분석|설명|어떤\s*내용|무슨\s*내용|뭐야|뭔지|어떻게\s*돼|현황|진행\s*상황)/.test(q);
+  if (isSynthIntent) return false;
 
   // 자료 명사 + 찾기 동사 → 자료 요청
   if (hasDocNoun && hasFindVerb) return true;
   // 자료 명사만 있어도 (예: "경쟁사 홍보동향 자료") → 자료 요청
   if (hasDocNoun) return true;
-  // 종합/요약 의도면 파일요청이 아니라 일반 경로(검색+종합 답변)로 보낸다
-  const isSynthIntent = /(요약|정리|분석|설명|어떤\s*내용|무슨\s*내용|뭐야|뭔지|어떻게\s*돼|현황|진행\s*상황)/.test(q);
-  if (isSynthIntent) return false;
   // "OO 관련 자료 찾아줘"처럼 자료성 명사가 함께 있을 때만 파일 요청으로 인정
   if (/(관련|언급|얘기|이야기|논의).*(자료|파일|문서|보고서|장표|발표자료|패키지)/.test(q)) return true;
   return false;
